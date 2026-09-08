@@ -261,6 +261,7 @@ echo ">> [TEST] Differential kernel GPU decode vs FP64 CPU..."
 export BONSAI_CUDA_LIB="$WORKING/libbonsai_qmv_sm75.so"
 export LD_LIBRARY_PATH="$WORKING:$REPO_DIR:$REPO_DIR/build:$WORKING/build:$DIST_DIR:$REPO_DIR/.pixi/envs/default/lib:${LD_LIBRARY_PATH:-}"
 pixi run mojo run -I . tests/selftest_decode_gpu.mojo || echo ">> [WARN] selftest_decode_gpu GAGAL — LIHAT HASIL DI ATAS"
+pixi run mojo run -I . tests/test_qmm_gpu.mojo || echo ">> [WARN] test_qmm_gpu GAGAL — LIHAT HASIL DI ATAS"
 # Gerbang korektness RoPE (paritas MLX traditional=False half-split) + Argmax
 # GPU: RoPE salah pairing dulu lolos semua tes matmul tanpa pernah terdeteksi.
 pixi run mojo run -I . tests/test_rope_gpu.mojo || echo ">> [WARN] test_rope_gpu GAGAL — LIHAT HASIL DI ATAS"
@@ -342,9 +343,16 @@ PYEOF
 )" || { echo ">> [ERROR] Encode tokenizer GAGAL — run dihentikan, tidak ada fallback."; exit 1; }
     echo ">> [PROMPT] BONSAI_PROMPT=\"$BONSAI_PROMPT\" -> token ids: $PROMPT_TOKENS"
 
-    "$WORKING/bonsai_infer" --model-dir "$KMODEL" \
+    # Run 1: prefill BATCHED (qmm WMMA) + dump top-2 logit di batas prefill
+    BONSAI_DUMP_TOP2=1 "$WORKING/bonsai_infer" --model-dir "$KMODEL" \
         --prompt-tokens "$PROMPT_TOKENS" --max-tokens 24 --gpu 2>&1 | tee "$DIST_DIR/infer_t4.log" \
         || echo ">> [WARN] inferensi GPU gagal — periksa log di atas"
+
+    # Run 2: jalur per-token (fallback) — pembanding stream & TOP2 di node sama
+    echo ">> [AB] BONSAI_PREFILL_PER_TOKEN=1 (pembanding stream)..."
+    BONSAI_DUMP_TOP2=1 BONSAI_PREFILL_PER_TOKEN=1 "$WORKING/bonsai_infer" --model-dir "$KMODEL" \
+        --prompt-tokens "$PROMPT_TOKENS" --max-tokens 24 --gpu 2>&1 | tee "$DIST_DIR/infer_t4_pertoken.log" \
+        || echo ">> [WARN] inferensi per-token gagal — periksa log di atas"
 
     kill $CLOCK_PID 2>/dev/null || true
     nvidia-smi --query-gpu=clocks.sm,power.draw,temperature.gpu --format=csv,noheader > "$DIST_DIR/gpu_clock_after.txt" 2>/dev/null || true

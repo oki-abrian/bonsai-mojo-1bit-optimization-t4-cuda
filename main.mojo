@@ -26,8 +26,44 @@ from src.models.qwen3_5.gpu_ctx import gpu_ctx_new
 from gpu.host import DeviceBuffer
 from src.ops import (
     rmsnorm_sm75_launch_on, argmax_sm75_launch_on,
-    embed_lookup_1bit_sm75_launch_on
+    embed_lookup_1bit_sm75_launch_on, copy_vec_sm75_launch_on
 )
+
+fn dump_top2_prefill(
+    gpu_ctx_ptr: UnsafePointer[DeviceContextGPU, MutAnyOrigin],
+    logits_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    V: Int
+) raises:
+    """Diagnostik near-tie: top-2 logit + gap di batas prefill. Gap kecil
+    (<~0.05) + flip token vs jalur per-token = wajar (beda urutan akumulasi
+    fp16 antara WMMA vs GEMV); gap besar = indikasi bug layout."""
+    var ctx = gpu_ctx_ptr[]
+    var tmp = ctx.enqueue_create_buffer[DType.float16](V)
+    copy_vec_sm75_launch_on[DType.float16](
+        ctx, tmp.unsafe_ptr(), logits_dev, V
+    )
+    ctx.synchronize()
+    var hlog = alloc[Scalar[DType.float16]](V)
+    ctx.enqueue_copy(hlog, tmp)
+    ctx.synchronize()
+    var b1 = 0
+    var b2 = 0
+    var v1: Float64 = -1e30
+    var v2: Float64 = -1e30
+    for i in range(V):
+        var lv = hlog[i].cast[DType.float64]()
+        if lv > v1:
+            v2 = v1
+            b2 = b1
+            v1 = lv
+            b1 = i
+        elif lv > v2:
+            v2 = lv
+            b2 = i
+    print(">> [TOP2] 1st:", b1, "=", v1, "| 2nd:", b2, "=", v2,
+          "| gap:", v1 - v2)
+    hlog.free()
+
 
 fn find_flex(index: SafeTensorsIndex, name: String) -> Int:
     """Cari tensor: nama apa adanya, lalu fallback prefix 'language_model.'
@@ -676,39 +712,106 @@ fn main() raises:
         var embed_s_dev = embed_s_dev_buf[].unsafe_ptr()
         var embed_b_dev = embed_b_dev_buf[].unsafe_ptr()
 
+        # Timer prefill mulai SETELAH upload embedding (~238 MB via PCIe) —
+        # itu biaya setup one-time, bukan beban latensi prompt.
+        var t_prefill_start = monotonic()
+
         # prefill (Full GPU resident)
-        for t in range(prompt_len):
-            var cur_tok = ptoks[t + 1]
-            embed_lookup_1bit_sm75_launch_on[T](
-                gpu_ctx_ptr[], embed_w_dev, embed_s_dev, embed_b_dev,
-                h_hidden_holder[].unsafe_ptr(), cur_tok, D
+        # Jalur BATCHED (default): prompt diproses per chunk M-token via kernel
+        # qmm WMMA v2 (tensor core) — bobot 2.8 GB dibaca SEKALI per chunk,
+        # bukan M kali seperti GEMV per-token. Fallback per-token otomatis bila
+        # .so tidak memiliki simbol qmm atau env BONSAI_PREFILL_PER_TOKEN=1.
+        var force_per_token = getenv("BONSAI_PREFILL_PER_TOKEN")
+        var batched_prefill = layers[0].prefill_ffi_ready() and not (
+            force_per_token and force_per_token[0] == "1"
+        )
+        if batched_prefill:
+            alias PF_CHUNK = 256
+            var chunk_len = min(PF_CHUNK, prompt_len)
+
+            # Buffer prefill M-token (fp16, RAII hidup selama blok ini)
+            var h_pf_hidden = alloc[DeviceBuffer[T]](1)
+            h_pf_hidden.init_pointee_move(gpu_ctx_ptr[].enqueue_create_buffer[T](chunk_len * D))
+            var pf_hidden = h_pf_hidden[].unsafe_ptr()
+            var h_pf_xn = alloc[DeviceBuffer[T]](1)
+            h_pf_xn.init_pointee_move(gpu_ctx_ptr[].enqueue_create_buffer[T](chunk_len * D))
+            var pf_xn = h_pf_xn[].unsafe_ptr()
+            var h_pf_sub = alloc[DeviceBuffer[T]](1)
+            h_pf_sub.init_pointee_move(gpu_ctx_ptr[].enqueue_create_buffer[T](chunk_len * D))
+            var pf_sub = h_pf_sub[].unsafe_ptr()
+            var h_pf_mlp = alloc[DeviceBuffer[T]](1)
+            h_pf_mlp.init_pointee_move(gpu_ctx_ptr[].enqueue_create_buffer[T](chunk_len * D))
+            var pf_mlp = h_pf_mlp[].unsafe_ptr()
+            var h_pf_proj = alloc[DeviceBuffer[T]](1)
+            h_pf_proj.init_pointee_move(gpu_ctx_ptr[].enqueue_create_buffer[T](chunk_len * 17408))
+            var pf_proj = h_pf_proj[].unsafe_ptr()
+            var h_pf_conv = alloc[DeviceBuffer[T]](1)
+            h_pf_conv.init_pointee_move(gpu_ctx_ptr[].enqueue_create_buffer[T](chunk_len * cfg.gdn_conv_dim))
+            var pf_conv = h_pf_conv[].unsafe_ptr()
+            var pf_qk_dim = cfg.gdn_num_k_heads * cfg.gdn_head_k_dim
+            var h_pf_qn = alloc[DeviceBuffer[T]](1)
+            h_pf_qn.init_pointee_move(gpu_ctx_ptr[].enqueue_create_buffer[T](chunk_len * pf_qk_dim))
+            var pf_qn = h_pf_qn[].unsafe_ptr()
+            var h_pf_kn = alloc[DeviceBuffer[T]](1)
+            h_pf_kn.init_pointee_move(gpu_ctx_ptr[].enqueue_create_buffer[T](chunk_len * pf_qk_dim))
+            var pf_kn = h_pf_kn[].unsafe_ptr()
+            var pf_v_dim = cfg.gdn_num_v_heads * cfg.gdn_head_v_dim
+            var h_pf_gdn = alloc[DeviceBuffer[T]](1)
+            h_pf_gdn.init_pointee_move(gpu_ctx_ptr[].enqueue_create_buffer[T](chunk_len * pf_v_dim))
+            var pf_gdn = h_pf_gdn[].unsafe_ptr()
+            var h_pf_gu = alloc[DeviceBuffer[T]](1)
+            h_pf_gu.init_pointee_move(gpu_ctx_ptr[].enqueue_create_buffer[T](chunk_len * 2 * cfg.intermediate_size))
+            var pf_gu = h_pf_gu[].unsafe_ptr()
+            var h_pf_sw = alloc[DeviceBuffer[T]](1)
+            h_pf_sw.init_pointee_move(gpu_ctx_ptr[].enqueue_create_buffer[T](chunk_len * cfg.intermediate_size))
+            var pf_sw = h_pf_sw[].unsafe_ptr()
+
+            var pos_pf = 0
+            while pos_pf < prompt_len:
+                var m = min(PF_CHUNK, prompt_len - pos_pf)
+                # Embed lookup per baris (M row di pf_hidden)
+                for t in range(m):
+                    embed_lookup_1bit_sm75_launch_on[T](
+                        gpu_ctx_ptr[], embed_w_dev, embed_s_dev, embed_b_dev,
+                        pf_hidden.offset(t * D), ptoks[pos_pf + t + 1], D
+                    )
+                for li in range(n_layers):
+                    if layers[li].is_linear:
+                        layers[li].forward_prefill_gpu(
+                            pf_hidden, pf_xn, pf_sub, pf_mlp,
+                            pf_proj, pf_conv, pf_qn, pf_kn, pf_gdn,
+                            pf_gu, pf_sw, act_attn_scores_dev,
+                            gdn_states[gdn_idx[li]], kv_caches[0], pos_pf, m
+                        )
+                    else:
+                        layers[li].forward_prefill_gpu(
+                            pf_hidden, pf_xn, pf_sub, pf_mlp,
+                            pf_proj, pf_conv, pf_qn, pf_kn, pf_gdn,
+                            pf_gu, pf_sw, act_attn_scores_dev,
+                            gdn_states[0], kv_caches[kv_idx[li]], pos_pf, m
+                        )
+                pos_pf += m
+            pos = pos_pf
+
+            # Transplantasi baris terakhir prefill -> buffer decode (D2D)
+            copy_vec_sm75_launch_on[T](
+                gpu_ctx_ptr[], act_hidden_dev,
+                pf_hidden.offset((prompt_len - 1) % chunk_len * D), D
             )
+            gpu_ctx_ptr[].synchronize()
 
-            for li in range(n_layers):
-                if layers[li].is_linear:
-                    var gi = gdn_idx[li]
-                    layers[li].forward_gpu(
-                        act_hidden_dev, act_x_norm_dev, act_sublayer_out_dev, act_mlp_out_dev,
-                        act_proj_raw_dev, act_conv_out_dev, act_q_normed_dev, act_k_normed_dev,
-                        act_gdn_out_dev, act_gate_up_dev, act_swiglu_act_dev,
-                        act_attn_scores_dev,
-                        gdn_states[gi], kv_caches[0], pos
-                    )
-                else:
-                    var ki = kv_idx[li]
-                    layers[li].forward_gpu(
-                        act_hidden_dev, act_x_norm_dev, act_sublayer_out_dev, act_mlp_out_dev,
-                        act_proj_raw_dev, act_conv_out_dev, act_q_normed_dev, act_k_normed_dev,
-                        act_gdn_out_dev, act_gate_up_dev, act_swiglu_act_dev,
-                        act_attn_scores_dev,
-                        gdn_states[0], kv_caches[ki], pos
-                    )
-
+            # Norm final + lm_head + argmax hanya pada baris terakhir
             rmsnorm_sm75_launch_on[T](
                 gpu_ctx_ptr[], act_hidden_dev, act_x_norm_dev,
                 fnorm_dev, True, D, cfg.rms_norm_eps
             )
             lm_proj.forward_device(act_x_norm_dev, act_logits_dev, 1)
+
+            # Diagnostik near-tie di batas prefill (BONSAI_DUMP_TOP2=1)
+            var dumpv = getenv("BONSAI_DUMP_TOP2")
+            if dumpv and dumpv[0] == "1":
+                dump_top2_prefill(gpu_ctx_ptr, act_logits_dev, V)
+
             argmax_sm75_launch_on[T](
                 gpu_ctx_ptr[], act_logits_dev, act_stage1_vals_dev, act_stage1_idxs_dev,
                 act_token_out_dev, V
@@ -716,7 +819,61 @@ fn main() raises:
             gpu_ctx_ptr[].enqueue_copy(next_tok_host, h_token_out_holder[])
             gpu_ctx_ptr[].synchronize()
             next_tok = Int(next_tok_host[0])
-            pos += 1
+            # Buffer pf_* dibebaskan otomatis oleh RAII di akhir blok.
+        else:
+            # Fallback per-token (GEMV decode per baris; hasil identik)
+            for t in range(prompt_len):
+                var cur_tok = ptoks[t + 1]
+                embed_lookup_1bit_sm75_launch_on[T](
+                    gpu_ctx_ptr[], embed_w_dev, embed_s_dev, embed_b_dev,
+                    h_hidden_holder[].unsafe_ptr(), cur_tok, D
+                )
+
+                for li in range(n_layers):
+                    if layers[li].is_linear:
+                        var gi = gdn_idx[li]
+                        layers[li].forward_gpu(
+                            act_hidden_dev, act_x_norm_dev, act_sublayer_out_dev, act_mlp_out_dev,
+                            act_proj_raw_dev, act_conv_out_dev, act_q_normed_dev, act_k_normed_dev,
+                            act_gdn_out_dev, act_gate_up_dev, act_swiglu_act_dev,
+                            act_attn_scores_dev,
+                            gdn_states[gi], kv_caches[0], pos
+                        )
+                    else:
+                        var ki = kv_idx[li]
+                        layers[li].forward_gpu(
+                            act_hidden_dev, act_x_norm_dev, act_sublayer_out_dev, act_mlp_out_dev,
+                            act_proj_raw_dev, act_conv_out_dev, act_q_normed_dev, act_k_normed_dev,
+                            act_gdn_out_dev, act_gate_up_dev, act_swiglu_act_dev,
+                            act_attn_scores_dev,
+                            gdn_states[0], kv_caches[ki], pos
+                        )
+
+                # LM head + argmax hanya untuk token TERAKHIR prompt (yang
+                # menghasilkan prediksi token generasi pertama). Untuk token
+                # intermediate next_tok dibuang — cur_tok diambil dari prompt —
+                # jadi lewati proyeksi V=248320 + reduksi argmax + sync host.
+                # State GDN/KV tetap ter-update asinkron via stream yang sama.
+                if t == prompt_len - 1:
+                    rmsnorm_sm75_launch_on[T](
+                        gpu_ctx_ptr[], act_hidden_dev, act_x_norm_dev,
+                        fnorm_dev, True, D, cfg.rms_norm_eps
+                    )
+                    lm_proj.forward_device(act_x_norm_dev, act_logits_dev, 1)
+
+                    # Diagnostik near-tie di batas prefill (BONSAI_DUMP_TOP2=1)
+                    var dumpv2 = getenv("BONSAI_DUMP_TOP2")
+                    if dumpv2 and dumpv2[0] == "1":
+                        dump_top2_prefill(gpu_ctx_ptr, act_logits_dev, V)
+
+                    argmax_sm75_launch_on[T](
+                        gpu_ctx_ptr[], act_logits_dev, act_stage1_vals_dev, act_stage1_idxs_dev,
+                        act_token_out_dev, V
+                    )
+                    gpu_ctx_ptr[].enqueue_copy(next_tok_host, h_token_out_holder[])
+                    gpu_ctx_ptr[].synchronize()
+                    next_tok = Int(next_tok_host[0])
+                pos += 1
         generated[n_generated] = next_tok
         n_generated += 1
         print(">> [GEN] token id:", next_tok)
@@ -793,9 +950,13 @@ fn main() raises:
 
         var total_ms = Float64(monotonic() - t_all) / 1e6
         var dec_ms = Float64(monotonic() - t_decode) / 1e6
+        var prefill_ms = Float64(t_decode - t_prefill_start) / 1e6
         var n_dec = max_tokens - 1
         if n_dec > 0:
-            print(">> [PERF] prefill", prompt_len, "token | decode", n_dec, "token")
+            print(">> [PERF] prefill", prompt_len, "token |", prefill_ms, "ms |",
+                  prefill_ms / Float64(prompt_len), "ms/token |",
+                  Float64(prompt_len) * 1000.0 / prefill_ms if prefill_ms > 0.0 else 0.0,
+                  "tok/s | decode", n_dec, "token")
             print(">> [PERF] rata-rata decode:", dec_ms / n_dec, "ms/token |",
                   Float64(n_dec) * 1000.0 / dec_ms if dec_ms > 0.0 else 0.0, "tok/s")
             print(">> [PROF/SPLIT] per token -> GDN:",

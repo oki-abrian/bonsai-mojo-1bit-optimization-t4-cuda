@@ -247,11 +247,47 @@ fn qwen3_5_gdn_step_gpu(
     """
     Eksekusi 1 langkah token GDN 100% di GPU (VRAM-to-VRAM):
     1. in_proj_all.forward_device (W1A16 GPU matmul)
-    2. Causal Conv1d 4-tap GPU kernel
-    3. Head RMSNorm GPU kernel (Q-Norm & K-Norm)
-    4. GDN Recurrence GPU kernel (64 block x 128 thread masif-paralel)
-    5. Fused GDN Gating & Per-Head RMSNorm GPU kernel
-    6. out_proj.forward_device (W1A16 GPU matmul)
+    2-6. qwen3_5_gdn_step_gpu_from_proj (conv -> norm -> recurrence -> gate)
+    7. out_proj.forward_device (W1A16 GPU matmul)
+    """
+    var ctx_ptr = in_proj_all.ctx_ptr
+    if not ctx_ptr:
+        raise Error("FATAL: ctx_ptr null pada qwen3_5_gdn_step_gpu!")
+
+    in_proj_all.forward_device(x_norm_dev, proj_raw_dev, 1)
+
+    qwen3_5_gdn_step_gpu_from_proj(
+        ctx_ptr, proj_raw_dev, conv_out_dev,
+        q_normed_dev, k_normed_dev, gdn_out_dev,
+        conv_weights, a_log, dt_bias, norm_w, has_params,
+        state, config, pos
+    )
+
+    out_proj.forward_device(gdn_out_dev, out_dev, 1)
+
+
+fn qwen3_5_gdn_step_gpu_from_proj(
+    ctx_ptr: UnsafePointer[DeviceContextGPU, MutAnyOrigin],
+    proj_raw_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    conv_out_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    q_normed_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    k_normed_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    gdn_out_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    conv_weights: UnsafePointer[Float32, MutAnyOrigin],
+    a_log: UnsafePointer[Float32, MutAnyOrigin],
+    dt_bias: UnsafePointer[Float32, MutAnyOrigin],
+    norm_w: UnsafePointer[Float32, MutAnyOrigin],
+    has_params: Bool,
+    mut state: GatedDeltaNetState,
+    config: QwenConfig,
+    pos: Int = 0
+) raises:
+    """
+    Langkah GDN tanpa proyeksi linear (in_proj/out_proj di luar fungsi).
+    Dipakai decode per-token DAN loop prefill batched (pointer baris M-token
+    di-offset oleh pemanggil). Urutan: conv1d kausal -> q/k norm -> rekurensi
+    delta rule -> gate silu(z)+rmsnorm per head. Semua update state (jendela
+    conv & matriks S) berjalan sekuensial via stream yang sama.
     """
     alias T = DType.float16
     var H_v = config.gdn_num_v_heads
@@ -260,40 +296,22 @@ fn qwen3_5_gdn_step_gpu(
     var D_v = config.gdn_head_v_dim
     var conv_dim = config.gdn_conv_dim
 
-    var ctx_ptr = in_proj_all.ctx_ptr
     if not ctx_ptr:
-        raise Error("FATAL: ctx_ptr null pada qwen3_5_gdn_step_gpu!")
+        raise Error("FATAL: ctx_ptr null pada qwen3_5_gdn_step_gpu_from_proj!")
     var ctx = ctx_ptr[]
 
     if not state.dev_ready:
         state.init_device(ctx)
 
-    var prof = pos == 0
-    var pv = getenv("BONSAI_PROFILE")
-    prof = prof and pv and pv[0] == "1"
-
-    # 1. Proyeksi Linear 1-Bit Masukan di VRAM
-    var t0 = monotonic()
-    in_proj_all.forward_device(x_norm_dev, proj_raw_dev, 1)
-    var t_in = 0.0
-    if prof:
-        ctx.synchronize()
-        t_in = Float64(monotonic() - t0) / 1e3
-
-    # 2. Causal Conv1D 4-Tap pada komponen QKV di VRAM
-    var t1 = monotonic()
+    # Causal Conv1D 4-Tap pada komponen QKV di VRAM
     causal_conv1d_sm75_launch_on[T](
         ctx,
         state.conv_buf_dev, proj_raw_dev, conv_weights,
         conv_weights != UnsafePointer[Float32, MutAnyOrigin](),
         conv_out_dev, conv_dim
     )
-    var t_conv = 0.0
-    if prof:
-        ctx.synchronize()
-        t_conv = Float64(monotonic() - t1) / 1e3
 
-    # 3. Ekstraksi Q, K, V dan Z, B, A dari VRAM buffer
+    # Ekstraksi Q, K, V dan Z, B, A dari VRAM buffer
     var q_dev = conv_out_dev
     var k_dev = conv_out_dev.offset(H_k * D_k)
     var v_dev = conv_out_dev.offset(2 * H_k * D_k)
@@ -302,51 +320,25 @@ fn qwen3_5_gdn_step_gpu(
     var b_dev = proj_raw_dev.offset(conv_dim + H_v * D_v)
     var a_dev = proj_raw_dev.offset(conv_dim + H_v * D_v + H_v)
 
-    # 4. Q-Norm & K-Norm per-head di VRAM
+    # Q-Norm & K-Norm per-head di VRAM
     var inv_scale_k = 1.0 / sqrt(Float32(D_k))
     var inv_scale_q = inv_scale_k * inv_scale_k
-    var t2 = monotonic()
     head_rmsnorm_sm75_launch_on[T](ctx, q_dev, q_normed_dev, H_k, D_k, inv_scale_q, config.rms_norm_eps)
     head_rmsnorm_sm75_launch_on[T](ctx, k_dev, k_normed_dev, H_k, D_k, inv_scale_k, config.rms_norm_eps)
-    var t_qk = 0.0
-    if prof:
-        ctx.synchronize()
-        t_qk = Float64(monotonic() - t2) / 1e3
 
-    # 5. Rekurensi Gated Delta Rule masif-paralel di GPU
+    # Rekurensi Gated Delta Rule masif-paralel di GPU
     var repeat_factor = H_v // H_k
-    var t3 = monotonic()
     gdn_recurrence_sm75_launch_on[T](
         ctx,
         state.state_s_dev, q_normed_dev, k_normed_dev,
         v_dev, a_dev, b_dev, a_log, dt_bias, has_params,
         gdn_out_dev, repeat_factor, H_v, D_v, D_k
     )
-    var t_rec = 0.0
-    if prof:
-        ctx.synchronize()
-        t_rec = Float64(monotonic() - t3) / 1e3
 
-    # 6. Fused SiLU(z) Gate & Per-Head RMSNorm di VRAM
-    var t4 = monotonic()
+    # Fused SiLU(z) Gate & Per-Head RMSNorm di VRAM
     gdn_norm_gate_sm75_launch_on[T](
         ctx,
         gdn_out_dev, z_dev, norm_w, norm_w != UnsafePointer[Float32, MutAnyOrigin](),
         H_v, D_v, config.rms_norm_eps
     )
-    var t_gate = 0.0
-    if prof:
-        ctx.synchronize()
-        t_gate = Float64(monotonic() - t4) / 1e3
-
-    # 7. Proyeksi Keluar Linear 1-Bit di VRAM
-    var t5 = monotonic()
-    out_proj.forward_device(gdn_out_dev, out_dev, 1)
-    if prof:
-        ctx.synchronize()
-        print(
-            "[PROF-GDN] in_proj=", t_in, "us conv=", t_conv, "us qk_norm=",
-            t_qk, "us recurrence=", t_rec, "us norm_gate=", t_gate,
-            "us out_proj=", Float64(monotonic() - t5) / 1e3, "us"
-        )
 

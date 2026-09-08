@@ -129,6 +129,22 @@ fn vec_add_sm75_gpu[
         x_ptr[idx] = Scalar[T](Float32(x_ptr[idx]) + Float32(res_ptr[idx]))
 
 
+fn copy_vec_sm75_gpu[
+    T: DType
+](
+    dst_ptr: UnsafePointer[Scalar[T], MutAnyOrigin],
+    src_ptr: UnsafePointer[Scalar[T], MutAnyOrigin],
+    n: Int
+):
+    """
+    Salin vektor device-to-device: dst[i] = src[i] (untuk transplantasi
+    baris terakhir prefill ke buffer decode, tanpa memicu PCIe).
+    """
+    var idx = block_idx.x * 256 + thread_idx.x
+    if idx < n:
+        dst_ptr[idx] = src_ptr[idx]
+
+
 # ----------------------------------------------------------------------------
 # 4. Causal Conv1D 4-Tap GPU Kernel (48 block x 256 thread = 12,288 elemen)
 # ----------------------------------------------------------------------------

@@ -10,7 +10,8 @@ from gpu.host import DeviceContext as DeviceContextGPU, DeviceBuffer
 from sys.ffi import OwnedDLHandle
 from src.ops import (
     quantized_matmul_1bit, quantized_matmul_1bit_gpu, qmv_sm75_1bit_launch_on,
-    CudaQmvDecodeFnFP16, try_open_cuda_lib, dummy_cuda_decode_fp16
+    CudaQmvDecodeFnFP16, CudaQmmPrefillFnFP16, try_open_cuda_lib,
+    dummy_cuda_decode_fp16, dummy_cuda_qmm_prefill_fp16
 )
 from src.common import decode_split_plan
 
@@ -76,6 +77,8 @@ struct QwenLinear1Bit:
     var ffi_ready: Bool
     var ffi_fn: CudaQmvDecodeFnFP16
     var ffi_lib_buf: UnsafePointer[OwnedDLHandle, MutAnyOrigin]
+    var ffi_qmm_ready: Bool
+    var ffi_qmm_fn: CudaQmmPrefillFnFP16
     var N: Int
     var K: Int
 
@@ -108,6 +111,8 @@ struct QwenLinear1Bit:
         self.ffi_ready = False
         self.ffi_fn = dummy_cuda_decode_fp16
         self.ffi_lib_buf = UnsafePointer[OwnedDLHandle, MutAnyOrigin]()
+        self.ffi_qmm_ready = False
+        self.ffi_qmm_fn = dummy_cuda_qmm_prefill_fp16
         self.N = N
         self.K = K
 
@@ -141,6 +146,8 @@ struct QwenLinear1Bit:
         self.ffi_ready = False
         self.ffi_fn = dummy_cuda_decode_fp16
         self.ffi_lib_buf = UnsafePointer[OwnedDLHandle, MutAnyOrigin]()
+        self.ffi_qmm_ready = False
+        self.ffi_qmm_fn = dummy_cuda_qmm_prefill_fp16
         self.N = N
         self.K = K
 
@@ -214,6 +221,15 @@ struct QwenLinear1Bit:
                 self.ffi_fn = h_buf[].get_function[CudaQmvDecodeFnFP16]("launch_qmv_sm75_b1_decode_fp16")
                 self.ffi_lib_buf = h_buf
                 self.ffi_ready = True
+                # Prefill batched (WMMA v2) — opsional di .so lama, bukan fatal
+                # bila simbol tidak ada; prefill akan fallback per-token.
+                try:
+                    self.ffi_qmm_fn = h_buf[].get_function[CudaQmmPrefillFnFP16](
+                        "launch_qmm_sm75_b1_prefill_fp16"
+                    )
+                    self.ffi_qmm_ready = True
+                except:
+                    self.ffi_qmm_ready = False
             except:
                 self.ffi_ready = False
 
@@ -253,6 +269,43 @@ struct QwenLinear1Bit:
             x_dev, self.w_dev, self.s_dev, y_dev,
             M, self.N, self.K, 1, True, self.ws_dev
         )
+
+    fn prefill_ffi_ready(self) -> Bool:
+        """True bila kernel prefill batched (WMMA v2) tersedia di .so."""
+        return self.ffi_qmm_ready
+
+    fn forward_prefill_device(
+        mut self,
+        x_m_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+        y_m_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+        M: Int
+    ) raises:
+        """
+        Proyeksi BATCHED M-token via kernel qmm WMMA v2 (tensor core):
+        y[M,N] = x[M,K] · w[N,K/8]^T. Bobot dibaca SEKALI untuk seluruh chunk
+        (inilah penghemat prefill, bukan 9x GEMV). Syarat K % 128 == 0.
+        Fallback: loop per-token lewat forward_device decode (benar, lebih lambat).
+        """
+        if not self.ctx_ptr:
+            raise Error("FATAL: ctx_ptr null pada QwenLinear1Bit.forward_prefill_device!")
+        if not self.dev_ready:
+            self.ensure_dev_ready()
+
+        if self.ffi_qmm_ready:
+            var cuda_stream = UnsafePointer[Float32, MutAnyOrigin]()
+            var ret = self.ffi_qmm_fn(
+                x_m_dev, self.w_dev, self.s_dev, y_m_dev,
+                Int32(M), Int32(self.N), Int32(self.K), Int32(1),
+                Int32(1), cuda_stream
+            )
+            if ret == 0:
+                return
+            # ret != 0 (mis. kontrak K dilanggar) -> jatuh ke loop decode
+
+        for t in range(M):
+            self.forward_device(
+                x_m_dev.offset(t * self.K), y_m_dev.offset(t * self.N), 1
+            )
 
     fn forward(
         mut self,

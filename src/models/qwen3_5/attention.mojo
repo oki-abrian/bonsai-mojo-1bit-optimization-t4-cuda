@@ -261,7 +261,48 @@ fn qwen3_5_gated_attention_step_gpu(
     k_proj.forward_device(x_norm_dev, k_dev, 1)
     v_proj.forward_device(x_norm_dev, v_dev, 1)
 
-    # 2. Q-Norm & K-Norm per-head dengan bobot belajar di VRAM (stride 2*D untuk interleaved Query)
+    qwen3_5_gated_attention_step_gpu_from_proj(
+        ctx_ptr, q_gate_dev, k_dev, v_dev, attn_out_dev, attn_scores_dev,
+        q_norm_w_dev, k_norm_w_dev, has_norms,
+        kv_cache, pos, config
+    )
+
+    # 6. Proyeksi Keluar Linear 1-Bit o_proj di VRAM
+    o_proj.forward_device(attn_out_dev, out_dev, 1)
+
+
+fn qwen3_5_gated_attention_step_gpu_from_proj(
+    ctx_ptr: UnsafePointer[DeviceContextGPU, MutAnyOrigin],
+    q_gate_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    k_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    v_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    attn_out_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    attn_scores_dev: UnsafePointer[Float32, MutAnyOrigin],
+    q_norm_w_dev: UnsafePointer[Float32, MutAnyOrigin],
+    k_norm_w_dev: UnsafePointer[Float32, MutAnyOrigin],
+    has_norms: Bool,
+    mut kv_cache: AttentionKVCache,
+    pos: Int,
+    config: QwenConfig
+) raises:
+    """
+    Langkah attention TANPA proyeksi linear (q/k/v/o_proj di luar fungsi).
+    Dipakai decode per-token DAN loop prefill batched (pointer baris M-token
+    di-offset oleh pemanggil, pos absolut per token). Urutan: q/k norm ->
+    RoPE parsial half-split -> append KV cache -> GQA + softmax + sigmoid gate.
+    """
+    alias T = DType.float16
+    var H_q = config.num_attention_heads      # 48 di Bonsai-27B
+    var H_kv = config.num_key_value_heads     # 8 di Bonsai-27B
+    var D = config.head_dim                   # 128
+    var rot_dim = config.rotary_dim           # 32
+    var scale: Float32 = 1.0 / sqrt(Float32(D))
+
+    if not ctx_ptr:
+        raise Error("FATAL: ctx_ptr null pada qwen3_5_gated_attention_step_gpu_from_proj!")
+    var ctx = ctx_ptr[]
+
+    # Q-Norm & K-Norm per-head dengan bobot belajar di VRAM (stride 2*D untuk interleaved Query)
     head_rmsnorm_sm75_launch_on[T](
         ctx, q_gate_dev, q_gate_dev, H_q, D, 1.0,
         q_norm_w_dev, has_norms, config.rms_norm_eps, 2 * D
@@ -271,8 +312,8 @@ fn qwen3_5_gated_attention_step_gpu(
         k_norm_w_dev, has_norms, config.rms_norm_eps, D
     )
 
-    # 3. RoPE Parsial di VRAM (half-split MLX: pasangan (i, i+rot_dim/2) di
-    #    64 dim rotary per-head; stride 2*D untuk Query interleaved)
+    # RoPE Parsial di VRAM (half-split MLX: pasangan (i, i+rot_dim/2) di
+    # 64 dim rotary per-head; stride 2*D untuk Query interleaved)
     partial_rope_sm75_launch_on[T](
         ctx, q_gate_dev, H_q, D, rot_dim, pos, config.rope_theta, 2 * D
     )
@@ -280,20 +321,17 @@ fn qwen3_5_gated_attention_step_gpu(
         ctx, k_dev, H_kv, D, rot_dim, pos, config.rope_theta, D
     )
 
-    # 4. Simpan Key dan Value ke KV Cache ring buffer di VRAM
+    # Simpan Key dan Value ke KV Cache ring buffer di VRAM
     kv_cache_append_sm75_launch_on[T](
         ctx, kv_cache.k_cache_dev, kv_cache.v_cache_dev,
         k_dev, v_dev, pos, H_kv * D
     )
 
-    # 5. Fused GQA Attention + Softmax + Sigmoid Gate di VRAM (memproses interleaved Query & Gate)
+    # Fused GQA Attention + Softmax + Sigmoid Gate di VRAM (memproses interleaved Query & Gate)
     var seq_len = pos + 1
     gqa_attention_sm75_launch_on[T](
         ctx, q_gate_dev, kv_cache.k_cache_dev, kv_cache.v_cache_dev,
         attn_out_dev, attn_scores_dev,
         seq_len, kv_cache.max_seq_len, H_q, H_kv, D, scale
     )
-
-    # 6. Proyeksi Keluar Linear 1-Bit o_proj di VRAM
-    o_proj.forward_device(attn_out_dev, out_dev, 1)
 

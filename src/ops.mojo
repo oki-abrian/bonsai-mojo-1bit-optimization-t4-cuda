@@ -29,7 +29,7 @@ from .kernels.prefill_wmma import (
     qmm_wmma_b1_body, qmm_wmma_b1_gpu
 )
 from .kernels.elementwise_sm75 import (
-    rmsnorm_sm75_gpu, swiglu_sm75_gpu, vec_add_sm75_gpu,
+    rmsnorm_sm75_gpu, swiglu_sm75_gpu, vec_add_sm75_gpu, copy_vec_sm75_gpu,
     causal_conv1d_sm75_gpu, head_rmsnorm_sm75_gpu,
     gdn_recurrence_sm75_gpu, gdn_norm_gate_sm75_gpu,
     argmax_sm75_stage1_gpu, argmax_sm75_stage2_gpu,
@@ -432,6 +432,30 @@ alias CudaQmvDecodeFnFP16 = fn(
 ) -> Int32
 
 
+# Prefill batched W1A16 (WMMA v2 tensor core, tanpa workspace split-K).
+alias CudaQmmPrefillFnFP16 = fn(
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin], # x [L,M,K]
+    UnsafePointer[UInt8, MutAnyOrigin],                 # w [N,K/8]
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin], # scales [N,K/128]
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin], # out [L,M,N]
+    Int32, Int32, Int32, Int32,                       # m, n, k, l
+    Int32,                                            # broadcast_w
+    UnsafePointer[Float32, MutAnyOrigin]              # stream
+) -> Int32
+
+
+fn dummy_cuda_qmm_prefill_fp16(
+    x: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    scales: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    out_ptr: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    m: Int32, n: Int32, k: Int32, l: Int32,
+    broadcast_w: Int32,
+    stream: UnsafePointer[Float32, MutAnyOrigin]
+) -> Int32:
+    return -1
+
+
 fn dummy_cuda_decode_fp16(
     x: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],
@@ -750,6 +774,22 @@ fn vec_add_sm75_launch_on[
     var grid_x = cdiv(D, 256)
     ctx.enqueue_function[vec_add_sm75_gpu[T]](
         x, res, D,
+        grid_dim=(grid_x, 1, 1),
+        block_dim=(256, 1, 1)
+    )
+
+fn copy_vec_sm75_launch_on[
+    T: DType
+](
+    mut ctx: DeviceContextGPU,
+    dst: UnsafePointer[Scalar[T], MutAnyOrigin],
+    src: UnsafePointer[Scalar[T], MutAnyOrigin],
+    n: Int
+) raises:
+    """Salin vektor device-to-device di VRAM: dst = src."""
+    var grid_x = cdiv(n, 256)
+    ctx.enqueue_function[copy_vec_sm75_gpu[T]](
+        dst, src, n,
         grid_dim=(grid_x, 1, 1),
         block_dim=(256, 1, 1)
     )
