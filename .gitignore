@@ -1,0 +1,40 @@
+# Mojo and Magic build artifacts
+.magic/
+build/
+*.o
+*.so
+*.dylib
+
+# Mac OS metadata
+.DS_Store
+._*
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# Laporan & catatan internal (tidak untuk repo)
+LAPORAN_*.md
+NOTES_*.md
+
+# Vendored reference repos
+references/
+
+# Environment & artifacts
+.pixi/
+.build_cache/
+.cache_t4_build/
+dist/
+dist_kaggle_mojo/
+*.whl
+.max_cache/
+
+# Nested copy & session state (bukan source)
+bonsai-1bit-t4-mojo/
+mojo_source/
+.commandcode/

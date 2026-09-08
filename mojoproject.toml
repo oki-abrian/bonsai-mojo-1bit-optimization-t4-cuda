@@ -1,0 +1,17 @@
+[project]
+name = "bonsai-1bit-t4-mojo"
+version = "0.1.0"
+description = "High-Performance W1A16 (1-bit Affine g128) Quantized Matmul & Decode Kernels for NVIDIA T4 (sm_75) in Mojo"
+authors = ["PrismML Eng & Antigravity"]
+readme = "README.md"
+license = "Apache-2.0"
+
+[dependencies]
+# PIN: kodebase memakai gaya bahasa Mojo 25.x (fn/let, from memory import).
+# Tanpa batas atas, pixi memilih compiler termutakhir yang menolak sintaks ini
+# ('fn' has been removed; use 'def' — terlihat di log build Kaggle v7).
+max = ">=25.0,<26.0"
+
+[build]
+targets = ["gpu"]
+gpu-arch = "sm_75"

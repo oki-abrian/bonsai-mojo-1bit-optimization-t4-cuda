@@ -1,0 +1,11 @@
+[project]
+name = "bonsai-1bit-t4-mojo"
+version = "0.1.0"
+description = "High-Performance W1A16 (1-bit Affine g128) Quantized Matmul & Decode Kernels for NVIDIA T4 (sm_75) in Mojo"
+authors = ["PrismML Eng & Antigravity"]
+channels = ["https://conda.modular.com/max", "https://repo.prefix.dev/modular-community", "conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+
+[dependencies]
+# PIN seri 25.x (lihat mojoproject.toml) — compiler termutakhir menghapus fn/let.
+max = ">=25.0,<26.0"
