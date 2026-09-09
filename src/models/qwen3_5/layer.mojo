@@ -15,7 +15,7 @@ from .gated_delta import GatedDeltaNetState, qwen3_5_gdn_step, qwen3_5_gdn_step_
 from .attention import AttentionKVCache, qwen3_5_gated_attention_step, qwen3_5_gated_attention_step_gpu, qwen3_5_gated_attention_step_gpu_from_proj
 from .mlp import qwen3_5_swiglu_mlp_step, qwen3_5_swiglu_mlp_step_gpu
 from src.ops import (
-    rmsnorm_sm75_launch_on, vec_add_sm75_launch_on, swiglu_sm75_launch_on,
+    rmsnorm_sm75_launch_on, vec_add_sm75_launch_on, add_rmsnorm_sm75_launch_on, swiglu_sm75_launch_on,
     gdn_seq_sm75_try_launch, gdn_recurrence_sm75_launch_on,
     gdn_norm_gate_sm75_launch_on, causal_conv1d_sm75_launch_on,
     head_rmsnorm_sm75_launch_on
@@ -292,7 +292,9 @@ struct QwenDecoderLayer:
         attn_scores_dev: UnsafePointer[Float32, MutAnyOrigin],
         mut gdn_state: GatedDeltaNetState,
         mut kv_cache: AttentionKVCache,
-        pos: Int
+        pos: Int,
+        next_norm_w: UnsafePointer[Float32, MutAnyOrigin] = UnsafePointer[Float32, MutAnyOrigin](),
+        prenorm_done: Bool = False
     ) raises:
         """
         Forward pass 1 token penuh 100% di GPU (VRAM resident):
@@ -312,14 +314,18 @@ struct QwenDecoderLayer:
         var prof = pos == 0
         var pv = getenv("BONSAI_PROFILE")
         prof = prof and pv and pv[0] == "1"
+        var fuse = not (getenv("BONSAI_NO_FUSE") and getenv("BONSAI_NO_FUSE") == "1")
 
         # 1. Pre-Layer RMSNorm di GPU (menggunakan pointer bobot VRAM)
+        # dilewati bila prenorm_done (sudah dikerjakan fusi residual layer
+        # sebelumnya — hasil bit-exact identik, hememat 1 launch/layer).
         var t0 = monotonic()
-        rmsnorm_sm75_launch_on[T](
-            ctx, hidden_states_dev, x_norm_dev,
-            self.input_layernorm_w_dev, self.input_layernorm_w_dev != UnsafePointer[Float32, MutAnyOrigin](),
-            D, self.config.rms_norm_eps
-        )
+        if not prenorm_done:
+            rmsnorm_sm75_launch_on[T](
+                ctx, hidden_states_dev, x_norm_dev,
+                self.input_layernorm_w_dev, self.input_layernorm_w_dev != UnsafePointer[Float32, MutAnyOrigin](),
+                D, self.config.rms_norm_eps
+            )
         var t_pren = 0.0
         if prof:
             ctx.synchronize()
@@ -355,25 +361,25 @@ struct QwenDecoderLayer:
             ctx.synchronize()
             t_step = Float64(monotonic() - t1) / 1e3
 
-        # 3. Residual 1 di GPU
+        # 3+4. FUSI Residual 1 + Post-Attention RMSNorm (1 launch, bit-exact)
         var t2 = monotonic()
-        vec_add_sm75_launch_on[T](ctx, hidden_states_dev, sublayer_out_dev, D)
-        var t_r1 = 0.0
-        if prof:
-            ctx.synchronize()
-            t_r1 = Float64(monotonic() - t2) / 1e3
-
-        # 4. Post-Attention RMSNorm di GPU (menggunakan pointer bobot VRAM)
-        var t3 = monotonic()
-        rmsnorm_sm75_launch_on[T](
-            ctx, hidden_states_dev, x_norm_dev,
-            self.post_attn_layernorm_w_dev, self.post_attn_layernorm_w_dev != UnsafePointer[Float32, MutAnyOrigin](),
-            D, self.config.rms_norm_eps
-        )
+        if fuse:
+            add_rmsnorm_sm75_launch_on[T](
+                ctx, hidden_states_dev, sublayer_out_dev, x_norm_dev,
+                self.post_attn_layernorm_w_dev, self.post_attn_layernorm_w_dev != UnsafePointer[Float32, MutAnyOrigin](),
+                D, self.config.rms_norm_eps
+            )
+        else:
+            vec_add_sm75_launch_on[T](ctx, hidden_states_dev, sublayer_out_dev, D)
+            rmsnorm_sm75_launch_on[T](
+                ctx, hidden_states_dev, x_norm_dev,
+                self.post_attn_layernorm_w_dev, self.post_attn_layernorm_w_dev != UnsafePointer[Float32, MutAnyOrigin](),
+                D, self.config.rms_norm_eps
+            )
         var t_post = 0.0
         if prof:
             ctx.synchronize()
-            t_post = Float64(monotonic() - t3) / 1e3
+            t_post = Float64(monotonic() - t2) / 1e3
 
         # 5. SwiGLU MLP di GPU
         var t4 = monotonic()
@@ -387,14 +393,21 @@ struct QwenDecoderLayer:
             ctx.synchronize()
             t_mlp = Float64(monotonic() - t4) / 1e3
 
-        # 6. Residual 2 di GPU
+        # 6. Residual 2 di GPU — FUSI dgn pre-norm layer BERIKUTNYA bila
+        # next_norm_w disediakan (bit-exact; hememat 1 launch/layer).
         var t5 = monotonic()
-        vec_add_sm75_launch_on[T](ctx, hidden_states_dev, mlp_out_dev, D)
+        if fuse and next_norm_w != UnsafePointer[Float32, MutAnyOrigin]():
+            add_rmsnorm_sm75_launch_on[T](
+                ctx, hidden_states_dev, mlp_out_dev, x_norm_dev,
+                next_norm_w, True, D, self.config.rms_norm_eps
+            )
+        else:
+            vec_add_sm75_launch_on[T](ctx, hidden_states_dev, mlp_out_dev, D)
         if prof:
             ctx.synchronize()
             print(
                 "[PROF-LAYER] prenorm=", t_pren, "us step=", t_step,
-                "us resid1=", t_r1, "us postnorm=", t_post, "us mlp=",
+                "us postnorm(fused)=", t_post, "us mlp=",
                 t_mlp, "us resid2=", Float64(monotonic() - t5) / 1e3, "us"
             )
 

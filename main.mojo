@@ -905,6 +905,12 @@ fn main() raises:
 
             for li in range(n_layers):
                 var tl = monotonic()
+                # Fusi residual2+pre-norm: weight norm layer berikutnya
+                # (layer terakhir: final norm sebelum lm_head).
+                var nnw = (
+                    layers[li + 1].input_layernorm_w_dev
+                    if li + 1 < n_layers else fnorm_dev
+                )
                 if layers[li].is_linear:
                     var gi = gdn_idx[li]
                     layers[li].forward_gpu(
@@ -912,7 +918,8 @@ fn main() raises:
                         act_proj_raw_dev, act_conv_out_dev, act_q_normed_dev, act_k_normed_dev,
                         act_gdn_out_dev, act_gate_up_dev, act_swiglu_act_dev,
                         act_attn_scores_dev,
-                        gdn_states[gi], kv_caches[0], pos
+                        gdn_states[gi], kv_caches[0], pos,
+                        nnw, li > 0
                     )
                     if prof:
                         gpu_ctx_ptr[].synchronize()
@@ -924,7 +931,8 @@ fn main() raises:
                         act_proj_raw_dev, act_conv_out_dev, act_q_normed_dev, act_k_normed_dev,
                         act_gdn_out_dev, act_gate_up_dev, act_swiglu_act_dev,
                         act_attn_scores_dev,
-                        gdn_states[0], kv_caches[ki], pos
+                        gdn_states[0], kv_caches[ki], pos,
+                        nnw, li > 0
                     )
                     if prof:
                         gpu_ctx_ptr[].synchronize()
@@ -934,10 +942,16 @@ fn main() raises:
                 gpu_ctx_ptr[].synchronize()
             var tlm = monotonic()
 
-            rmsnorm_sm75_launch_on[T](
-                gpu_ctx_ptr[], act_hidden_dev, act_x_norm_dev,
-                fnorm_dev, True, D, cfg.rms_norm_eps
-            )
+            # Final norm dilewati bila fusi aktif: residual-2 layer terakhir
+            # sudah menulis act_x_norm_dev dgn fnorm_dev (bit-exact identik).
+            var no_fuse = getenv("BONSAI_NO_FUSE")
+            if not (no_fuse and no_fuse == "1"):
+                pass
+            else:
+                rmsnorm_sm75_launch_on[T](
+                    gpu_ctx_ptr[], act_hidden_dev, act_x_norm_dev,
+                    fnorm_dev, True, D, cfg.rms_norm_eps
+                )
             lm_proj.forward_device(act_x_norm_dev, act_logits_dev, 1)
             argmax_sm75_launch_on[T](
                 gpu_ctx_ptr[], act_logits_dev, act_stage1_vals_dev, act_stage1_idxs_dev,

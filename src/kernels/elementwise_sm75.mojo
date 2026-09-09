@@ -142,6 +142,86 @@ fn vec_add_sm75_gpu[
         x_row[idx] = Scalar[T](Float32(x_row[idx]) + Float32(res_row[idx]))
 
 
+fn add_rmsnorm_sm75_gpu[
+    T: DType,
+    HAS_WEIGHT: Bool = True
+](
+    x_ptr: UnsafePointer[Scalar[T], MutAnyOrigin],
+    res_ptr: UnsafePointer[Scalar[T], MutAnyOrigin],
+    out_norm_ptr: UnsafePointer[Scalar[T], MutAnyOrigin],
+    weight_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    D: Int,
+    eps: Float32
+):
+    """
+    FUSI vec_add + rmsnorm (1 launch per situs residual; hemat launch +
+    separuh trafik hidden). BIT-EXACT dgn jalur terpisah: jumlah di-round
+    fp16 SEBELUM sum-of-squares (vec_add menulis fp16, rmsnorm membaca fp16),
+    reduksi & iterasi identik dgn rmsnorm_sm75_gpu.
+    x = hidden (in-place), res = keluaran sublayer, out_norm = x_norm.
+    """
+    var tid = thread_idx.x
+    var lane = tid & 31
+    var wid = tid >> 5
+    var smem = stack_allocation[
+        32, Float32, alignment = 16, address_space = AddressSpace.SHARED
+    ]()
+
+    var row = block_idx.y
+    var x_row = x_ptr.offset(row * D)
+    var res_row = res_ptr.offset(row * D)
+    var o_row = out_norm_ptr.offset(row * D)
+
+    # 1. Residual in-place — persis dgn vec_add_sm75_gpu (f16(f32+f32))
+    var i = tid
+    while i < D:
+        x_row[i] = Scalar[T](Float32(x_row[i]) + Float32(res_row[i]))
+        i += 256
+
+    barrier()
+
+    # 2. Sum-of-squares — persis dgn rmsnorm_sm75_gpu pada hidden baru
+    var sum_sq: Float32 = 0.0
+    var j = tid
+    while j < D:
+        var val = Float32(x_row[j])
+        sum_sq += val * val
+        j += 256
+
+    sum_sq += shuffle_down(sum_sq, 16)
+    sum_sq += shuffle_down(sum_sq, 8)
+    sum_sq += shuffle_down(sum_sq, 4)
+    sum_sq += shuffle_down(sum_sq, 2)
+    sum_sq += shuffle_down(sum_sq, 1)
+
+    if lane == 0:
+        smem[wid] = sum_sq
+
+    barrier()
+
+    if wid == 0:
+        var warp_sum: Float32 = smem[lane] if lane < 8 else 0.0
+        warp_sum += shuffle_down(warp_sum, 4)
+        warp_sum += shuffle_down(warp_sum, 2)
+        warp_sum += shuffle_down(warp_sum, 1)
+        if lane == 0:
+            smem[0] = 1.0 / sqrt(warp_sum / Float32(D) + eps)
+
+    barrier()
+
+    var inv_rms = smem[0]
+
+    var k = tid
+    while k < D:
+        var val = Float32(x_row[k])
+        var gamma: Float32 = 1.0
+        @parameter
+        if HAS_WEIGHT:
+            gamma = weight_ptr[k]
+        o_row[k] = Scalar[T](val * inv_rms * gamma)
+        k += 256
+
+
 fn copy_vec_sm75_gpu[
     T: DType
 ](

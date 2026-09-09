@@ -367,6 +367,11 @@ PYEOF
         --prompt-tokens "$PROMPT_TOKENS_LONG" --max-tokens 8 --gpu 2>&1 | tee "$DIST_DIR/infer_t4_long.log" \
         || echo ">> [WARN] run prompt panjang gagal — periksa log"
 
+    # Run 2b: A/B fusi di node sama — fusion dimatikan utk pembanding.
+    BONSAI_NO_FUSE=1 "$WORKING/bonsai_infer" --model-dir "$KMODEL" \
+        --prompt-tokens "$PROMPT_TOKENS" --max-tokens 24 --gpu 2>&1 | tee "$DIST_DIR/infer_t4_nofuse.log" \
+        || echo ">> [WARN] run no-fuse gagal — periksa log"
+
     # Run 3: jalur per-token (fallback) — pembanding stream & TOP2 di node sama
     echo ">> [AB] BONSAI_PREFILL_PER_TOKEN=1 (pembanding stream)..."
     BONSAI_DUMP_TOP2=1 BONSAI_PREFILL_PER_TOKEN=1 "$WORKING/bonsai_infer" --model-dir "$KMODEL" \

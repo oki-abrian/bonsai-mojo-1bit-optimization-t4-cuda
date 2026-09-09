@@ -29,7 +29,7 @@ from .kernels.prefill_wmma import (
     qmm_wmma_b1_body, qmm_wmma_b1_gpu
 )
 from .kernels.elementwise_sm75 import (
-    rmsnorm_sm75_gpu, swiglu_sm75_gpu, vec_add_sm75_gpu, copy_vec_sm75_gpu,
+    rmsnorm_sm75_gpu, add_rmsnorm_sm75_gpu, swiglu_sm75_gpu, vec_add_sm75_gpu, copy_vec_sm75_gpu,
     causal_conv1d_sm75_gpu, head_rmsnorm_sm75_gpu,
     gdn_recurrence_sm75_gpu, gdn_norm_gate_sm75_gpu,
     argmax_sm75_stage1_gpu, argmax_sm75_stage2_gpu,
@@ -744,6 +744,35 @@ fn rmsnorm_sm75_launch_on[
         var null_w = UnsafePointer[Float32, MutAnyOrigin]()
         ctx.enqueue_function[rmsnorm_sm75_gpu[T, False]](
             x, out_ptr, null_w, D, eps,
+            grid_dim=(1, rows, 1),
+            block_dim=(256, 1, 1)
+        )
+
+fn add_rmsnorm_sm75_launch_on[
+    T: DType
+](
+    mut ctx: DeviceContextGPU,
+    x: UnsafePointer[Scalar[T], MutAnyOrigin],
+    res: UnsafePointer[Scalar[T], MutAnyOrigin],
+    out_norm: UnsafePointer[Scalar[T], MutAnyOrigin],
+    weight: UnsafePointer[Float32, MutAnyOrigin],
+    has_weight: Bool,
+    D: Int,
+    eps: Float32 = 1e-6,
+    rows: Int = 1
+) raises:
+    """FUSI residual-add + RMSNorm dalam 1 launch (bit-exact dgn jalur
+    vec_add_sm75_launch_on + rmsnorm_sm75_launch_on berurutan)."""
+    if has_weight and weight != UnsafePointer[Float32, MutAnyOrigin]():
+        ctx.enqueue_function[add_rmsnorm_sm75_gpu[T, True]](
+            x, res, out_norm, weight, D, eps,
+            grid_dim=(1, rows, 1),
+            block_dim=(256, 1, 1)
+        )
+    else:
+        var null_w = UnsafePointer[Float32, MutAnyOrigin]()
+        ctx.enqueue_function[add_rmsnorm_sm75_gpu[T, False]](
+            x, res, out_norm, null_w, D, eps,
             grid_dim=(1, rows, 1),
             block_dim=(256, 1, 1)
         )
