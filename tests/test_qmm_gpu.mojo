@@ -20,6 +20,79 @@ from src.ops import (
 from src.common import get_scale_stride, get_weight_row_bytes, decode_split_plan
 
 
+fn bench_qmv_case(
+    ctx: DeviceContext,
+    qmv_fn: CudaQmvDecodeFnFP16,
+    sync_fn: CudaSyncDeviceFn,
+    name: String,
+    N: Int, K: Int,
+    iters: Int
+) raises:
+    """Bench kernel decode M=1 (jalur FFI identik produksi, termasuk split-K).
+    GB/s = bobot (N*K/8) + skala (N*(K/128)*2) + x (K*2) + out (N*2)."""
+    var groups = get_scale_stride(K)
+    var row_bytes = get_weight_row_bytes(K)
+    var szx = K
+    var szw = N * row_bytes
+    var szs = N * groups
+    var szo = N
+    var splits = decode_split_plan(N, 1, K // 128)
+    var szws = splits * N
+
+    var hx16 = alloc[Scalar[DType.float16]](szx)
+    var hw = alloc[UInt8](szw)
+    var hs16 = alloc[Scalar[DType.float16]](szs)
+    var hy16 = alloc[Scalar[DType.float16]](szo)
+    for i in range(szx):
+        hx16[i] = Scalar[DType.float16](Float32((i % 17) - 8) * 0.125)
+    for i in range(szs):
+        hs16[i] = Scalar[DType.float16](Float32(1.0 + Float32(i % 5) * 0.1))
+    for i in range(szw):
+        hw[i] = UInt8((i * 37 + 13) & 0xFF)
+
+    var bx = ctx.enqueue_create_buffer[DType.float16](szx)
+    var bw = ctx.enqueue_create_buffer[DType.uint8](szw)
+    var bs = ctx.enqueue_create_buffer[DType.float16](szs)
+    var by = ctx.enqueue_create_buffer[DType.float16](szo)
+    var bws = ctx.enqueue_create_buffer[DType.float32](szws)
+    ctx.enqueue_copy(bx, hx16)
+    ctx.enqueue_copy(bw, hw)
+    ctx.enqueue_copy(bs, hs16)
+    ctx.synchronize()
+
+    var cuda_stream = UnsafePointer[Float32, MutAnyOrigin]()
+    for _ in range(5):
+        _ = qmv_fn(
+            bx.unsafe_ptr(), bw.unsafe_ptr(), bs.unsafe_ptr(), by.unsafe_ptr(),
+            bws.unsafe_ptr(),
+            Int32(1), Int32(N), Int32(K), Int32(1), Int32(1), Int32(splits),
+            cuda_stream
+        )
+    _ = sync_fn()
+    ctx.synchronize()
+
+    var t0 = monotonic()
+    for _ in range(iters):
+        _ = qmv_fn(
+            bx.unsafe_ptr(), bw.unsafe_ptr(), bs.unsafe_ptr(), by.unsafe_ptr(),
+            bws.unsafe_ptr(),
+            Int32(1), Int32(N), Int32(K), Int32(1), Int32(1), Int32(splits),
+            cuda_stream
+        )
+    _ = sync_fn()
+    ctx.synchronize()
+    var ms = Float64(monotonic() - t0) / 1e6 / Float64(iters)
+    var gbs = (Float64(N * K) / 8.0 + Float64(N * groups) * 2.0 + Float64(K) * 2.0 + Float64(N) * 2.0) / (ms * 1e6)
+    var gmac = Float64(N * K) / 2.0 / (ms * 1e9)
+    print("[BENCH-QMV]", name, "| M=1 N=", N, "K=", K, "splits=", splits,
+          "|", ms, "ms/iter |", gbs, "GB/s |", gmac, "GMAC/s")
+
+    hx16.free()
+    hw.free()
+    hs16.free()
+    hy16.free()
+
+
 struct QmmCase(Copyable, Movable, ImplicitlyCopyable):
     var name: String
     var M: Int
@@ -310,5 +383,18 @@ fn main() raises:
     bench_qmm_case(ctx, qmm_fn, sync_fn, "outproj", 9, 5120, 6144, 50)
     bench_qmm_case(ctx, qmm_fn, sync_fn, "qproj", 9, 12288, 5120, 50)
     bench_qmm_case(ctx, qmm_fn, sync_fn, "gateup_m32", 32, 34816, 5120, 50)
+
+    # ---- Bench kernel DECODE M=1 (FFI identik produksi, split-K sesuai plan) ----
+    var h_dbuf = alloc[OwnedDLHandle](1)
+    h_dbuf.init_pointee_move(try_open_cuda_lib())
+    var qmv_fn = h_dbuf[].get_function[CudaQmvDecodeFnFP16]("launch_qmv_sm75_b1_decode_fp16")
+    bench_qmv_case(ctx, qmv_fn, sync_fn, "qproj", 12288, 5120, 50)
+    bench_qmv_case(ctx, qmv_fn, sync_fn, "kvproj", 1024, 5120, 50)
+    bench_qmv_case(ctx, qmv_fn, sync_fn, "gateup", 34816, 5120, 50)
+    bench_qmv_case(ctx, qmv_fn, sync_fn, "down", 5120, 17408, 50)
+    bench_qmv_case(ctx, qmv_fn, sync_fn, "outproj", 5120, 6144, 50)
+    bench_qmv_case(ctx, qmv_fn, sync_fn, "inproj", 16480, 5120, 50)
+    h_dbuf.destroy_pointee()
+    h_dbuf.free()
     h_buf.destroy_pointee()
     h_buf.free()

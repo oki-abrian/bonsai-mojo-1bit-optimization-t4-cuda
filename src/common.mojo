@@ -61,7 +61,7 @@ fn decode_mpad_bucket(m: Int) -> Int:
 # 3b. Split-K Deterministik Decode (paritas QMV_VEC_BLOCK_FILL_TARGET)
 # ----------------------------------------------------------------------------
 alias DECODE_BLOCK_FILL_TARGET: Int = 320 # Kalibrasi T4: 40 SM x 8 blok/SM
-alias DECODE_MAX_SPLITS: Int = 16
+alias DECODE_MAX_SPLITS: Int = 3
 
 @fieldwise_init
 struct DecodeSplitRange(Copyable, Movable, ImplicitlyCopyable):
