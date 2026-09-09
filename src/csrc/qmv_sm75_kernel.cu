@@ -530,6 +530,107 @@ __global__ void qmm_sm75_b1_kernel(
 } // namespace bonsai::sm75::wmma_b1
 
 // ============================================================================
+// GDN SEQUENCE FUSED (tiru struktur prefill MLX fork gdn_step_kernel.cuh):
+// SELURUH sekuens T token diproses dalam SATU launch, state S hidup di
+// register (nol round-trip VRAM per token). Gating math replika 1:1 dari
+// kernel rekurensi Mojo kita (a_log/dt_bias di dalam loop). State dibulatkan
+// ke fp16 tiap token agar bit-exact dengan jalur per-token decode.
+// ============================================================================
+
+__device__ inline float gdn_seq_warp_sum(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        v += __shfl_xor_sync(0xffffffffu, v, off);
+    return v;
+}
+
+template <bool HAS_PARAMS, int NPT>
+__global__ void gdn_seq_sm75_kernel(
+    const __half* __restrict__ q,   // [T, Hk*Dk] (stride qk_stride)
+    const __half* __restrict__ k,   // [T, Hk*Dk]
+    const __half* __restrict__ v,   // [T, v_stride] (v head hv di hv*Dv)
+    const __half* __restrict__ a,   // [T, ab_stride] (a di +a_off)
+    const __half* __restrict__ b,   // [T, ab_stride] (b di +b_off)
+    const float* __restrict__ a_log,   // [Hv]
+    const float* __restrict__ dt_bias, // [Hv]
+    __half* __restrict__ state,        // [Hv, Dv, Dk] fp16 in/out
+    __half* __restrict__ y,            // [T, y_stride] (head hv di hv*Dv)
+    int T, int Hv, int Hk, int Dk, int Dv,
+    int qk_stride, int v_stride, int ab_stride, int y_stride,
+    int a_off, int b_off) {
+    const int n = blockIdx.z;          // hv
+    const int hv = n;
+    const int hk = hv / (Hv / Hk);
+    const int dv = blockIdx.y * blockDim.y + threadIdx.y;
+    if (dv >= Dv) return;
+
+    const int lane = threadIdx.x;
+
+    const __half* qp = q + hk * Dk;
+    const __half* kp = k + hk * Dk;
+    const __half* vp = v + hv * Dv + dv;
+    __half* yp = y + hv * Dv + dv;
+
+    // State ke register (fp32) — baris S[hv, dv, :]
+    __half* sp = state + ((size_t)n * Dv + dv) * Dk;
+    float st[NPT];
+#pragma unroll
+    for (int i = 0; i < NPT; ++i) {
+        int sidx = NPT * lane + i;
+        st[i] = (sidx < Dk) ? __half2float(sp[sidx]) : 0.0f;
+    }
+
+    const float al = a_log[hv];
+    const float dtb = dt_bias[hv];
+
+    for (int t = 0; t < T; ++t) {
+        // Gating math replika kernel Mojo (HAS_PARAMS=True)
+        float a_val = __half2float(a[(size_t)t * ab_stride + a_off + hv]);
+        float b_val = __half2float(b[(size_t)t * ab_stride + b_off + hv]);
+        float sp_in = a_val + dtb;
+        float spf = (sp_in > 20.0f) ? sp_in : logf(1.0f + expf(sp_in));
+        float dec = expf(-expf(al) * spf);
+        float beta = 1.0f / (1.0f + expf(-b_val));
+
+        float kt[NPT], qt[NPT];
+        float kv_mem = 0.f;
+#pragma unroll
+        for (int i = 0; i < NPT; ++i) {
+            int sidx = NPT * lane + i;
+            float kv = (sidx < Dk) ? __half2float(kp[(size_t)t * qk_stride + sidx]) : 0.0f;
+            kt[i] = kv;
+            qt[i] = (sidx < Dk) ? __half2float(qp[(size_t)t * qk_stride + sidx]) : 0.0f;
+            // Replika persis kernel per-token: decay lalu ROUND fp16 (state
+            // disimpan fp16), sedangkan kv_mem memakai nilai decay BELUM round.
+            float sdec = st[i] * dec;
+            st[i] = __half2float(__float2half(sdec));
+            kv_mem += sdec * kt[i];
+        }
+        kv_mem = gdn_seq_warp_sum(kv_mem);
+
+        float delta = (__half2float(vp[(size_t)t * v_stride]) - kv_mem) * beta;
+
+        float out = 0.f;
+#pragma unroll
+        for (int i = 0; i < NPT; ++i) {
+            // out memakai state baru BELUM round; state disimpan round fp16.
+            float snew = st[i] + kt[i] * delta;
+            out += snew * qt[i];
+            st[i] = __half2float(__float2half(snew));
+        }
+        out = gdn_seq_warp_sum(out);
+        if (lane == 0) yp[(size_t)t * y_stride] = __float2half(out);
+    }
+
+    // Tulis balik state akhir (fp16) — SEKALI untuk seluruh sekuens
+#pragma unroll
+    for (int i = 0; i < NPT; ++i) {
+        int sidx = NPT * lane + i;
+        if (sidx < Dk) sp[sidx] = __float2half(st[i]);
+    }
+}
+
+// ============================================================================
 // C ABI Export Functions (Dipanggil via Mojo FFI)
 // ============================================================================
 extern "C" {
@@ -687,6 +788,56 @@ int launch_qmm_sm75_b1_prefill_fp16(
             <<<dim3((n + QMM_BN - 1) / QMM_BN, (m + 63) / 64, l),
                dim3(128), 0, stream>>>(
                 xp, wp, sp, bp, op, m, n, k, l, bw_arg);
+    }
+
+    cudaError_t err = cudaGetLastError();
+    return (err == cudaSuccess) ? 0 : static_cast<int>(err);
+}
+
+// GDN sequence fused: seluruh chunk T token dalam 1 launch, state register.
+// a_off/b_off = offset a & b di dalam baris proj (ab_stride); v head hv di
+// hv*Dv dalam baris v_stride; y head hv di hv*Dv dalam baris y_stride.
+int launch_gdn_seq_sm75_fp16(
+    const void* q, const void* k, const void* v,
+    const void* a, const void* b,
+    const void* a_log, const void* dt_bias,
+    void* state, void* y,
+    int t_len, int hv, int hk, int dk, int dv,
+    int qk_stride, int v_stride, int ab_stride, int y_stride,
+    int a_off, int b_off,
+    cudaStream_t stream
+) {
+    const __half* qp = reinterpret_cast<const __half*>(q);
+    const __half* kp = reinterpret_cast<const __half*>(k);
+    const __half* vp = reinterpret_cast<const __half*>(v);
+    const __half* ap = reinterpret_cast<const __half*>(a);
+    const __half* bp = reinterpret_cast<const __half*>(b);
+    const float* alp = reinterpret_cast<const float*>(a_log);
+    const float* dbp = reinterpret_cast<const float*>(dt_bias);
+    __half* sp = reinterpret_cast<__half*>(state);
+    __half* yp = reinterpret_cast<__half*>(y);
+
+    // 1 warp per baris dv: block (32, 4), grid (1, ceil(Dv/4), Hv)
+    dim3 block(32, 4, 1);
+    dim3 grid(1, (dv + 3) / 4, hv);
+
+    if (dk == 128) {
+        gdn_seq_sm75_kernel<true, 4><<<grid, block, 0, stream>>>(
+            qp, kp, vp, ap, bp, alp, dbp, sp, yp,
+            t_len, hv, hk, dk, dv,
+            qk_stride, v_stride, ab_stride, y_stride, a_off, b_off);
+    } else if (dk == 256) {
+        gdn_seq_sm75_kernel<true, 8><<<grid, block, 0, stream>>>(
+            qp, kp, vp, ap, bp, alp, dbp, sp, yp,
+            t_len, hv, hk, dk, dv,
+            qk_stride, v_stride, ab_stride, y_stride, a_off, b_off);
+    } else if (dk == 64) {
+        gdn_seq_sm75_kernel<true, 2><<<grid, block, 0, stream>>>(
+            qp, kp, vp, ap, bp, alp, dbp, sp, yp,
+            t_len, hv, hk, dk, dv,
+            qk_stride, v_stride, ab_stride, y_stride, a_off, b_off);
+    } else {
+        return -101; // Dk tidak didukung instansiasi NPT
     }
 
     cudaError_t err = cudaGetLastError();

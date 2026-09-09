@@ -348,7 +348,26 @@ PYEOF
         --prompt-tokens "$PROMPT_TOKENS" --max-tokens 24 --gpu 2>&1 | tee "$DIST_DIR/infer_t4.log" \
         || echo ">> [WARN] inferensi GPU gagal — periksa log di atas"
 
-    # Run 2: jalur per-token (fallback) — pembanding stream & TOP2 di node sama
+    # Run 2: benchmark adil gaya MLX — prompt panjang (~40 token), warmup aktif.
+    # Angka 120 tok/s MLX diukur pada prompt ChatML penuh + warmup eksplisit,
+    # bukan 9 token dingin. Ini pembanding apples-to-apples.
+    PROMPT_LONG="Jelaskan secara singkat apa itu kompresi kuantisasi biner, mengapa model bahasa besar tetap bisa menghasilkan keluaran yang baik dengan bobot 1-bit, serta apa keuntungan dan kerugiannya dibanding bobot presisi penuh."
+    PROMPT_TOKENS_LONG="$(python3 - "$KMODEL" "$PROMPT_LONG" <<'PYEOF'
+import sys
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained(sys.argv[1], trust_remote_code=True)
+msgs = [{"role": "user", "content": sys.argv[2]}]
+text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+ids = tok.encode(text, add_special_tokens=False)
+print(",".join(str(i) for i in ids))
+PYEOF
+)" || { echo ">> [ERROR] Encode prompt panjang GAGAL."; exit 1; }
+    echo ">> [PROMPT-LONG] ${#PROMPT_TOKENS_LONG} token | $PROMPT_LONG"
+    BONSAI_DUMP_TOP2=1 "$WORKING/bonsai_infer" --model-dir "$KMODEL" \
+        --prompt-tokens "$PROMPT_TOKENS_LONG" --max-tokens 8 --gpu 2>&1 | tee "$DIST_DIR/infer_t4_long.log" \
+        || echo ">> [WARN] run prompt panjang gagal — periksa log"
+
+    # Run 3: jalur per-token (fallback) — pembanding stream & TOP2 di node sama
     echo ">> [AB] BONSAI_PREFILL_PER_TOKEN=1 (pembanding stream)..."
     BONSAI_DUMP_TOP2=1 BONSAI_PREFILL_PER_TOKEN=1 "$WORKING/bonsai_infer" --model-dir "$KMODEL" \
         --prompt-tokens "$PROMPT_TOKENS" --max-tokens 24 --gpu 2>&1 | tee "$DIST_DIR/infer_t4_pertoken.log" \

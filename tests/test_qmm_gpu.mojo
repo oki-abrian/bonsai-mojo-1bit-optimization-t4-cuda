@@ -10,6 +10,7 @@
 from gpu.host import DeviceContext, DeviceBuffer
 from memory import UnsafePointer, alloc
 from math import sqrt
+from time import monotonic
 from sys.ffi import OwnedDLHandle
 from src.ops import (
     CudaQmmPrefillFnFP16, CudaSyncDeviceFn, dummy_cuda_qmm_prefill_fp16,
@@ -194,6 +195,76 @@ fn run_qmm_case(ctx: DeviceContext, c: QmmCase) raises -> Bool:
     return passed
 
 
+fn bench_qmm_case(
+    ctx: DeviceContext,
+    qmm_fn: CudaQmmPrefillFnFP16,
+    sync_fn: CudaSyncDeviceFn,
+    name: String,
+    M: Int, N: Int, K: Int,
+    iters: Int
+) raises:
+    """Bench qmm terisolasi: apakah GEMM sudah DRAM-bound?
+    GB/s dihitung dari byte bobot (N*K/8) + aktivasi (M*K*2 + M*N*2)."""
+    var groups = get_scale_stride(K)
+    var row_bytes = get_weight_row_bytes(K)
+    var szx = M * K
+    var szw = N * row_bytes
+    var szs = N * groups
+    var szo = M * N
+
+    var hx16 = alloc[Scalar[DType.float16]](szx)
+    var hw = alloc[UInt8](szw)
+    var hs16 = alloc[Scalar[DType.float16]](szs)
+    var hy16 = alloc[Scalar[DType.float16]](szo)
+    for i in range(szx):
+        hx16[i] = Scalar[DType.float16](Float32((i % 17) - 8) * 0.125)
+    for i in range(szs):
+        hs16[i] = Scalar[DType.float16](Float32(1.0 + Float32(i % 5) * 0.1))
+    for i in range(szw):
+        hw[i] = UInt8((i * 37 + 13) & 0xFF)
+
+    var bx = ctx.enqueue_create_buffer[DType.float16](szx)
+    var bw = ctx.enqueue_create_buffer[DType.uint8](szw)
+    var bs = ctx.enqueue_create_buffer[DType.float16](szs)
+    var by = ctx.enqueue_create_buffer[DType.float16](szo)
+    ctx.enqueue_copy(bx, hx16)
+    ctx.enqueue_copy(bw, hw)
+    ctx.enqueue_copy(bs, hs16)
+    ctx.synchronize()
+
+    var cuda_stream = UnsafePointer[Float32, MutAnyOrigin]()
+    for _ in range(5):
+        _ = qmm_fn(
+            bx.unsafe_ptr(), bw.unsafe_ptr(), bs.unsafe_ptr(),
+            by.unsafe_ptr(),
+            Int32(M), Int32(N), Int32(K), Int32(1),
+            Int32(0), cuda_stream
+        )
+    _ = sync_fn()
+
+    var t0 = monotonic()
+    for _ in range(iters):
+        _ = qmm_fn(
+            bx.unsafe_ptr(), bw.unsafe_ptr(), bs.unsafe_ptr(),
+            by.unsafe_ptr(),
+            Int32(M), Int32(N), Int32(K), Int32(1),
+            Int32(0), cuda_stream
+        )
+    _ = sync_fn()
+    var ms = Float64(monotonic() - t0) / 1e6 / Float64(iters)
+
+    var bytes = Float64(szw) + Float64(szx) * 2.0 + Float64(szs) * 2.0 + Float64(szo) * 2.0
+    var gbps = bytes / (ms * 1e-3) / 1e9
+    var gmacs = Float64(N) * Float64(K) * Float64(M) / (ms * 1e-3) / 1e9
+    print("[BENCH-QMM]", name, "| M=", M, "N=", N, "K=", K,
+          "|", ms, "ms/iter |", gbps, "GB/s |", gmacs, "GMAC/s")
+
+    hx16.free()
+    hw.free()
+    hs16.free()
+    hy16.free()
+
+
 fn main() raises:
     print("=================================================================")
     print(">> TES DIFERENSIAL PREFILL BATCHED QMM WMMA v2 (nvcc FFI) vs FP64 CPU")
@@ -227,3 +298,17 @@ fn main() raises:
         print(">> HASIL AKHIR: TERDAPAT KASUS GAGAL PADA QMM PREFILL!")
         raise Error("qmm prefill differential FAILED")
     print(">> HASIL AKHIR: SEMUA KASUS QMM PREFILL PASS!")
+
+    # ---- Bench terisolasi produksi (M=9 chunk ChatML) ----
+    var h_buf = alloc[OwnedDLHandle](1)
+    h_buf.init_pointee_move(try_open_cuda_lib())
+    var qmm_fn = h_buf[].get_function[CudaQmmPrefillFnFP16]("launch_qmm_sm75_b1_prefill_fp16")
+    var sync_fn = h_buf[].get_function[CudaSyncDeviceFn]("qmv_sm75_device_synchronize")
+    bench_qmm_case(ctx, qmm_fn, sync_fn, "gateup", 9, 34816, 5120, 50)
+    bench_qmm_case(ctx, qmm_fn, sync_fn, "inproj", 9, 16480, 5120, 50)
+    bench_qmm_case(ctx, qmm_fn, sync_fn, "down", 9, 5120, 17408, 50)
+    bench_qmm_case(ctx, qmm_fn, sync_fn, "outproj", 9, 5120, 6144, 50)
+    bench_qmm_case(ctx, qmm_fn, sync_fn, "qproj", 9, 12288, 5120, 50)
+    bench_qmm_case(ctx, qmm_fn, sync_fn, "gateup_m32", 32, 34816, 5120, 50)
+    h_buf.destroy_pointee()
+    h_buf.free()

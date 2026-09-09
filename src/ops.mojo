@@ -729,20 +729,22 @@ fn rmsnorm_sm75_launch_on[
     weight: UnsafePointer[Float32, MutAnyOrigin],
     has_weight: Bool,
     D: Int,
-    eps: Float32 = 1e-6
+    eps: Float32 = 1e-6,
+    rows: Int = 1
 ) raises:
-    """Meluncurkan RMSNorm di VRAM (1 block, 256 thread)."""
+    """Meluncurkan RMSNorm di VRAM (1 block x 256 thread per baris).
+    rows > 1 = batched prefill M-token (grid.y = baris)."""
     if has_weight and weight != UnsafePointer[Float32, MutAnyOrigin]():
         ctx.enqueue_function[rmsnorm_sm75_gpu[T, True]](
             x, out_ptr, weight, D, eps,
-            grid_dim=(1, 1, 1),
+            grid_dim=(1, rows, 1),
             block_dim=(256, 1, 1)
         )
     else:
         var null_w = UnsafePointer[Float32, MutAnyOrigin]()
         ctx.enqueue_function[rmsnorm_sm75_gpu[T, False]](
             x, out_ptr, null_w, D, eps,
-            grid_dim=(1, 1, 1),
+            grid_dim=(1, rows, 1),
             block_dim=(256, 1, 1)
         )
 
@@ -752,13 +754,14 @@ fn swiglu_sm75_launch_on[
     mut ctx: DeviceContextGPU,
     gate_up: UnsafePointer[Scalar[T], MutAnyOrigin],
     out_ptr: UnsafePointer[Scalar[T], MutAnyOrigin],
-    intermediate_size: Int
+    intermediate_size: Int,
+    rows: Int = 1
 ) raises:
-    """Meluncurkan aktivasi SwiGLU di VRAM (68 block x 256 thread)."""
+    """Meluncurkan aktivasi SwiGLU di VRAM (cdiv(inter,256) x rows block)."""
     var grid_x = cdiv(intermediate_size, 256)
     ctx.enqueue_function[swiglu_sm75_gpu[T]](
         gate_up, out_ptr, intermediate_size,
-        grid_dim=(grid_x, 1, 1),
+        grid_dim=(grid_x, rows, 1),
         block_dim=(256, 1, 1)
     )
 
@@ -768,13 +771,15 @@ fn vec_add_sm75_launch_on[
     mut ctx: DeviceContextGPU,
     x: UnsafePointer[Scalar[T], MutAnyOrigin],
     res: UnsafePointer[Scalar[T], MutAnyOrigin],
-    D: Int
+    D: Int,
+    rows: Int = 1
 ) raises:
-    """Meluncurkan in-place residual addition di VRAM: x += res."""
+    """Meluncurkan in-place residual addition di VRAM: x += res.
+    rows > 1 = batched prefill M-token (grid.y = baris)."""
     var grid_x = cdiv(D, 256)
     ctx.enqueue_function[vec_add_sm75_gpu[T]](
         x, res, D,
-        grid_dim=(grid_x, 1, 1),
+        grid_dim=(grid_x, rows, 1),
         block_dim=(256, 1, 1)
     )
 
@@ -793,6 +798,60 @@ fn copy_vec_sm75_launch_on[
         grid_dim=(grid_x, 1, 1),
         block_dim=(256, 1, 1)
     )
+
+# GDN sequence fused (tiru gdn_step_kernel MLX fork): 1 launch per layer
+# untuk seluruh chunk T token, state di register.
+alias CudaGdnSeqFnFP16 = fn(
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # q
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # k
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # v
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # a
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # b
+    UnsafePointer[Float32, MutAnyOrigin],                # a_log
+    UnsafePointer[Float32, MutAnyOrigin],                # dt_bias
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # state fp16 in/out
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # y [T, y_stride]
+    Int32, Int32, Int32, Int32, Int32,                   # T, Hv, Hk, Dk, Dv
+    Int32, Int32, Int32, Int32,                          # qk,v,ab,y strides
+    Int32, Int32,                                        # a_off, b_off
+    UnsafePointer[Float32, MutAnyOrigin]                 # stream
+) -> Int32
+
+
+fn gdn_seq_sm75_try_launch(
+    ctx: DeviceContextGPU,
+    q: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    k: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    v: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    a: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    b: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    a_log: UnsafePointer[Float32, MutAnyOrigin],
+    dt_bias: UnsafePointer[Float32, MutAnyOrigin],
+    state: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    y: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    T: Int, Hv: Int, Hk: Int, Dk: Int, Dv: Int,
+    qk_stride: Int, v_stride: Int, ab_stride: Int, y_stride: Int,
+    a_off: Int, b_off: Int
+) -> Bool:
+    """Jalankan kernel GDN sequence fused via FFI. False = .so tidak tersedia
+    (pemanggil fallback ke loop per-token)."""
+    var disable = getenv("BONSAI_DISABLE_CUDA_FFI")
+    if disable and (disable == "1" or disable == "true"):
+        return False
+    try:
+        var h = try_open_cuda_lib()
+        var f = h.get_function[CudaGdnSeqFnFP16]("launch_gdn_seq_sm75_fp16")
+        var cuda_stream = UnsafePointer[Float32, MutAnyOrigin]()
+        var ret = f(
+            q, k, v, a, b, a_log, dt_bias, state, y,
+            Int32(T), Int32(Hv), Int32(Hk), Int32(Dk), Int32(Dv),
+            Int32(qk_stride), Int32(v_stride), Int32(ab_stride), Int32(y_stride),
+            Int32(a_off), Int32(b_off), cuda_stream
+        )
+        return ret == 0
+    except:
+        return False
+
 
 fn causal_conv1d_sm75_launch_on[
     T: DType
@@ -831,13 +890,18 @@ fn head_rmsnorm_sm75_launch_on[
     head_dim: Int,
     scale_factor: Float32,
     eps: Float32 = 1e-6,
-    stride: Int = 0
+    stride: Int = 0,
+    rows: Int = 1,
+    row_stride: Int = 0,
+    out_row_stride: Int = 0
 ) raises:
-    """Meluncurkan Head RMSNorm (Q-Norm & K-Norm) tanpa bobot di VRAM (untuk GDN)."""
+    """Meluncurkan Head RMSNorm (Q-Norm & K-Norm) tanpa bobot di VRAM (untuk GDN).
+    rows > 1 = batched prefill (grid.y = baris token, row_stride = lebar baris)."""
     var null_w = UnsafePointer[Float32, MutAnyOrigin]()
     ctx.enqueue_function[head_rmsnorm_sm75_gpu[T, False]](
-        x, out_ptr, null_w, head_dim, scale_factor, eps, stride,
-        grid_dim=(num_heads, 1, 1),
+        x, out_ptr, null_w, head_dim, scale_factor, eps, stride, row_stride,
+        out_row_stride,
+        grid_dim=(num_heads, rows, 1),
         block_dim=(32, 1, 1)
     )
 
@@ -853,20 +917,28 @@ fn head_rmsnorm_sm75_launch_on[
     weight: UnsafePointer[Float32, MutAnyOrigin],
     has_weight: Bool,
     eps: Float32 = 1e-6,
-    stride: Int = 0
+    stride: Int = 0,
+    rows: Int = 1,
+    row_stride: Int = 0,
+    out_row_stride: Int = 0
 ) raises:
-    """Meluncurkan Head RMSNorm berbobot di VRAM (untuk Gated Attention)."""
+    """Meluncurkan Head RMSNorm berbobot di VRAM (untuk Gated Attention).
+    CATATAN: out_row_stride WAJIB diteruskan eksplisit ke kernel —
+    enqueue_function tidak mengisi param kernel yang di-default
+    (bug Run AU/AV: CUDA_ERROR_INVALID_VALUE, 8 arg vs kernel 9 param)."""
     if has_weight and weight != UnsafePointer[Float32, MutAnyOrigin]():
         ctx.enqueue_function[head_rmsnorm_sm75_gpu[T, True]](
-            x, out_ptr, weight, head_dim, scale_factor, eps, stride,
-            grid_dim=(num_heads, 1, 1),
+            x, out_ptr, weight, head_dim, scale_factor, eps, stride, row_stride,
+            out_row_stride,
+            grid_dim=(num_heads, rows, 1),
             block_dim=(32, 1, 1)
         )
     else:
         var null_w = UnsafePointer[Float32, MutAnyOrigin]()
         ctx.enqueue_function[head_rmsnorm_sm75_gpu[T, False]](
-            x, out_ptr, null_w, head_dim, scale_factor, eps, stride,
-            grid_dim=(num_heads, 1, 1),
+            x, out_ptr, null_w, head_dim, scale_factor, eps, stride, row_stride,
+            out_row_stride,
+            grid_dim=(num_heads, rows, 1),
             block_dim=(32, 1, 1)
         )
 
@@ -919,20 +991,24 @@ fn gdn_norm_gate_sm75_launch_on[
     has_norm_w: Bool,
     H_v: Int,
     D_v: Int,
-    eps: Float32 = 1e-6
+    eps: Float32 = 1e-6,
+    rows: Int = 1,
+    out_row_stride: Int = 0,
+    z_row_stride: Int = 0
 ) raises:
-    """Meluncurkan Fused GDN Gating & Per-Head RMSNorm di VRAM."""
+    """Meluncurkan Fused GDN Gating & Per-Head RMSNorm di VRAM.
+    rows > 1 = batched prefill (grid.y = baris; stride per baris eksplisit)."""
     if has_norm_w and norm_w != UnsafePointer[Float32, MutAnyOrigin]():
         ctx.enqueue_function[gdn_norm_gate_sm75_gpu[T, True]](
-            gdn_out, z, norm_w, D_v, eps,
-            grid_dim=(H_v, 1, 1),
+            gdn_out, z, norm_w, D_v, eps, out_row_stride, z_row_stride,
+            grid_dim=(H_v, rows, 1),
             block_dim=(D_v, 1, 1)
         )
     else:
         var null_w = UnsafePointer[Float32, MutAnyOrigin]()
         ctx.enqueue_function[gdn_norm_gate_sm75_gpu[T, False]](
-            gdn_out, z, null_w, D_v, eps,
-            grid_dim=(H_v, 1, 1),
+            gdn_out, z, null_w, D_v, eps, out_row_stride, z_row_stride,
+            grid_dim=(H_v, rows, 1),
             block_dim=(D_v, 1, 1)
         )
 

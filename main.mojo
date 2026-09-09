@@ -679,6 +679,15 @@ fn main() raises:
     print(">> Prompt tokens:", prompt_len, "| max_tokens:", max_tokens)
 
     # ---------------- 6. Generasi greedy ----------------
+    # Warmup clock GPU (metodologi benchmark MLX): beberapa iterasi GEMM
+    # terbesar (lm_head) menaikkan clock ke keadaan sustain SEBELUM timer —
+    # menghapus bias cold-clock pada angka prefill. BONSAI_WARMUP=0 mematikan.
+    var warmup_env = getenv("BONSAI_WARMUP")
+    if use_gpu_matmul() and not (warmup_env and warmup_env == "0"):
+        for _ in range(12):
+            lm_proj.forward_device(act_x_norm_dev, act_logits_dev, 1)
+        gpu_ctx_ptr[].synchronize()
+
     var t_all = monotonic()
     var hidden = alloc[Float32](D)
     var generated = alloc[Int](max_tokens + 1)

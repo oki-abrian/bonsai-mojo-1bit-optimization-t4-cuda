@@ -7,13 +7,19 @@ from memory import UnsafePointer, alloc
 from os import getenv
 from time import monotonic
 from gpu.host import DeviceBuffer
+from math import sqrt
 from .config import QwenConfig
 from .norm import rms_norm
 from .linear import QwenLinear1Bit, DeviceContextGPU
 from .gated_delta import GatedDeltaNetState, qwen3_5_gdn_step, qwen3_5_gdn_step_gpu, qwen3_5_gdn_step_gpu_from_proj
 from .attention import AttentionKVCache, qwen3_5_gated_attention_step, qwen3_5_gated_attention_step_gpu, qwen3_5_gated_attention_step_gpu_from_proj
 from .mlp import qwen3_5_swiglu_mlp_step, qwen3_5_swiglu_mlp_step_gpu
-from src.ops import rmsnorm_sm75_launch_on, vec_add_sm75_launch_on, swiglu_sm75_launch_on
+from src.ops import (
+    rmsnorm_sm75_launch_on, vec_add_sm75_launch_on, swiglu_sm75_launch_on,
+    gdn_seq_sm75_try_launch, gdn_recurrence_sm75_launch_on,
+    gdn_norm_gate_sm75_launch_on, causal_conv1d_sm75_launch_on,
+    head_rmsnorm_sm75_launch_on
+)
 
 struct QwenDecoderLayer:
     """
@@ -439,32 +445,100 @@ struct QwenDecoderLayer:
             var conv_dim = self.config.gdn_conv_dim
             var v_dim = self.config.gdn_num_v_heads * self.config.gdn_head_v_dim
             var qk_dim = self.config.gdn_num_k_heads * self.config.gdn_head_k_dim
+            var inv_scale_k_gdn = 1.0 / sqrt(Float32(self.config.gdn_head_k_dim))
+            var inv_scale_q_gdn = inv_scale_k_gdn * inv_scale_k_gdn
 
-            # 1. Pre-Layer RMSNorm per baris
-            for t in range(M):
-                rmsnorm_sm75_launch_on[T](
-                    ctx, hidden_m_dev.offset(t * D), x_norm_m_dev.offset(t * D),
-                    self.input_layernorm_w_dev,
-                    self.input_layernorm_w_dev != UnsafePointer[Float32, MutAnyOrigin](),
-                    D, self.config.rms_norm_eps
-                )
+            # 1. Pre-Layer RMSNorm batched (1 launch, grid.y = M)
+            rmsnorm_sm75_launch_on[T](
+                ctx, hidden_m_dev, x_norm_m_dev,
+                self.input_layernorm_w_dev,
+                self.input_layernorm_w_dev != UnsafePointer[Float32, MutAnyOrigin](),
+                D, self.config.rms_norm_eps, M
+            )
 
             # 2. in_proj GEMM batched (bobot 16480x5120 dibaca SEKALI)
             self.gdn_in_proj_all.forward_prefill_device(x_norm_m_dev, proj_m_dev, M)
 
-            # 3. Per-token stateful: conv -> q/k norm -> rekurensi -> gate
+            # WAJIB sebelum conv: alokasi + zeroing buffer state device.
+            if not gdn_state.dev_ready:
+                gdn_state.init_device(ctx)
+
+            # 3. STRUKTUR PREFILL MLX: state GDN di register, 1 launch per layer.
+            #    a) conv kausal per token (window state di global, kecil)
+            #    b) q/k norm batched (grid (Hk, M))
+            #    c) rekurensi delta-rule SELURUH chunk via FFI gdn_seq
+            #    d) gate silu(z)+rmsnorm batched (grid (Hv, M))
             for t in range(M):
-                qwen3_5_gdn_step_gpu_from_proj(
-                    ctx_ptr,
+                causal_conv1d_sm75_launch_on[T](
+                    ctx,
+                    gdn_state.conv_buf_dev,
                     proj_m_dev.offset(t * in_proj_n),
-                    conv_m_dev.offset(t * conv_dim),
-                    qn_m_dev.offset(t * qk_dim),
-                    kn_m_dev.offset(t * qk_dim),
-                    gdn_m_dev.offset(t * v_dim),
                     self.gdn_conv_weights_dev,
-                    self.gdn_a_log_dev, self.gdn_dt_bias_dev, self.gdn_norm_w_dev,
-                    self.gdn_has_params,
-                    gdn_state, self.config, pos_base + t
+                    self.gdn_conv_weights_dev != UnsafePointer[Float32, MutAnyOrigin](),
+                    conv_m_dev.offset(t * conv_dim),
+                    conv_dim
+                )
+            head_rmsnorm_sm75_launch_on[T](
+                ctx, conv_m_dev, qn_m_dev, self.config.gdn_num_k_heads,
+                self.config.gdn_head_k_dim, inv_scale_q_gdn, self.config.rms_norm_eps,
+                0, M, conv_dim, qk_dim
+            )
+            head_rmsnorm_sm75_launch_on[T](
+                ctx, conv_m_dev.offset(self.config.gdn_num_k_heads * self.config.gdn_head_k_dim),
+                kn_m_dev, self.config.gdn_num_k_heads,
+                self.config.gdn_head_k_dim, inv_scale_k_gdn, self.config.rms_norm_eps,
+                0, M, conv_dim, qk_dim
+            )
+            var a_off_gdn = conv_dim + v_dim + self.config.gdn_num_v_heads
+            var b_off_gdn = conv_dim + v_dim
+            var gdn_seq_ok = gdn_seq_sm75_try_launch(
+                ctx,
+                qn_m_dev, kn_m_dev,
+                conv_m_dev.offset(2 * self.config.gdn_num_k_heads * self.config.gdn_head_k_dim),
+                proj_m_dev, proj_m_dev,
+                self.gdn_a_log_dev, self.gdn_dt_bias_dev,
+                gdn_state.state_s_dev,
+                gdn_m_dev,
+                M, self.config.gdn_num_v_heads, self.config.gdn_num_k_heads,
+                self.config.gdn_head_k_dim, self.config.gdn_head_v_dim,
+                qk_dim, conv_dim, in_proj_n, v_dim,
+                a_off_gdn, b_off_gdn
+            )
+            if not gdn_seq_ok:
+                # Fallback: rekurensi + gate per token (conv & norm SUDAH jalan
+                # di atas — jangan diulang agar tidak konvolusi ganda).
+                for t in range(M):
+                    gdn_recurrence_sm75_launch_on[T](
+                        ctx,
+                        gdn_state.state_s_dev,
+                        qn_m_dev.offset(t * qk_dim),
+                        kn_m_dev.offset(t * qk_dim),
+                        conv_m_dev.offset(t * conv_dim + 2 * self.config.gdn_num_k_heads * self.config.gdn_head_k_dim),
+                        proj_m_dev.offset(t * in_proj_n + a_off_gdn),
+                        proj_m_dev.offset(t * in_proj_n + b_off_gdn),
+                        self.gdn_a_log_dev, self.gdn_dt_bias_dev, self.gdn_has_params,
+                        gdn_m_dev.offset(t * v_dim),
+                        self.config.gdn_num_v_heads // self.config.gdn_num_k_heads,
+                        self.config.gdn_num_v_heads, self.config.gdn_head_v_dim,
+                        self.config.gdn_head_k_dim
+                    )
+                    gdn_norm_gate_sm75_launch_on[T](
+                        ctx,
+                        gdn_m_dev.offset(t * v_dim),
+                        proj_m_dev.offset(t * in_proj_n + conv_dim),
+                        self.gdn_norm_w_dev, self.gdn_has_params,
+                        self.config.gdn_num_v_heads, self.config.gdn_head_v_dim,
+                        self.config.rms_norm_eps
+                    )
+            else:
+                # Gate silu(z) + per-head rmsnorm batched (grid (Hv, M))
+                gdn_norm_gate_sm75_launch_on[T](
+                    ctx,
+                    gdn_m_dev,
+                    proj_m_dev.offset(conv_dim),
+                    self.gdn_norm_w_dev, self.gdn_has_params,
+                    self.config.gdn_num_v_heads, self.config.gdn_head_v_dim,
+                    self.config.rms_norm_eps, M, v_dim, in_proj_n
                 )
 
             # 4. out_proj GEMM batched
@@ -481,14 +555,13 @@ struct QwenDecoderLayer:
             # baris t+1 dan merusak hidden state (bug Run AM/AN).
             var attn_out_stride = H_q * Dh
 
-            # 1. Pre-Layer RMSNorm per baris
-            for t in range(M):
-                rmsnorm_sm75_launch_on[T](
-                    ctx, hidden_m_dev.offset(t * D), x_norm_m_dev.offset(t * D),
-                    self.input_layernorm_w_dev,
-                    self.input_layernorm_w_dev != UnsafePointer[Float32, MutAnyOrigin](),
-                    D, self.config.rms_norm_eps
-                )
+            # 1. Pre-Layer RMSNorm batched (1 launch, grid.y = M)
+            rmsnorm_sm75_launch_on[T](
+                ctx, hidden_m_dev, x_norm_m_dev,
+                self.input_layernorm_w_dev,
+                self.input_layernorm_w_dev != UnsafePointer[Float32, MutAnyOrigin](),
+                D, self.config.rms_norm_eps, M
+            )
 
             # 2. q/k/v GEMM batched (3 bobot masing-masing dibaca SEKALI)
             self.attn_q_proj.forward_prefill_device(x_norm_m_dev, proj_m_dev, M)
@@ -514,31 +587,26 @@ struct QwenDecoderLayer:
             # 4. o_proj GEMM batched: attn out (gdn_m rows, [M,6144]) -> sublayer_m
             self.attn_o_proj.forward_prefill_device(gdn_m_dev, sublayer_m_dev, M)
 
-        # 5. Residual 1 batched per baris
-        for t in range(M):
-            vec_add_sm75_launch_on[T](ctx, hidden_m_dev.offset(t * D), sublayer_m_dev.offset(t * D), D)
+        # 5. Residual 1 batched (1 launch, grid.y = M)
+        vec_add_sm75_launch_on[T](ctx, hidden_m_dev, sublayer_m_dev, D, M)
 
-        # 6. Post-Attention RMSNorm per baris
-        for t in range(M):
-            rmsnorm_sm75_launch_on[T](
-                ctx, hidden_m_dev.offset(t * D), x_norm_m_dev.offset(t * D),
-                self.post_attn_layernorm_w_dev,
-                self.post_attn_layernorm_w_dev != UnsafePointer[Float32, MutAnyOrigin](),
-                D, self.config.rms_norm_eps
-            )
+        # 6. Post-Attention RMSNorm batched (1 launch, grid.y = M)
+        rmsnorm_sm75_launch_on[T](
+            ctx, hidden_m_dev, x_norm_m_dev,
+            self.post_attn_layernorm_w_dev,
+            self.post_attn_layernorm_w_dev != UnsafePointer[Float32, MutAnyOrigin](),
+            D, self.config.rms_norm_eps, M
+        )
 
-        # 7. SwiGLU MLP batched: gate_up GEMM -> swiglu per baris -> down GEMM
+        # 7. SwiGLU MLP batched: gate_up GEMM -> swiglu (1 launch) -> down GEMM
         self.mlp_gate_up_proj.forward_prefill_device(x_norm_m_dev, gate_up_m_dev, M)
-        for t in range(M):
-            swiglu_sm75_launch_on[T](
-                ctx, gate_up_m_dev.offset(t * 2 * self.config.intermediate_size),
-                swiglu_m_dev.offset(t * self.config.intermediate_size),
-                self.config.intermediate_size
-            )
+        swiglu_sm75_launch_on[T](
+            ctx, gate_up_m_dev, swiglu_m_dev,
+            self.config.intermediate_size, M
+        )
         self.mlp_down_proj.forward_prefill_device(swiglu_m_dev, mlp_m_dev, M)
 
-        # 8. Residual 2 batched per baris
-        for t in range(M):
-            vec_add_sm75_launch_on[T](ctx, hidden_m_dev.offset(t * D), mlp_m_dev.offset(t * D), D)
+        # 8. Residual 2 batched (1 launch, grid.y = M)
+        vec_add_sm75_launch_on[T](ctx, hidden_m_dev, mlp_m_dev, D, M)
 
 

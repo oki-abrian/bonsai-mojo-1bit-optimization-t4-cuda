@@ -44,10 +44,15 @@ fn rmsnorm_sm75_gpu[
     ]()
 
     # 1. Akumulasi jumlah kuadrat x[i]^2 dengan grid stride loop
+    # block_idx.y = indeks baris (batched prefill M-token; decode selalu 0)
+    var row = block_idx.y
+    var x_row = x_ptr.offset(row * D)
+    var o_row = out_ptr.offset(row * D)
+
     var sum_sq: Float32 = 0.0
     var i = tid
     while i < D:
-        var val = Float32(x_ptr[i])
+        var val = Float32(x_row[i])
         sum_sq += val * val
         i += 256
 
@@ -79,12 +84,12 @@ fn rmsnorm_sm75_gpu[
     # 4. Normalisasi dan kalikan bobot gamma
     var j = tid
     while j < D:
-        var val = Float32(x_ptr[j])
+        var val = Float32(x_row[j])
         var gamma: Float32 = 1.0
         @parameter
         if HAS_WEIGHT:
             gamma = weight_ptr[j]
-        out_ptr[j] = Scalar[T](val * inv_rms * gamma)
+        o_row[j] = Scalar[T](val * inv_rms * gamma)
         j += 256
 
 
@@ -102,13 +107,17 @@ fn swiglu_sm75_gpu[
     Aktivasi SwiGLU FFN: out[i] = silu(gate[i]) * up[i]
     gate berada di [0 .. intermediate_size - 1],
     up berada di [intermediate_size .. 2*intermediate_size - 1].
+    block_idx.y = indeks baris (batched prefill M-token; decode selalu 0).
     """
+    var row = block_idx.y
+    var gu_row = gate_up_ptr.offset(row * 2 * intermediate_size)
+    var o_row = out_ptr.offset(row * intermediate_size)
     var idx = block_idx.x * 256 + thread_idx.x
     if idx < intermediate_size:
-        var g = Float32(gate_up_ptr[idx])
-        var u = Float32(gate_up_ptr[intermediate_size + idx])
+        var g = Float32(gu_row[idx])
+        var u = Float32(gu_row[intermediate_size + idx])
         var silu_g = g / (1.0 + exp(-g))
-        out_ptr[idx] = Scalar[T](silu_g * u)
+        o_row[idx] = Scalar[T](silu_g * u)
 
 
 # ----------------------------------------------------------------------------
@@ -123,10 +132,14 @@ fn vec_add_sm75_gpu[
 ):
     """
     In-place residual addition di VRAM: x[i] += res[i]
+    block_idx.y = indeks baris (batched prefill M-token; decode selalu 0).
     """
+    var row = block_idx.y
+    var x_row = x_ptr.offset(row * D)
+    var res_row = res_ptr.offset(row * D)
     var idx = block_idx.x * 256 + thread_idx.x
     if idx < D:
-        x_ptr[idx] = Scalar[T](Float32(x_ptr[idx]) + Float32(res_ptr[idx]))
+        x_row[idx] = Scalar[T](Float32(x_row[idx]) + Float32(res_row[idx]))
 
 
 fn copy_vec_sm75_gpu[
@@ -202,7 +215,9 @@ fn head_rmsnorm_sm75_gpu[
     head_dim: Int,
     scale_factor: Float32,
     eps: Float32,
-    stride: Int = 0
+    stride: Int = 0,
+    row_stride: Int = 0,
+    out_row_stride: Int = 0
 ):
     """
     Per-head RMSNorm untuk Q dan K: 1 block per head, 32 thread (1 warp).
@@ -212,7 +227,12 @@ fn head_rmsnorm_sm75_gpu[
     var h = block_idx.x
     var tid = thread_idx.x
     var eff_stride = stride if stride > 0 else head_dim
-    var head_offset = h * eff_stride
+    # block_idx.y = baris (batched prefill M-token; decode selalu 0).
+    # row_stride = lebar baris INPUT (mis. conv_dim=10240), out_row_stride =
+    # lebar baris OUTPUT (mis. qk_dim=2048) — beda bila layout x != y.
+    var o_row_stride = out_row_stride if out_row_stride > 0 else row_stride
+    var head_offset = block_idx.y * row_stride + h * eff_stride
+    var head_offset_o = block_idx.y * o_row_stride + h * eff_stride
 
     var smem = stack_allocation[
         32, Float32, alignment = 16, address_space = AddressSpace.SHARED
@@ -245,7 +265,7 @@ fn head_rmsnorm_sm75_gpu[
         @parameter
         if HAS_WEIGHT:
             normed *= weight_ptr[od]
-        out_ptr[head_offset + od] = Scalar[T](normed)
+        out_ptr[head_offset_o + od] = Scalar[T](normed)
         od += 32
 
 
@@ -366,7 +386,9 @@ fn gdn_norm_gate_sm75_gpu[
     z_ptr: UnsafePointer[Scalar[T], MutAnyOrigin],
     norm_w: UnsafePointer[Float32, MutAnyOrigin],
     D_v: Int,
-    eps: Float32
+    eps: Float32,
+    out_row_stride: Int = 0,
+    z_row_stride: Int = 0
 ):
     """
     1 block per head hv (64 block total), 128 thread per block.
@@ -385,9 +407,9 @@ fn gdn_norm_gate_sm75_gpu[
         32, Float32, alignment = 16, address_space = AddressSpace.SHARED
     ]()
 
-    var z_val = Float32(z_ptr[idx])
+    var z_val = Float32(z_ptr[block_idx.y * z_row_stride + idx])
     var silu_z = z_val / (1.0 + exp(-z_val))
-    var gated_val = Float32(gdn_out[idx]) * silu_z
+    var gated_val = Float32(gdn_out[block_idx.y * out_row_stride + idx]) * silu_z
 
     # Hitung mean kuadrat pada 128 thread
     var sq = gated_val * gated_val
@@ -416,7 +438,7 @@ fn gdn_norm_gate_sm75_gpu[
     @parameter
     if HAS_NORM_W:
         gamma = norm_w[dv]
-    gdn_out[idx] = Scalar[T](gated_val * inv_rms * gamma)
+    gdn_out[block_idx.y * out_row_stride + idx] = Scalar[T](gated_val * inv_rms * gamma)
 
 
 # ----------------------------------------------------------------------------
