@@ -197,7 +197,9 @@ fn _khq_env_int(name: String, fallback: Int) -> Int:
     if not v:
         return fallback
     try:
-        return Int(v[0])
+        # Int(v), BUKAN Int(v[0]): v[0] hanya karakter pertama, jadi "16"
+        # terbaca 1 (ini pernah membuat BONSAI_KHQ_SPLITS=16 jadi 1 split).
+        return Int(v)
     except:
         return fallback
 

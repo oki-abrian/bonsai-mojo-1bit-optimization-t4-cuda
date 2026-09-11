@@ -605,6 +605,16 @@ def prefix_vs(ref, got):
     return p, n
 
 
+def eff_splits(path):
+    """Baca jumlah split yang BENAR-BENAR dipakai dari log run itu."""
+    try:
+        txt = open(path).read()
+    except FileNotFoundError:
+        return None
+    m = re.search(r"split-K attention: maks\s+(\d+)\s+jalan", txt)
+    return int(m.group(1)) if m else None
+
+
 print("   --- A/B split-K (ms/token, tanpa debug) ---")
 base = ms_per_token(os.path.join(d, "khq_base.log"))
 ref_toks = toks(os.path.join(d, "khq_base.log"))
@@ -613,15 +623,18 @@ if base:
 ref = ms_per_token(os.path.join(d, "khq_split_1.log"))
 rows = []
 for sp in (1, 4, 8, 16):
-    v = ms_per_token(os.path.join(d, f"khq_split_{sp}.log"))
+    p = os.path.join(d, f"khq_split_{sp}.log")
+    v = ms_per_token(p)
     if v is None:
         continue
     rows.append((sp, v))
-    got = toks(os.path.join(d, f"khq_split_{sp}.log"))
-    p, n = prefix_vs(ref_toks, got)
+    got = toks(p)
+    pfx, n = prefix_vs(ref_toks, got)
+    eff = eff_splits(p)
     tag = "  <- jalur lama (bit-exact)" if sp == 1 else ""
+    warn = "" if eff == sp else f"  [WARN] jalan sebagai splits={eff}"
     print(f"   KHQ splits={sp:<2}                  : {v:.2f} ms/token | "
-          f"prefix token {p}/{n}{tag}")
+          f"prefix token {pfx}/{n}{tag}{warn}")
 if ref and len(rows) > 1:
     best_sp, best = min(rows, key=lambda r: r[1])
     print(f"   split-K terbaik: splits={best_sp} -> {best:.2f} ms/token "
