@@ -21,6 +21,7 @@ from math import sqrt
 from io.file import FileHandle, open
 from src.ops import (
     copy_vec_sm75_launch_on,
+    khq_ring_dual_sm75_launch_on,
     khq_state_slot_cell,
     khq_compress_sm75_try_launch,
     khq_attn_sm75_try_launch,
@@ -114,7 +115,6 @@ struct KhqLayer:
     var h_vsm: UnsafePointer[DeviceBuffer[DType.uint8], MutAnyOrigin]
 
     # scratch
-    var h_ktmp: UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]
     var h_qbuf: UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]
     var h_ac: UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]
     var h_aw: UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]
@@ -150,7 +150,6 @@ struct KhqLayer:
         self.h_vnorm = UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]()
         self.h_vrn = UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]()
         self.h_vsm = UnsafePointer[DeviceBuffer[DType.uint8], MutAnyOrigin]()
-        self.h_ktmp = UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]()
         self.h_qbuf = UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]()
         self.h_ac = UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]()
         self.h_aw = UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]()
@@ -420,7 +419,6 @@ fn khq_init_layer(
     L[].h_vnorm = _mk_f16(ctx, rows_total)
     L[].h_vrn = _mk_f16(ctx, rows_total)
     L[].h_vsm = _mk_u8(ctx, rows_total * 4)
-    L[].h_ktmp = _mk_f16(ctx, kv)
     L[].h_qbuf = _mk_f16(ctx, H_q * d)
     L[].h_ac = _mk_f32(ctx, H_q * (d + 2))
     L[].h_aw = _mk_f32(ctx, H_q * (d + 2))
@@ -432,15 +430,22 @@ fn khq_capture_unroped(
     mut ctx: DeviceContextGPU, layer_idx: Int,
     k_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
 ) raises:
-    """Salin K post-norm PRE-rope ke scratch — dipanggil SEBELUM partial_rope
-    supaya kompresi tidak perlu unrotate (kontrak user)."""
+    """Salin K post-norm PRE-rope LANGSUNG ke slot ring unroped — dipanggil
+    SEBELUM partial_rope supaya kompresi tidak perlu unrotate (kontrak user).
+
+    Dulu ini menulis ke staging h_ktmp lalu khq_step menyalin h_ktmp ke ring:
+    dua kernel + dua lintasan 2 KB per layer per token untuk data yang sama.
+    Karena write_pos belum naik saat fungsi ini dipanggil, slotnya sama dengan
+    yang akan dipakai khq_step, jadi salinan perantara itu memang sia-sia."""
     if not _g()[].active or not _g()[].ready or layer_idx < 0 or layer_idx >= KHQ_MAX_LAYERS:
         return
     var L = UnsafePointer[KhqLayer, MutAnyOrigin](_g()[].layers + layer_idx)
     if not L[].ready:
         return
+    var kv = L[].H_kv * L[].D
+    var slot = L[].write_pos % KHQ_RING
     copy_vec_sm75_launch_on[DType.float16](
-        ctx, L[].h_ktmp[].unsafe_ptr(), k_dev, L[].H_kv * L[].D)
+        ctx, L[].h_ring_u[].unsafe_ptr() + slot * kv, k_dev, kv)
 
 
 fn khq_step(
@@ -464,14 +469,20 @@ fn khq_step(
     var kv = H_kv * d
     var slot = L[].write_pos % KHQ_RING
 
-    # 1. tulis ke ring (K unroped utk kompresi; K roped + V utk jendela)
+    # 1. tulis ke ring: K roped + V sekaligus (satu launch, bukan dua), lalu
+    #    (kalau perlu) kompres 128 token tertua dari ring. K unroped sudah
+    #    ditulis khq_capture_unroped sebelum RoPE.
+    #
+    #    Sync di AWAL fase: kalau tidak, synchronize() di akhir fase pertama
+    #    ikut menunggu seluruh kerja GPU yang diantre sejak merge+gate layer
+    #    attention sebelumnya (3 layer GDN + proyeksi layer ini), sehingga
+    #    ring-write terukur ~55 ms/token dan menutupi biaya sebenarnya.
+    if _g()[].prof:
+        ctx.synchronize()
     var t0 = monotonic() if _g()[].prof else 0
-    copy_vec_sm75_launch_on[DType.float16](
-        ctx, L[].h_ring_u[].unsafe_ptr() + slot * kv, L[].h_ktmp[].unsafe_ptr(), kv)
-    copy_vec_sm75_launch_on[DType.float16](
-        ctx, L[].h_ring_k[].unsafe_ptr() + slot * kv, k_roped_dev, kv)
-    copy_vec_sm75_launch_on[DType.float16](
-        ctx, L[].h_ring_v[].unsafe_ptr() + slot * kv, v_dev, kv)
+    khq_ring_dual_sm75_launch_on[DType.float16](
+        ctx, L[].h_ring_k[].unsafe_ptr() + slot * kv, L[].h_ring_v[].unsafe_ptr() + slot * kv,
+        k_roped_dev, v_dev, kv)
     if _g()[].prof:
         ctx.synchronize()
         khq_prof_add(KHQ_P_RING, monotonic() - t0)

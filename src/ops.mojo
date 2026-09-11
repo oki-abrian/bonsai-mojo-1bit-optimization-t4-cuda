@@ -34,7 +34,8 @@ from .kernels.elementwise_sm75 import (
     gdn_recurrence_sm75_gpu, gdn_norm_gate_sm75_gpu,
     argmax_sm75_stage1_gpu, argmax_sm75_stage2_gpu,
     partial_rope_sm75_gpu, kv_cache_append_sm75_gpu,
-    gqa_attention_sm75_gpu, embed_lookup_1bit_sm75_gpu
+    gqa_attention_sm75_gpu, embed_lookup_1bit_sm75_gpu,
+    khq_ring_dual_sm75_gpu
 )
 from gpu.host import DeviceContext as DeviceContextGPU
 
@@ -824,6 +825,28 @@ fn copy_vec_sm75_launch_on[
     var grid_x = cdiv(n, 256)
     ctx.enqueue_function[copy_vec_sm75_gpu[T]](
         dst, src, n,
+        grid_dim=(grid_x, 1, 1),
+        block_dim=(256, 1, 1)
+    )
+
+
+fn khq_ring_dual_sm75_launch_on[
+    T: DType
+](
+    mut ctx: DeviceContextGPU,
+    dst_a: UnsafePointer[Scalar[T], MutAnyOrigin],
+    dst_b: UnsafePointer[Scalar[T], MutAnyOrigin],
+    src_a: UnsafePointer[Scalar[T], MutAnyOrigin],
+    src_b: UnsafePointer[Scalar[T], MutAnyOrigin],
+    n: Int
+) raises:
+    """Tulis dua vektor dalam SATU launch: dst_a=src_a dan dst_b=src_b.
+
+    Dipakai jalur KHQ untuk menulis ring_k (K roped) dan ring_v (V) sekaligus,
+    menggantikan dua copy_vec_sm75_launch_on terpisah per layer per token."""
+    var grid_x = cdiv(n, 256)
+    ctx.enqueue_function[khq_ring_dual_sm75_gpu[T]](
+        dst_a, dst_b, src_a, src_b, n,
         grid_dim=(grid_x, 1, 1),
         block_dim=(256, 1, 1)
     )

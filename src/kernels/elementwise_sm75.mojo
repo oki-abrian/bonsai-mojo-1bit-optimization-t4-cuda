@@ -238,6 +238,28 @@ fn copy_vec_sm75_gpu[
         dst_ptr[idx] = src_ptr[idx]
 
 
+fn khq_ring_dual_sm75_gpu[
+    T: DType
+](
+    dst_a: UnsafePointer[Scalar[T], MutAnyOrigin],
+    dst_b: UnsafePointer[Scalar[T], MutAnyOrigin],
+    src_a: UnsafePointer[Scalar[T], MutAnyOrigin],
+    src_b: UnsafePointer[Scalar[T], MutAnyOrigin],
+    n: Int
+):
+    """
+    Tulis DUA vektor dalam satu launch (K roped -> ring_k, V -> ring_v).
+    KHQ meluncurkan ~4 salinan kecil per layer per token; yang membebani
+    bukan byte-nya (6 KB) melainkan jumlah launch kernel kecil yang
+    latency-bound (grid cdiv(1024,256) = 4 block). Menggabungkan dua launch
+    menjadi satu memotong separuh overhead itu tanpa mengubah data.
+    """
+    var idx = block_idx.x * 256 + thread_idx.x
+    if idx < n:
+        dst_a[idx] = src_a[idx]
+        dst_b[idx] = src_b[idx]
+
+
 # ----------------------------------------------------------------------------
 # 4. Causal Conv1D 4-Tap GPU Kernel (48 block x 256 thread = 12,288 elemen)
 # ----------------------------------------------------------------------------
