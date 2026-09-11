@@ -869,12 +869,18 @@ __global__ void khq_attn_kernel(
     const __half* __restrict__ d_vec_k,
     const __half* __restrict__ d_vec_v,
     float* __restrict__ out_attn,
+    float* __restrict__ out_partial,
     int D_v, int c_len, int h_kv, float sc,
     float a_k_param, float a_v_param, int n_rep,
     int num_queries, int num_heads, int L_q, float rope_base,
-    int start_pos)
+    int start_pos, int num_splits)
 {
-    const uint total_id = blockIdx.x;
+    // Split-K: grid = num_queries * num_splits (blockIdx.x di-decode), tiap
+    // block menggarap sepotong rentang token dan menulis partial unnormalized
+    // (acc, max_s, sum_exp) ke out_partial. num_splits == 1 -> langsung ke
+    // out_attn, jalur lama, bit-identik.
+    const uint total_id = blockIdx.x / (uint)num_splits;
+    const uint split_id = blockIdx.x % (uint)num_splits;
     if (total_id >= (uint)num_queries) return;
     const uint head_idx = total_id / (uint)L_q;
     const uint l_idx = total_id % (uint)L_q;
@@ -913,7 +919,18 @@ __global__ void khq_attn_kernel(
     }
 
     int s_limit = (L_q > 1) ? min(c_len, (int)l_idx + 1) : c_len;
-    int start_s = 0;
+    // Potongan token untuk block ini. start_s dipakai sebagai basis RoPE
+    // inkremental, jadi tiap split menginisialisasi sudut di token awalnya
+    // sendiri (eksak, cosf/sinf dari sudut sebenarnya).
+    int s_lo = 0, s_hi = s_limit;
+    if (num_splits > 1) {
+        int per = (s_limit + num_splits - 1) / num_splits;
+        s_lo = (int)split_id * per;
+        if (s_lo > s_limit) s_lo = s_limit;
+        s_hi = s_lo + per;
+        if (s_hi > s_limit) s_hi = s_limit;
+    }
+    int start_s = s_lo;
 
     float local_c_base[8];
     float local_d_vec_k[8];
@@ -944,7 +961,7 @@ __global__ void khq_attn_kernel(
     float norm_val_k = 0.0f, norm_val_v = 0.0f, energy_correction = 0.0f, sm_scale_val = 0.0f;
     uint word0 = 0, word1 = 0, word2 = 0;
     uint vq_high_lo = 0, vq_high_hi = 0;
-    if (s_limit > start_s) {
+    if (s_hi > s_lo) {
         norm_val_k = __half2float(k_norms[g_kv]);
         norm_val_v = __half2float(v_norms[g_kv]);
         energy_correction = __half2float(v_r_norms[g_kv]);
@@ -958,8 +975,8 @@ __global__ void khq_attn_kernel(
         vq_high_hi = p_v[25];
     }
 
-    for (int s = start_s; s < s_limit; s++) {
-        if ((s - start_s) > 0 && (s - start_s) % 256 == 0) {
+    for (int s = s_lo; s < s_hi; s++) {
+        if ((s - s_lo) > 0 && (s % 256) == 0) {
             for (int j = 0; j < 8; j++) {
                 float true_theta = ((float)(start_pos + s)) * freqs[j];
                 current_cos[j] = cosf(true_theta);
@@ -1072,7 +1089,7 @@ __global__ void khq_attn_kernel(
         uint next_word0 = 0, next_word1 = 0, next_word2 = 0;
         uint next_vq_high_lo = 0, next_vq_high_hi = 0;
         uint next_g_kv = next_s * h_kv + head_idx_kv;
-        if ((int)next_s < s_limit) {
+        if ((int)next_s < s_hi) {
             next_norm_val_k = __half2float(k_norms[next_g_kv]);
             next_norm_val_v = __half2float(v_norms[next_g_kv]);
             next_energy_correction = __half2float(v_r_norms[next_g_kv]);
@@ -1123,7 +1140,7 @@ __global__ void khq_attn_kernel(
         }
         for (int j = 0; j < 8; j++) acc[j] += score * v_val[j];
 
-        if ((int)next_s < s_limit) {
+        if ((int)next_s < s_hi) {
             g_kv = next_g_kv;
             norm_val_k = next_norm_val_k;
             norm_val_v = next_norm_val_v;
@@ -1179,13 +1196,62 @@ __global__ void khq_attn_kernel(
     #undef BUTTERFLY_SIMD_INV
 
     float f_s_inv = 1.0f / 16.0f;
+    float* out_base = (num_splits > 1)
+        ? (out_partial + ((size_t)total_id * (size_t)num_splits + split_id) * (size_t)(D_v + 2))
+        : (out_attn + (size_t)total_id * (size_t)(D_v + 2));
     for (int j = 0; j < 8; j++) {
-        out_attn[total_id * (D_v + 2) + tid * 8 + j] =
+        out_base[tid * 8 + j] =
             (acc[j] * f_s_inv) / (__half2float(d_vec_v[tid * 8 + j]) + 1e-8f);
     }
     if (tid == 0) {
-        out_attn[total_id * (D_v + 2) + D_v] = max_s;
-        out_attn[total_id * (D_v + 2) + D_v + 1] = sum_exp;
+        out_base[D_v] = max_s;
+        out_base[D_v + 1] = sum_exp;
+    }
+}
+
+// Gabung partial split-K dari khq_attn_kernel via logsumexp menjadi satu hasil
+// (num_queries, D+2). Satu block per query; tiap partial membawa acc
+// unnormalized + max_s + sum_exp sendiri.
+__global__ void khq_attn_reduce_kernel(
+    const float* __restrict__ partial,   // (num_queries, num_splits, D+2)
+    float* __restrict__ out_attn,        // (num_queries, D+2)
+    int num_queries, int num_splits, int D_v)
+{
+    const int qid = blockIdx.x;
+    if (qid >= num_queries) return;
+    const int stride = D_v + 2;
+    const float* base = partial + (size_t)qid * (size_t)num_splits * (size_t)stride;
+
+    __shared__ float s_M, s_den;
+    if (threadIdx.x == 0) {
+        float M = -1e20f;
+        for (int sp = 0; sp < num_splits; sp++) {
+            float m = base[(size_t)sp * stride + D_v];
+            if (m > M) M = m;
+        }
+        float den = 0.0f;
+        for (int sp = 0; sp < num_splits; sp++) {
+            const float* p = base + (size_t)sp * stride;
+            den += p[D_v + 1] * expf(p[D_v] - M);
+        }
+        s_M = M;
+        s_den = den;
+    }
+    __syncthreads();
+    const float M = s_M, den = s_den;
+
+    float* out = out_attn + (size_t)qid * stride;
+    for (int d = threadIdx.x; d < D_v; d += blockDim.x) {
+        float num = 0.0f;
+        for (int sp = 0; sp < num_splits; sp++) {
+            const float* p = base + (size_t)sp * stride;
+            num += p[d] * expf(p[D_v] - M);
+        }
+        out[d] = num;
+    }
+    if (threadIdx.x == 0) {
+        out[D_v] = M;
+        out[D_v + 1] = den;
     }
 }
 
@@ -2935,13 +3001,17 @@ int launch_khq_attn_fp16(
     const void* d_vec_k,         // (D) __half
     const void* d_vec_v,         // (D) __half
     void* out_attn,              // (num_queries, D+2) float
+    void* out_partial,           // (num_queries, num_splits, D+2) float — split-K
     int num_queries, int num_heads, int L_q, int c_len, int stride_s,
     int n_rep, float scale, float alpha_k, float alpha_v,
-    float rope_base, int start_pos,
+    float rope_base, int start_pos, int num_splits,
     cudaStream_t stream)
 {
     if (num_queries <= 0 || c_len <= 0) return -100;
-    khq_attn_kernel<<<dim3(num_queries), dim3(32), 0, stream>>>(
+    if (num_splits < 1) num_splits = 1;
+    if (num_splits > 1 && out_partial == nullptr) return -101;
+    const int grid = num_queries * num_splits;
+    khq_attn_kernel<<<dim3((unsigned)grid), dim3(32), 0, stream>>>(
         reinterpret_cast<const __half*>(q),
         reinterpret_cast<const unsigned char*>(k_payload),
         reinterpret_cast<const unsigned char*>(v_payload),
@@ -2959,11 +3029,21 @@ int launch_khq_attn_fp16(
         reinterpret_cast<const __half*>(d_vec_k),
         reinterpret_cast<const __half*>(d_vec_v),
         reinterpret_cast<float*>(out_attn),
+        reinterpret_cast<float*>(out_partial),
         256, c_len, (n_rep > 0 ? num_heads / n_rep : 1), scale,
         alpha_k, alpha_v, n_rep,
-        num_queries, num_heads, L_q, rope_base, start_pos);
+        num_queries, num_heads, L_q, rope_base, start_pos, num_splits);
     cudaError_t err = cudaGetLastError();
-    return (err == cudaSuccess) ? 0 : static_cast<int>(err);
+    if (err != cudaSuccess) return static_cast<int>(err);
+    if (num_splits > 1) {
+        khq_attn_reduce_kernel<<<dim3((unsigned)num_queries), dim3(256), 0, stream>>>(
+            reinterpret_cast<const float*>(out_partial),
+            reinterpret_cast<float*>(out_attn),
+            num_queries, num_splits, 256);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) return static_cast<int>(err);
+    }
+    return 0;
 }
 
 // Attention jendela raw fp16 (unnormalized) untuk merge logsumexp.

@@ -18,7 +18,7 @@ from src import (
     QwenConfig, QwenDecoderLayer, QwenLinear1Bit, GatedDeltaNetState,
     AttentionKVCache, qwen3_5_model_forward,
     khq_dump_configure, khq_dump_flush,
-    khq_active, khq_activate
+    khq_active, khq_activate, khq_prof_report
 )
 from time import monotonic
 from src.jsonlite import JsonDoc
@@ -1007,6 +1007,7 @@ fn main() raises:
                   Float64(acc_attn) / 1e6 / n_dec, "ms | LM_HEAD+argmax:",
                   Float64(acc_lm) / 1e6 / n_dec, "ms")
         print(">> [PERF] total:", total_ms, "ms")
+        khq_prof_report()
         print(">> Selesai:", n_generated, "token di-generate (greedy).")
         if khq_dir:
             khq_dump_flush()

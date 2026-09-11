@@ -59,6 +59,7 @@ Ukuran KV terkompresi turun dari **1024 B → 220 B** per (token, head) — seki
   1. region terkompresi (dekompresi payload K/V),
   2. jendela raw di ring (K sudah di-RoPE pada posisi absolutnya).
 - Terakhir, sigmoid gate diterapkan setelah merge.
+- **Split-K** pada region terkompresi: rentang token dipecah `BONSAI_KHQ_SPLITS` bagian, tiap bagian jadi satu block tersendiri, lalu partial (acc, `max_s`, `sum_exp`) digabung kernel reduce via logsumexp. Ini menaikkan paralelisme dari `H_q × 1 warp` (24 warp) menjadi `H_q × splits`. Dengan `splits = 1` kernel memakai jalur lama persis, jadi kontrak bit-exact tetap utuh.
 
 ### Skema kompresi per (token, head)
 
@@ -132,6 +133,8 @@ BONSAI_KHQ_PATH=/tmp/khq/khq_calib.bin ./bonsai_infer --model-dir <dir_model> \
 | `BONSAI_KHQ_PATH` | Aktifkan KV terkompresi (file centroid) |
 | `BONSAI_DUMP_KV_DIR` | Dump K/V model asli untuk kalibrasi |
 | `BONSAI_KHQ_DEBUG` | Cetak event kompresi + norma payload tiap event |
+| `BONSAI_KHQ_SPLITS` | Jumlah split-K attention terkompresi (default 8, maks 16) |
+| `BONSAI_KHQ_PROF` | Profil per-fase jalur KHQ (sync tiap fase, total jadi lebih lambat) |
 | `BONSAI_DUMP_TOP2` | Cetak logit top-2 (pembanding numerik) |
 | `BONSAI_PROFILE` | Sync per tahap (profil akurat, ~6% lebih lambat) |
 | `BONSAI_NO_FUSE` | Matikan fusi (pembanding A/B) |
@@ -144,7 +147,7 @@ BONSAI_KHQ_PATH=/tmp/khq/khq_calib.bin ./bonsai_infer --model-dir <dir_model> \
 bash push_to_kaggle.sh
 ```
 
-`deploy_on_kaggle.sh` secara berurutan: kompilasi CUDA → smoke test FFI → uji kernel → build `main.mojo` → buat wheel → jalankan inferensi di T4 → **dump K/V asli → kalibrasi → uji runtime KHQ**, dengan gate otomatis (verifikasi dump, TOP2, cadence, dan isi payload).
+`deploy_on_kaggle.sh` secara berurutan: kompilasi CUDA → smoke test FFI → uji kernel → build `main.mojo` → buat wheel → jalankan inferensi di T4 → **dump K/V asli → kalibrasi → uji runtime KHQ**, dengan gate otomatis (verifikasi dump, TOP2, cadence, dan isi payload), lalu **A/B split-K** (splits 1/4/8/16 + baseline fp16) dan **profil per-fase**.
 
 ---
 
@@ -239,8 +242,9 @@ Bagian ini jujur soal apa yang **belum** setara dengan implementasi referensi (P
 - State per-layer saat ini tidak dipersistensikan antar-proses.
 
 **Performa**
-- `khq_attn_kernel` di-launch `<<<H_q = 24, 32>>>` — hanya 24 block × 32 thread (≈1,9% okupansi T4), dan loop token di dalam block berjalan serial. Ini kandidat utama optimasi (mis. split-K + merge logsumexp).
-- Profiling per-tahap (`BONSAI_PROFILE=1`) dimatikan secara bawaan pada deploy, sehingga pembagian waktu GPU vs submit CPU belum terukur akurat.
+- `khq_attn_kernel` semula di-launch `<<<H_q = 24, 32>>>` — hanya 24 block × 32 thread (≈1,9% okupansi T4) dengan loop token serial di dalam block. Split-K (`BONSAI_KHQ_SPLITS`, default 8) sudah diimplementasikan untuk mengatasi ini; **angka perbaikannya belum terukur** di T4 — pengukuran ada di bagian A/B pada `deploy_on_kaggle.sh`. Karena kernel ini latency-bound (bukan throughput-bound), device dengan komputasi lebih tinggi tidak otomatis menolong.
+- Split-K mengubah urutan akumulasi floating-point. Secara matematis identik (merge logsumexp), tetapi hasil akhir bisa berbeda di level pembulatan. Karena itu run verifikasi di deploy dikunci `BONSAI_KHQ_SPLITS=1` supaya kontrak bit-exact dan gate isi payload tetap berlaku; stream token tiap nilai splits dibandingkan terpisah di A/B.
+- `BONSAI_PROFILE=1` (per-tahap GDN/ATTN) dimatikan secara bawaan karena sync 65×/token mematikan pipeline async. Untuk jalur KHQ ada `BONSAI_KHQ_PROF=1` yang mengukur 7 fase internal KHQ (ring-write, compress-K/V, gather-q, attn-kompresi, attn-jendela, merge+gate).
 
 ---
 

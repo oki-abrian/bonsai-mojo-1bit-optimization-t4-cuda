@@ -535,10 +535,115 @@ PYEOF
 
             echo ">> [KHQ] 5b.4 uji RUNTIME dengan centroid hasil kalibrasi (BONSAI_KHQ_PATH)"
             echo ">> [KHQ] $KHQ_TOKENS token supaya watermark 256->kompres 128 benar-benar terpicu"
-            BONSAI_KHQ_PATH="$KHQ_DIR/khq_calib.bin" BONSAI_DUMP_TOP2=1 BONSAI_KHQ_DEBUG=1 "$WORKING/bonsai_infer" \
+            # BONSAI_KHQ_SPLITS=1 DIKUNCI di sini: ini run verifikasi, dan gate
+            # isi payload (gate 4) butuh stream token identik dengan run dump.
+            # Dengan num_splits=1 kernel memakai jalur lama persis (tanpa reduce
+            # kernel), jadi kontrak bit-exact yang sudah terbukti tidak berubah.
+            # Perilaku split-K diukur terpisah di 5b.5.
+            BONSAI_KHQ_SPLITS=1 BONSAI_KHQ_PATH="$KHQ_DIR/khq_calib.bin" BONSAI_DUMP_TOP2=1 BONSAI_KHQ_DEBUG=1 "$WORKING/bonsai_infer" \
                 --model-dir "$KMODEL" --prompt-tokens "$PROMPT_TOKENS_LONG" \
                 --max-tokens "$KHQ_TOKENS" --gpu 2>&1 | tee "$DIST_DIR/khq_runtime.log" \
                 || echo ">> [KHQ-FAIL] run runtime KHQ gagal — periksa $DIST_DIR/khq_runtime.log"
+
+            # 5b.5 A/B SPLIT-K — pembanding yang menentukan: jalur lama (1 split,
+            # 24 block x 1 warp) vs split-K. Dijalankan TANPA BONSAI_KHQ_DEBUG
+            # dan TANPA BONSAI_KHQ_PROF supaya angkanya tidak tercemar sync/D2H
+            # yang dipakai verifikasi.
+            echo ">> [KHQ] 5b.5 A/B split-K attention (tanpa debug/prof, angka adil)"
+            # Baseline apple-to-apple: prompt & jumlah token SAMA, tanpa KHQ.
+            echo ">> [KHQ] --- baseline fp16 (BONSAI_KHQ_PATH kosong) ---"
+            env -u BONSAI_KHQ_PATH "$WORKING/bonsai_infer" \
+                --model-dir "$KMODEL" --prompt-tokens "$PROMPT_TOKENS_LONG" \
+                --max-tokens "$KHQ_TOKENS" --gpu 2>&1 | tee "$DIST_DIR/khq_base.log" \
+                | grep -E "PERF" || true
+            for KHQ_SP in 1 4 8 16; do
+                echo ">> [KHQ] --- BONSAI_KHQ_SPLITS=$KHQ_SP ---"
+                BONSAI_KHQ_PATH="$KHQ_DIR/khq_calib.bin" BONSAI_KHQ_SPLITS="$KHQ_SP" \
+                    "$WORKING/bonsai_infer" \
+                    --model-dir "$KMODEL" --prompt-tokens "$PROMPT_TOKENS_LONG" \
+                    --max-tokens "$KHQ_TOKENS" --gpu 2>&1 | tee "$DIST_DIR/khq_split_$KHQ_SP.log" \
+                    | grep -E "PERF|KHQ\] split" || true
+            done
+
+            # 5b.6 PROFIL PER-FASE — sync tiap fase, jadi total ms/token memang
+            # lebih buruk; yang dibaca adalah pembagian waktunya, bukan totalnya.
+            echo ">> [KHQ] 5b.6 profil per-fase jalur KHQ (BONSAI_KHQ_PROF=1)"
+            BONSAI_KHQ_PATH="$KHQ_DIR/khq_calib.bin" BONSAI_KHQ_PROF=1 \
+                "$WORKING/bonsai_infer" \
+                --model-dir "$KMODEL" --prompt-tokens "$PROMPT_TOKENS_LONG" \
+                --max-tokens "$KHQ_TOKENS" --gpu 2>&1 | tee "$DIST_DIR/khq_prof.log" \
+                | grep -E "KHQ-PROF|PERF" || true
+
+            python3 - "$DIST_DIR" <<'PYEOF'
+import os, re, sys
+
+d = sys.argv[1]
+
+
+def ms_per_token(path):
+    try:
+        txt = open(path).read()
+    except FileNotFoundError:
+        return None
+    m = re.search(r"rata-rata decode:\s*([-\d.eE+]+)\s*ms/token", txt)
+    return float(m.group(1)) if m else None
+
+
+def toks(path):
+    try:
+        txt = open(path).read()
+    except FileNotFoundError:
+        return []
+    return [int(m) for m in re.findall(r"\[GEN\] token id:\s*(\d+)", txt)]
+
+
+def prefix_vs(ref, got):
+    n = min(len(ref), len(got))
+    p = 0
+    while p < n and ref[p] == got[p]:
+        p += 1
+    return p, n
+
+
+print("   --- A/B split-K (ms/token, tanpa debug) ---")
+base = ms_per_token(os.path.join(d, "khq_base.log"))
+ref_toks = toks(os.path.join(d, "khq_base.log"))
+if base:
+    print(f"   baseline fp16 (KV penuh)      : {base:.2f} ms/token")
+ref = ms_per_token(os.path.join(d, "khq_split_1.log"))
+rows = []
+for sp in (1, 4, 8, 16):
+    v = ms_per_token(os.path.join(d, f"khq_split_{sp}.log"))
+    if v is None:
+        continue
+    rows.append((sp, v))
+    got = toks(os.path.join(d, f"khq_split_{sp}.log"))
+    p, n = prefix_vs(ref_toks, got)
+    tag = "  <- jalur lama (bit-exact)" if sp == 1 else ""
+    print(f"   KHQ splits={sp:<2}                  : {v:.2f} ms/token | "
+          f"prefix token {p}/{n}{tag}")
+if ref and len(rows) > 1:
+    best_sp, best = min(rows, key=lambda r: r[1])
+    print(f"   split-K terbaik: splits={best_sp} -> {best:.2f} ms/token "
+          f"({(ref - best) / ref * 100:+.1f}% vs splits=1)")
+    if best >= ref:
+        print("   [WARN] split-K belum memperbaiki apa pun di konfigurasi ini")
+    if base:
+        print(f"   (KHQ vs baseline fp16: {ref / base:.3f}x pada splits=1)")
+PH = ["ring-write", "compress-K", "compress-V", "gather-q",
+      "attn-kompresi", "attn-jendela", "merge+gate"]
+try:
+    ptxt = open(os.path.join(d, "khq_prof.log")).read()
+except FileNotFoundError:
+    ptxt = ""
+lines = re.findall(r"KHQ-PROF\]\s+(\S+)\s+([-\d.eE+]+)ms\s+\|\s+([-\d.eE+]+)%", ptxt)
+if lines:
+    print("   --- profil per-fase (sync tiap fase) ---")
+    for name, ms, pct in lines:
+        print(f"   {name:<14}: {float(ms):10.2f} ms | {pct}%")
+else:
+    print("   [WARN] blok KHQ-PROF tidak ditemukan di khq_prof.log")
+PYEOF
 
             python3 - "$DIST_DIR/khq_dump.log" "$DIST_DIR/khq_runtime.log" \
                      "$KMODEL" "$KHQ_DIR/kv_dump.bin" <<'PYEOF'

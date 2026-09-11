@@ -29,6 +29,7 @@ from src.ops import (
     khq_merge_gate_try,
 )
 from os import getenv
+from time import monotonic
 from src.models.qwen3_5.linear import DeviceContextGPU
 
 alias KHQ_MAX_LAYERS = 64
@@ -36,6 +37,21 @@ alias KHQ_RING = 256
 alias KHQ_WATERMARK = 256
 alias KHQ_CHUNK = 128
 alias KHQ_MAGIC = 0x4B51484B  # 'KHQK'
+
+# Split-K attention terkompresi: rentang token dipecah ke beberapa block supaya
+# paralelisme tidak terbatas pada H_q block x 1 warp. 1 = jalur lama.
+alias KHQ_MAX_SPLITS = 16
+alias KHQ_MIN_TOKENS_PER_SPLIT = 16
+
+# Fase profiling (BONSAI_KHQ_PROF=1).
+alias KHQ_P_RING = 0    # tulis 3 ring (K unroped, K roped, V)
+alias KHQ_P_CK = 1      # kompresi K
+alias KHQ_P_CV = 2      # kompresi V
+alias KHQ_P_GATHER = 3  # pisah Q dari buffer interleaved
+alias KHQ_P_ATTN = 4    # attention region terkompresi (+ reduce split-K)
+alias KHQ_P_WIN = 5     # attention jendela raw
+alias KHQ_P_MERGE = 6   # merge logsumexp + sigmoid gate
+alias KHQ_N_PHASES = 7
 
 # --------------------------------------------------------------- alokasi helper
 fn _mk_f16(mut ctx: DeviceContextGPU, n: Int) raises -> UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]:
@@ -102,6 +118,7 @@ struct KhqLayer:
     var h_qbuf: UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]
     var h_ac: UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]
     var h_aw: UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]
+    var h_ap: UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]
 
     fn __init__(out self):
         self.ready = False
@@ -137,6 +154,7 @@ struct KhqLayer:
         self.h_qbuf = UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]()
         self.h_ac = UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]()
         self.h_aw = UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]()
+        self.h_ap = UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]()
 
 
 struct KhqGlobals:
@@ -145,6 +163,9 @@ struct KhqGlobals:
     var active: Bool
     var ready: Bool
     var file_buf: UnsafePointer[UInt8, MutAnyOrigin]
+    var splits: Int
+    var prof: Bool
+    var prof_ns: UnsafePointer[Float64, MutAnyOrigin]
 
     fn __init__(out self):
         self.layers = UnsafePointer[KhqLayer, MutAnyOrigin]()
@@ -152,6 +173,9 @@ struct KhqGlobals:
         self.active = False
         self.ready = False
         self.file_buf = UnsafePointer[UInt8, MutAnyOrigin]()
+        self.splits = 1
+        self.prof = False
+        self.prof_ns = UnsafePointer[Float64, MutAnyOrigin]()
 
 
 fn _g() -> UnsafePointer[KhqGlobals, MutAnyOrigin]:
@@ -166,6 +190,64 @@ fn _g() -> UnsafePointer[KhqGlobals, MutAnyOrigin]:
 
 fn khq_active() -> Bool:
     return _g()[].active
+
+
+fn _khq_env_int(name: String, fallback: Int) -> Int:
+    var v = getenv(name)
+    if not v:
+        return fallback
+    try:
+        return Int(v[0])
+    except:
+        return fallback
+
+
+fn _khq_split_count(c_len: Int) -> Int:
+    """Split efektif untuk attention terkompresi. Dibatasi supaya tiap split
+    tetap kebagian cukup token — split kosong hanya menambah launch."""
+    var g = _g()
+    if g[].splits <= 1 or c_len <= 0:
+        return 1
+    var eff = c_len // KHQ_MIN_TOKENS_PER_SPLIT
+    if eff < 1:
+        eff = 1
+    if eff > g[].splits:
+        eff = g[].splits
+    return eff
+
+
+fn khq_prof_add(phase: Int, dt_ns: Int):
+    var g = _g()
+    if not g[].prof:
+        return
+    g[].prof_ns[phase] += Float64(dt_ns)
+
+
+fn _khq_prof_line(i: Int, name: String, tot: Float64):
+    var g = _g()
+    var ms = g[].prof_ns[i] / 1e6
+    var pct = (100.0 * g[].prof_ns[i] / tot) if tot > 0.0 else 0.0
+    print(">> [KHQ-PROF]   ", name, ms, "ms |", pct, "%")
+
+
+fn khq_prof_report():
+    """Akumulasi waktu per fase jalur KHQ sepanjang run (BONSAI_KHQ_PROF=1).
+    Setiap fase disinkronkan saat profiling supaya angkanya waktu GPU nyata."""
+    var g = _g()
+    if not g[].prof:
+        return
+    var tot = 0.0
+    for i in range(KHQ_N_PHASES):
+        tot += g[].prof_ns[i]
+    print(">> [KHQ-PROF] total", tot / 1e6, "ms sepanjang run | splits",
+          g[].splits)
+    _khq_prof_line(KHQ_P_RING, "ring-write   ", tot)
+    _khq_prof_line(KHQ_P_CK, "compress-K   ", tot)
+    _khq_prof_line(KHQ_P_CV, "compress-V   ", tot)
+    _khq_prof_line(KHQ_P_GATHER, "gather-q     ", tot)
+    _khq_prof_line(KHQ_P_ATTN, "attn-kompresi", tot)
+    _khq_prof_line(KHQ_P_WIN, "attn-jendela ", tot)
+    _khq_prof_line(KHQ_P_MERGE, "merge+gate   ", tot)
 
 
 fn khq_activate(mut ctx: DeviceContextGPU, centroid_path: String, max_seq: Int) raises -> Bool:
@@ -288,7 +370,20 @@ fn khq_init(mut ctx: DeviceContextGPU, path: String, max_seq: Int) raises -> Boo
         L[].ready = False
 
     _g()[].ready = True
+    _g()[].splits = _khq_env_int("BONSAI_KHQ_SPLITS", 8)
+    if _g()[].splits < 1:
+        _g()[].splits = 1
+    if _g()[].splits > KHQ_MAX_SPLITS:
+        _g()[].splits = KHQ_MAX_SPLITS
+    var pf = getenv("BONSAI_KHQ_PROF")
+    _g()[].prof = pf and pf[0] == "1"
+    if _g()[].prof:
+        _g()[].prof_ns = alloc[Float64](KHQ_N_PHASES)
+        for i in range(KHQ_N_PHASES):
+            _g()[].prof_ns[i] = 0.0
     print(">> [KHQ] centroid dimuat:", n_lay, "layer dari", path)
+    print(">> [KHQ] split-K attention: maks", _g()[].splits, "jalan | profiling:",
+          _g()[].prof)
     return True
 
 
@@ -327,6 +422,7 @@ fn khq_init_layer(
     L[].h_qbuf = _mk_f16(ctx, H_q * d)
     L[].h_ac = _mk_f32(ctx, H_q * (d + 2))
     L[].h_aw = _mk_f32(ctx, H_q * (d + 2))
+    L[].h_ap = _mk_f32(ctx, H_q * KHQ_MAX_SPLITS * (d + 2))
     L[].ready = True
 
 
@@ -367,12 +463,16 @@ fn khq_step(
     var slot = L[].write_pos % KHQ_RING
 
     # 1. tulis ke ring (K unroped utk kompresi; K roped + V utk jendela)
+    var t0 = monotonic() if _g()[].prof else 0
     copy_vec_sm75_launch_on[DType.float16](
         ctx, L[].h_ring_u[].unsafe_ptr() + slot * kv, L[].h_ktmp[].unsafe_ptr(), kv)
     copy_vec_sm75_launch_on[DType.float16](
         ctx, L[].h_ring_k[].unsafe_ptr() + slot * kv, k_roped_dev, kv)
     copy_vec_sm75_launch_on[DType.float16](
         ctx, L[].h_ring_v[].unsafe_ptr() + slot * kv, v_dev, kv)
+    if _g()[].prof:
+        ctx.synchronize()
+        khq_prof_add(KHQ_P_RING, monotonic() - t0)
     L[].write_pos += 1
 
     # 2. event kompresi (watermark 256 -> kompres 128 tertua, kontigu di ring)
@@ -383,6 +483,7 @@ fn khq_step(
         var r0 = L[].boundary * H_kv
         var uptr = L[].h_ring_u[].unsafe_ptr() + s0 * kv
         var vptr = L[].h_ring_v[].unsafe_ptr() + s0 * kv
+        var tc = monotonic() if _g()[].prof else 0
         var ok_k = khq_compress_sm75_try_launch(
             uptr, L[].h_dk[].unsafe_ptr(), L[].h_rk[].unsafe_ptr(),
             L[].h_ck[].unsafe_ptr(), L[].h_ck[].unsafe_ptr(),
@@ -392,6 +493,10 @@ fn khq_step(
             L[].h_kpay[].unsafe_ptr() + r0 * 40,
             L[].h_vsm[].unsafe_ptr() + r0 * 4,
             nrows, d, L[].ts_k, L[].alpha_k, False)
+        if _g()[].prof:
+            ctx.synchronize()
+            khq_prof_add(KHQ_P_CK, monotonic() - tc)
+            tc = monotonic()
         var ok_v = khq_compress_sm75_try_launch(
             vptr, L[].h_dv[].unsafe_ptr(), L[].h_rv[].unsafe_ptr(),
             L[].h_cv[].unsafe_ptr(), L[].h_vq[].unsafe_ptr(),
@@ -401,6 +506,9 @@ fn khq_step(
             L[].h_vpay[].unsafe_ptr() + r0 * 104,
             L[].h_vsm[].unsafe_ptr() + r0 * 4,
             nrows, d, L[].ts_v, L[].alpha_v, True)
+        if _g()[].prof:
+            ctx.synchronize()
+            khq_prof_add(KHQ_P_CV, monotonic() - tc)
         if not (ok_k and ok_v):
             return False
         # Bukti cadence + ISI (BONSAI_KHQ_DEBUG=1): tiap event mencetak boundary,
@@ -434,12 +542,21 @@ fn khq_step(
     var has_w = win_len > 0
     if not (has_c or has_w):
         return False
+    var tg = monotonic() if _g()[].prof else 0
     if not khq_gather_q_sm75_try_launch(
         q_gate_dev, L[].h_qbuf[].unsafe_ptr(), H_q, d):
         return False
+    if _g()[].prof:
+        ctx.synchronize()
+        khq_prof_add(KHQ_P_GATHER, monotonic() - tg)
 
     if has_c:
         var n_rep = H_q // H_kv
+        # Split-K: paralelisme naik dari H_q block x 1 warp menjadi
+        # H_q * splits block. Partial digabung kernel reduce via logsumexp,
+        # jadi hasilnya tetap sama secara matematis (beda urutan akumulasi).
+        var n_sp = _khq_split_count(c_len)
+        var ta = monotonic() if _g()[].prof else 0
         var ok = khq_attn_sm75_try_launch(
             L[].h_qbuf[].unsafe_ptr(),
             L[].h_kpay[].unsafe_ptr(), L[].h_vpay[].unsafe_ptr(),
@@ -450,8 +567,12 @@ fn khq_step(
             L[].h_vq[].unsafe_ptr(), L[].h_rk[].unsafe_ptr(),
             L[].h_rv[].unsafe_ptr(), L[].h_dk[].unsafe_ptr(),
             L[].h_dv[].unsafe_ptr(), L[].h_ac[].unsafe_ptr(),
+            L[].h_ap[].unsafe_ptr(),
             H_q, H_q, 1, c_len, c_len, n_rep, scale,
-            L[].alpha_k, L[].alpha_v, 10000000.0, 0)
+            L[].alpha_k, L[].alpha_v, 10000000.0, 0, n_sp)
+        if _g()[].prof:
+            ctx.synchronize()
+            khq_prof_add(KHQ_P_ATTN, monotonic() - ta)
         if not ok:
             return False
         # jendela raw: bagian KROPE yang belum dikompresi (dari ujung ring);
@@ -460,14 +581,23 @@ fn khq_step(
 
     if has_w:
         var win_start = c_len % KHQ_RING
+        var tw = monotonic() if _g()[].prof else 0
         var ok = khq_window_attn_sm75_try_launch(
             L[].h_qbuf[].unsafe_ptr(), L[].h_ring_k[].unsafe_ptr(),
             L[].h_ring_v[].unsafe_ptr(), L[].h_aw[].unsafe_ptr(),
             win_start, win_len, KHQ_RING, H_q, H_kv, d, scale)
+        if _g()[].prof:
+            ctx.synchronize()
+            khq_prof_add(KHQ_P_WIN, monotonic() - tw)
         if not ok:
             return False
 
     # 4. merge + sigmoid gate
-    return khq_merge_gate_try(
+    var tm = monotonic() if _g()[].prof else 0
+    var mok = khq_merge_gate_try(
         L[].h_ac[].unsafe_ptr(), L[].h_aw[].unsafe_ptr(), q_gate_dev,
         out_dev, H_q, d, has_w, has_c)
+    if _g()[].prof:
+        ctx.synchronize()
+        khq_prof_add(KHQ_P_MERGE, monotonic() - tm)
+    return mok

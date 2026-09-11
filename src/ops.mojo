@@ -937,8 +937,10 @@ alias CudaKhqAttnFn = fn(
     UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # d_vec_k
     UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # d_vec_v
     UnsafePointer[Float32, MutAnyOrigin],                # out_attn
+    UnsafePointer[Float32, MutAnyOrigin],                # out_partial (split-K)
     Int32, Int32, Int32, Int32, Int32, Int32,            # n_q, H, Lq, c_len, stride_s, n_rep
     Float32, Float32, Float32, Float32, Int32,           # scale, alpha_k, alpha_v, rope_base, start_pos
+    Int32,                                               # num_splits
     UnsafePointer[Float32, MutAnyOrigin]                 # stream
 ) -> Int32
 
@@ -993,11 +995,14 @@ fn khq_attn_sm75_try_launch(
     d_vec_k: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
     d_vec_v: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
     out_attn: UnsafePointer[Float32, MutAnyOrigin],
+    out_partial: UnsafePointer[Float32, MutAnyOrigin],
     num_queries: Int, num_heads: Int, L_q: Int, c_len: Int, stride_s: Int,
     n_rep: Int, scale: Float32, alpha_k: Float32, alpha_v: Float32,
-    rope_base: Float32, start_pos: Int
+    rope_base: Float32, start_pos: Int, num_splits: Int
 ) -> Bool:
-    """Attention terfusi atas KV terkompresi KHQ (output unnormalized)."""
+    """Attention terfusi atas KV terkompresi KHQ (output unnormalized).
+    num_splits > 1 = split-K: rentang token dipecah ke beberapa block, hasil
+    partial digabung kernel reduce via logsumexp."""
     var disable = getenv("BONSAI_DISABLE_CUDA_FFI")
     if disable and (disable == "1" or disable == "true"):
         return False
@@ -1009,10 +1014,10 @@ fn khq_attn_sm75_try_launch(
             q, k_payload, v_payload, v_shared_meta, k_mask,
             k_norms, k_r_norms, v_norms, v_r_norms,
             centroids_k, centroids_v, vq_centroids, k_rotor, v_rotor,
-            d_vec_k, d_vec_v, out_attn,
+            d_vec_k, d_vec_v, out_attn, out_partial,
             Int32(num_queries), Int32(num_heads), Int32(L_q), Int32(c_len),
             Int32(stride_s), Int32(n_rep), scale, alpha_k, alpha_v,
-            rope_base, Int32(start_pos),
+            rope_base, Int32(start_pos), Int32(num_splits),
             cuda_stream
         )
         return ret == 0

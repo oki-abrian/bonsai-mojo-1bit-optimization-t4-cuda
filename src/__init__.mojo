@@ -27,5 +27,5 @@ from .models import (
     embed_tokens_step, qwen3_5_model_forward, lm_head_argmax_step,
     khq_dump_configure, khq_dump_flush, khq_dump_active
 )
-from .khq import khq_active, khq_activate
+from .khq import khq_active, khq_activate, khq_prof_report
 
