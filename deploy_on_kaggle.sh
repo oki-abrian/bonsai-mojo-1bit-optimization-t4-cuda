@@ -556,7 +556,7 @@ PYEOF
                 --model-dir "$KMODEL" --prompt-tokens "$PROMPT_TOKENS_LONG" \
                 --max-tokens "$KHQ_TOKENS" --gpu 2>&1 | tee "$DIST_DIR/khq_base.log" \
                 | grep -E "PERF" || true
-            for KHQ_SP in 1 4 8 16; do
+            for KHQ_SP in 1 4 8 16 32; do
                 echo ">> [KHQ] --- BONSAI_KHQ_SPLITS=$KHQ_SP ---"
                 BONSAI_KHQ_PATH="$KHQ_DIR/khq_calib.bin" BONSAI_KHQ_SPLITS="$KHQ_SP" \
                     "$WORKING/bonsai_infer" \
@@ -716,7 +716,7 @@ if base:
     print(f"   baseline fp16 (KV penuh)      : {base:.2f} ms/token")
 ref = ms_per_token(os.path.join(d, "khq_split_1.log"))
 rows = []
-for sp in (1, 4, 8, 16):
+for sp in (1, 4, 8, 16, 32):
     p = os.path.join(d, f"khq_split_{sp}.log")
     v = ms_per_token(p)
     if v is None:

@@ -41,8 +41,8 @@ alias KHQ_MAGIC = 0x4B51484B  # 'KHQK'
 
 # Split-K attention terkompresi: rentang token dipecah ke beberapa block supaya
 # paralelisme tidak terbatas pada H_q block x 1 warp. 1 = jalur lama.
-alias KHQ_MAX_SPLITS = 16
-alias KHQ_MIN_TOKENS_PER_SPLIT = 16
+alias KHQ_MAX_SPLITS = 32
+alias KHQ_MIN_TOKENS_PER_SPLIT = 8
 
 # Fase profiling (BONSAI_KHQ_PROF=1).
 alias KHQ_P_RING = 0    # tulis 3 ring (K unroped, K roped, V)
