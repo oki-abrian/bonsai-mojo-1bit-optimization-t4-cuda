@@ -30,14 +30,22 @@ token 512 -> kompres 128 tertua -> boundary 384, jendela raw 128
 
 Setelah event pertama, kompresi terjadi **tiap 128 token**; jendela raw berayun 128 ↔ 256 dan region terkompresi tumbuh monoton.
 
-**Performa** — KHQ **belum** lebih cepat pada konteks pendek; ia menukar memori dengan waktu:
+**Performa** — angka di bawah dari **satu run T4 terkontrol**: prompt 56 token, decode 512 token, binary & kondisi identik, hanya `BONSAI_KHQ_SPLITS` yang berbeda (dari A/B di `deploy_on_kaggle.sh`):
 
-| Konfigurasi | ms/token | tok/s |
+| Konfigurasi | ms/token | Beban vs baseline |
 |---|---|---|
-| Baseline KV fp16 | 53,2 | 18,8 |
-| KHQ aktif | 75,0 | 13,3 |
+| Baseline KV fp16 | 57,17 | — |
+| KHQ `splits=1` (jalur lama) | 66,67 | +9,50 (+16,6%) |
+| KHQ `splits=4` | 62,01 | +4,84 (+8,5%) |
+| KHQ `splits=8` | 59,98 | +2,81 (+4,9%) |
 
-Ukuran KV terkompresi turun dari **1024 B → 220 B** per (token, head) — sekitar **4,7×** lebih kecil. Karena biaya attention tumbuh linear terhadap panjang sekuens, keuntungan ini baru terasa pada konteks panjang; pada 512 token KHQ masih berupa biaya tambahan.
+Split-K memotong **beban** KHQ dari 9,50 → 2,81 ms/token (−70%), yang berarti penghematan **6,69 ms/token (−10,0%)** pada laju decode. Semua nilai splits tetap menghasilkan stream token 512/512 identik dan `|delta| logit top-1 = 0.000000`.
+
+Catatan: angka "53,2 → 75,0 ms/token (+22 ms)" yang sempat dilaporkan **tidak tereproduksi** di pengukuran terkontrol ini; beban KHQ yang terukur adalah +9,50 ms, bukan +22 ms. Tabel di atas menggantikannya.
+
+Ukuran KV terkompresi turun dari **1024 B → 220 B** per (token, head) — sekitar **4,7×** lebih kecil. Karena biaya attention tumbuh linear terhadap panjang sekuens, keuntungan memori ini baru terasa pada konteks panjang.
+
+**Yang sebenarnya mendominasi decode bukan KHQ.** Profil per-subsistem (`BONSAI_PROFILE`) konsisten menunjukkan `LM_HEAD+argmax` = **47–63 ms dari 50–67 ms/token (≈93%)**, sementara seluruh layer (GDN + attention) hanya ≈3–4 ms/token. `lm_head` juga 1-bit (159 MB + 39 MB skala), jadi 47 ms berarti ≈4 GB/s — sedangkan kernel layer lain berjalan ≈290 GB/s (43 MB dalam ≈0,15 ms). Selisih ini belum dijelaskan dan merupakan target optimasi terbesar.
 
 ---
 
