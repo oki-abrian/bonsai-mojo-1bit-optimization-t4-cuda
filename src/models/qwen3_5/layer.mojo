@@ -354,7 +354,7 @@ struct QwenDecoderLayer:
                 q_gate_dev, k_dev, v_dev, attn_out_dev, attn_scores_dev,
                 self.attn_q_proj, self.attn_k_proj, self.attn_v_proj, self.attn_o_proj,
                 self.attn_q_norm_w_dev, self.attn_k_norm_w_dev, self.attn_has_norms,
-                kv_cache, pos, self.config
+                kv_cache, pos, self.config, self.layer_idx
             )
         var t_step = 0.0
         if prof:
@@ -594,7 +594,7 @@ struct QwenDecoderLayer:
                     attn_scores_dev,
                     self.attn_q_norm_w_dev, self.attn_k_norm_w_dev,
                     self.attn_has_norms,
-                    kv_cache, pos_base + t, self.config
+                    kv_cache, pos_base + t, self.config, self.layer_idx
                 )
 
             # 4. o_proj GEMM batched: attn out (gdn_m rows, [M,6144]) -> sublayer_m

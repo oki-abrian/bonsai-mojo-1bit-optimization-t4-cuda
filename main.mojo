@@ -16,7 +16,9 @@ from os import setenv, getenv
 from memory import UnsafePointer, alloc
 from src import (
     QwenConfig, QwenDecoderLayer, QwenLinear1Bit, GatedDeltaNetState,
-    AttentionKVCache, qwen3_5_model_forward
+    AttentionKVCache, qwen3_5_model_forward,
+    khq_dump_configure, khq_dump_flush,
+    khq_active, khq_activate
 )
 from time import monotonic
 from src.jsonlite import JsonDoc
@@ -357,6 +359,17 @@ fn main() raises:
 
     # ---------------- 4. Muat bobot per layer (dengan fusion Paket C) ----------------
     var n_layers = cfg.num_hidden_layers
+
+    # KHQ: dump K/V untuk kalibrasi (env BONSAI_DUMP_KV_DIR) — K unroped.
+    var khq_dir = getenv("BONSAI_DUMP_KV_DIR")
+    if khq_dir:
+        khq_dump_configure(
+            khq_dir, 2048, cfg.num_key_value_heads * cfg.head_dim
+        )
+        print(">> [KHQ-DUMP] aktif ->", khq_dir)
+
+    # KHQ: aktivasi dipindah ke setelah DeviceContext terpasang (lihat bawah).
+
     var layers = alloc[QwenDecoderLayer](n_layers)
     var gdn_states = alloc[GatedDeltaNetState](n_layers)
     var kv_caches = alloc[AttentionKVCache](n_layers)
@@ -593,6 +606,13 @@ fn main() raises:
             layers[li].set_ctx(gpu_ctx_ptr)
         lm_proj.set_ctx(gpu_ctx_ptr)
         print(">> [GPU] DeviceContext tunggal terpasang ke", n_layers, "layer + lm_head")
+
+        # KHQ: jalur KV terkompresi (env BONSAI_KHQ_PATH=<file centroid>).
+        # Tanpa fallback: gagal aktivasi = berhenti, bukan diam-diam fp16.
+        var khq_path = getenv("BONSAI_KHQ_PATH")
+        if khq_path:
+            if not khq_activate(gpu_ctx_ptr[], khq_path, 4096):
+                raise Error("KHQ gagal aktif (centroid tidak valid): " + khq_path)
 
         # Inisialisasi VRAM KV Cache untuk seluruh layer Attention (Layer 3, 7, 11, ...)
         for ki in range(n_kv):
@@ -988,6 +1008,8 @@ fn main() raises:
                   Float64(acc_lm) / 1e6 / n_dec, "ms")
         print(">> [PERF] total:", total_ms, "ms")
         print(">> Selesai:", n_generated, "token di-generate (greedy).")
+        if khq_dir:
+            khq_dump_flush()
     else:
         # FALLBACK DIHAPUS: jalur host-sim CPU tidak lagi dipakai produksi.
         # GPU wajib — tanpa BONSAI_USE_GPU program error, bukan diam-diam CPU.

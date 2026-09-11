@@ -16,6 +16,10 @@ from src.ops import (
     kv_cache_append_sm75_launch_on,
     gqa_attention_sm75_launch_on
 )
+from .khq_dump import khq_dump_kv, khq_dump_attn
+from src.khq.runtime import (
+    khq_active, khq_init_layer, khq_capture_unroped, khq_step
+)
 
 struct AttentionKVCache:
     """
@@ -208,7 +212,8 @@ fn qwen3_5_gated_attention_step_gpu(
     has_norms: Bool,
     mut kv_cache: AttentionKVCache,
     pos: Int,
-    config: QwenConfig
+    config: QwenConfig,
+    layer_idx: Int = -1
 ) raises:
     """
     Forward pass 1 token penuh Gated Full Attention 100% di VRAM GPU:
@@ -264,7 +269,7 @@ fn qwen3_5_gated_attention_step_gpu(
     qwen3_5_gated_attention_step_gpu_from_proj(
         ctx_ptr, q_gate_dev, k_dev, v_dev, attn_out_dev, attn_scores_dev,
         q_norm_w_dev, k_norm_w_dev, has_norms,
-        kv_cache, pos, config
+        kv_cache, pos, config, layer_idx
     )
 
     # 6. Proyeksi Keluar Linear 1-Bit o_proj di VRAM
@@ -283,7 +288,8 @@ fn qwen3_5_gated_attention_step_gpu_from_proj(
     has_norms: Bool,
     mut kv_cache: AttentionKVCache,
     pos: Int,
-    config: QwenConfig
+    config: QwenConfig,
+    layer_idx: Int = -1
 ) raises:
     """
     Langkah attention TANPA proyeksi linear (q/k/v/o_proj di luar fungsi).
@@ -302,6 +308,11 @@ fn qwen3_5_gated_attention_step_gpu_from_proj(
         raise Error("FATAL: ctx_ptr null pada qwen3_5_gated_attention_step_gpu_from_proj!")
     var ctx = ctx_ptr[]
 
+    # KHQ: siapkan state layer (idempoten) bila jalur KV terkompresi aktif.
+    var khq_on = khq_active()
+    if khq_on:
+        khq_init_layer(ctx, layer_idx, H_q, H_kv, D)
+
     # Q-Norm & K-Norm per-head dengan bobot belajar di VRAM (stride 2*D untuk interleaved Query)
     head_rmsnorm_sm75_launch_on[T](
         ctx, q_gate_dev, q_gate_dev, H_q, D, 1.0,
@@ -312,6 +323,14 @@ fn qwen3_5_gated_attention_step_gpu_from_proj(
         k_norm_w_dev, has_norms, config.rms_norm_eps, D
     )
 
+    # KHQ: dump K post-norm PRE-rope (unroped) + V — kalibrasi KudaHitamQuant.
+    # Tanpa hook ini K harus di-unrotate ulang (buang waktu).
+    khq_dump_kv(ctx, layer_idx, k_dev, v_dev)
+
+    # KHQ: simpan K unroped utk kompresi (sebelum RoPE — tanpa unrotate).
+    if khq_on:
+        khq_capture_unroped(ctx, layer_idx, k_dev)
+
     # RoPE Parsial di VRAM (half-split MLX: pasangan (i, i+rot_dim/2) di
     # 64 dim rotary per-head; stride 2*D untuk Query interleaved)
     partial_rope_sm75_launch_on[T](
@@ -320,6 +339,18 @@ fn qwen3_5_gated_attention_step_gpu_from_proj(
     partial_rope_sm75_launch_on[T](
         ctx, k_dev, H_kv, D, rot_dim, pos, config.rope_theta, D
     )
+
+    # KHQ: dump skor attention (post-RoPE, post-softmax kausal) — SmartVQ.
+    khq_dump_attn(ctx, layer_idx, q_gate_dev, k_dev, pos, H_q, H_kv, D, scale)
+
+    # KHQ aktif: attention atas KV terkompresi + jendela raw (tanpa KV cache fp16)
+    if khq_on:
+        if khq_step(ctx, layer_idx, q_gate_dev, k_dev, v_dev, attn_out_dev, scale):
+            return
+        # Jangan fallback senyap: kalau jalur kompresi aktif tapi gagal, hasil
+        # fp16 akan memakai KV cache yang tidak pernah diisi (state campur).
+        raise Error("KHQ aktif tapi khq_step GAGAL di layer " + String(layer_idx)
+                    + " — periksa kernel/centroid, bukan fallback ke fp16")
 
     # Simpan Key dan Value ke KV Cache ring buffer di VRAM
     kv_cache_append_sm75_launch_on[T](

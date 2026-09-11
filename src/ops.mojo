@@ -882,6 +882,287 @@ fn gdn_seq_sm75_try_launch(
         return False
 
 
+# ============================================================================ #
+# KHQ (KudaHitamQuant) — FFI ke kernel CUDA di libbonsai_qmv_sm75.so.
+# ============================================================================ #
+alias CudaKhqSlotFn = fn(Int32) -> UnsafePointer[
+    UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin
+]
+
+
+fn khq_state_slot_cell(
+    which: Int
+) -> UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin]:
+    """Alamat sel statik (void*) di lib CUDA utk memarkir pointer state Mojo."""
+    var disable = getenv("BONSAI_DISABLE_CUDA_FFI")
+    if disable and (disable == "1" or disable == "true"):
+        return UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin]()
+    try:
+        var h = try_open_cuda_lib()
+        var f = h.get_function[CudaKhqSlotFn]("khq_state_slot")
+        return f(Int32(which))
+    except:
+        return UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin]()
+
+alias CudaKhqCompressFn = fn(
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # x
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # d_vec
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # rotor
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # centroids
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # vq_centroids
+    UnsafePointer[UInt32, MutAnyOrigin],                 # out_mask
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # out_norms
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # out_r_norms
+    UnsafePointer[UInt8, MutAnyOrigin],                  # out_payload
+    UnsafePointer[UInt8, MutAnyOrigin],                  # out_shared_meta
+    Int32, Int32, Float32, Float32, Int32,               # n, d, ts, alpha, is_v
+    UnsafePointer[Float32, MutAnyOrigin]                 # stream
+) -> Int32
+
+alias CudaKhqAttnFn = fn(
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # q
+    UnsafePointer[UInt8, MutAnyOrigin],                  # k_payload
+    UnsafePointer[UInt8, MutAnyOrigin],                  # v_payload
+    UnsafePointer[UInt8, MutAnyOrigin],                  # v_shared_meta
+    UnsafePointer[UInt32, MutAnyOrigin],                 # k_mask
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # k_norms
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # k_r_norms
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # v_norms
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # v_r_norms
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # centroids_k
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # centroids_v
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # vq_centroids
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # k_rotor
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # v_rotor
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # d_vec_k
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # d_vec_v
+    UnsafePointer[Float32, MutAnyOrigin],                # out_attn
+    Int32, Int32, Int32, Int32, Int32, Int32,            # n_q, H, Lq, c_len, stride_s, n_rep
+    Float32, Float32, Float32, Float32, Int32,           # scale, alpha_k, alpha_v, rope_base, start_pos
+    UnsafePointer[Float32, MutAnyOrigin]                 # stream
+) -> Int32
+
+
+fn khq_compress_sm75_try_launch(
+    x: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    d_vec: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    rotor: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    centroids: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    vq_centroids: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    out_mask: UnsafePointer[UInt32, MutAnyOrigin],
+    out_norms: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    out_r_norms: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    out_payload: UnsafePointer[UInt8, MutAnyOrigin],
+    out_shared_meta: UnsafePointer[UInt8, MutAnyOrigin],
+    n: Int, d: Int, ts: Float32, alpha: Float32, is_v: Bool
+) -> Bool:
+    """Kompresi K/V KHQ via FFI. False = .so tidak tersedia (pemanggil skip)."""
+    var disable = getenv("BONSAI_DISABLE_CUDA_FFI")
+    if disable and (disable == "1" or disable == "true"):
+        return False
+    try:
+        var h = try_open_cuda_lib()
+        var f = h.get_function[CudaKhqCompressFn]("launch_khq_compress_fp16")
+        var cuda_stream = UnsafePointer[Float32, MutAnyOrigin]()
+        var ret = f(
+            x, d_vec, rotor, centroids, vq_centroids,
+            out_mask, out_norms, out_r_norms, out_payload, out_shared_meta,
+            Int32(n), Int32(d), ts, alpha, Int32(1 if is_v else 0),
+            cuda_stream
+        )
+        return ret == 0
+    except:
+        return False
+
+
+fn khq_attn_sm75_try_launch(
+    q: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    k_payload: UnsafePointer[UInt8, MutAnyOrigin],
+    v_payload: UnsafePointer[UInt8, MutAnyOrigin],
+    v_shared_meta: UnsafePointer[UInt8, MutAnyOrigin],
+    k_mask: UnsafePointer[UInt32, MutAnyOrigin],
+    k_norms: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    k_r_norms: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    v_norms: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    v_r_norms: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    centroids_k: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    centroids_v: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    vq_centroids: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    k_rotor: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    v_rotor: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    d_vec_k: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    d_vec_v: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    out_attn: UnsafePointer[Float32, MutAnyOrigin],
+    num_queries: Int, num_heads: Int, L_q: Int, c_len: Int, stride_s: Int,
+    n_rep: Int, scale: Float32, alpha_k: Float32, alpha_v: Float32,
+    rope_base: Float32, start_pos: Int
+) -> Bool:
+    """Attention terfusi atas KV terkompresi KHQ (output unnormalized)."""
+    var disable = getenv("BONSAI_DISABLE_CUDA_FFI")
+    if disable and (disable == "1" or disable == "true"):
+        return False
+    try:
+        var h = try_open_cuda_lib()
+        var f = h.get_function[CudaKhqAttnFn]("launch_khq_attn_fp16")
+        var cuda_stream = UnsafePointer[Float32, MutAnyOrigin]()
+        var ret = f(
+            q, k_payload, v_payload, v_shared_meta, k_mask,
+            k_norms, k_r_norms, v_norms, v_r_norms,
+            centroids_k, centroids_v, vq_centroids, k_rotor, v_rotor,
+            d_vec_k, d_vec_v, out_attn,
+            Int32(num_queries), Int32(num_heads), Int32(L_q), Int32(c_len),
+            Int32(stride_s), Int32(n_rep), scale, alpha_k, alpha_v,
+            rope_base, Int32(start_pos),
+            cuda_stream
+        )
+        return ret == 0
+    except:
+        return False
+
+
+alias CudaKhqWindowAttnFn = fn(
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # q (H_q, D)
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # ring_k
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # ring_v
+    UnsafePointer[Float32, MutAnyOrigin],                # out (H_q, D+2)
+    Int32, Int32, Int32,                                 # win_start, win_len, ring_cap
+    Int32, Int32, Int32, Float32,                        # H_q, H_kv, d, scale
+    UnsafePointer[Float32, MutAnyOrigin]                 # stream
+) -> Int32
+
+alias CudaKhqGatherQFn = fn(
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # q_gate
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # q_out
+    Int32, Int32,                                        # H_q, d
+    UnsafePointer[Float32, MutAnyOrigin]
+) -> Int32
+
+
+fn khq_window_attn_sm75_try_launch(
+    q: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    ring_k: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    ring_v: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    out_attn: UnsafePointer[Float32, MutAnyOrigin],
+    win_start: Int, win_len: Int, ring_cap: Int,
+    H_q: Int, H_kv: Int, d: Int, scale: Float32
+) -> Bool:
+    """Attention jendela raw fp16 (unnormalized) — bagian dari merge logsumexp."""
+    var disable = getenv("BONSAI_DISABLE_CUDA_FFI")
+    if disable and (disable == "1" or disable == "true"):
+        return False
+    try:
+        var h = try_open_cuda_lib()
+        var f = h.get_function[CudaKhqWindowAttnFn]("launch_khq_window_attn_fp16")
+        var cuda_stream = UnsafePointer[Float32, MutAnyOrigin]()
+        var ret = f(
+            q, ring_k, ring_v, out_attn,
+            Int32(win_start), Int32(win_len), Int32(ring_cap),
+            Int32(H_q), Int32(H_kv), Int32(d), scale,
+            cuda_stream
+        )
+        return ret == 0
+    except:
+        return False
+
+
+fn khq_gather_q_sm75_try_launch(
+    q_gate: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    q_out: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    H_q: Int, d: Int
+) -> Bool:
+    """Pisahkan Q (interleaved [H_q,2D]) menjadi kontigu [H_q,D]."""
+    var disable = getenv("BONSAI_DISABLE_CUDA_FFI")
+    if disable and (disable == "1" or disable == "true"):
+        return False
+    try:
+        var h = try_open_cuda_lib()
+        var f = h.get_function[CudaKhqGatherQFn]("launch_khq_gather_q_fp16")
+        var cuda_stream = UnsafePointer[Float32, MutAnyOrigin]()
+        var ret = f(q_gate, q_out, Int32(H_q), Int32(d), cuda_stream)
+        return ret == 0
+    except:
+        return False
+
+
+alias CudaKhqMergeGateFn = fn(
+    UnsafePointer[Float32, MutAnyOrigin],                # attn_c (H_q, D+2)
+    UnsafePointer[Float32, MutAnyOrigin],                # attn_w (H_q, D+2)
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # q_gate
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # out (H_q, D)
+    Int32, Int32, Int32,                                 # H_q, d, has_w
+    UnsafePointer[Float32, MutAnyOrigin]
+) -> Int32
+
+
+fn khq_merge_gate_try(
+    attn_c: UnsafePointer[Float32, MutAnyOrigin],
+    attn_w: UnsafePointer[Float32, MutAnyOrigin],
+    q_gate: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    out_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    H_q: Int, d: Int, has_w: Bool, has_c: Bool
+) -> Bool:
+    """Merge logsumexp region kompresi+jendela lalu sigmoid gate."""
+    var disable = getenv("BONSAI_DISABLE_CUDA_FFI")
+    if disable and (disable == "1" or disable == "true"):
+        return False
+    try:
+        var h = try_open_cuda_lib()
+        var f = h.get_function[CudaKhqMergeGateFn]("launch_khq_merge_gate_fp16")
+        var cuda_stream = UnsafePointer[Float32, MutAnyOrigin]()
+        # has_w=0 -> hanya region kompresi; has_c=0 -> hanya jendela (attn_c=attn_w)
+        var src_c = attn_c if has_c else attn_w
+        var ret = f(
+            src_c, attn_w, q_gate, out_dev,
+            Int32(H_q), Int32(d), Int32(1 if (has_w and has_c) else 0),
+            cuda_stream
+        )
+        return ret == 0
+    except:
+        return False
+
+
+alias CudaCalSvqTrainFn = fn(
+    UnsafePointer[Float32, MutAnyOrigin],   # v (N,256) head-major
+    UnsafePointer[Float32, MutAnyOrigin],   # attn (H_q,T,T) atau null
+    UnsafePointer[Float32, MutAnyOrigin],   # init_cb (49152)
+    UnsafePointer[Float32, MutAnyOrigin],   # rp (1024)
+    UnsafePointer[Float32, MutAnyOrigin],   # out_cb (49152)
+    UnsafePointer[Float32, MutAnyOrigin],   # out_wtrm (256*256) atau null
+    Int32, Int32, Int32, Int32,             # N, T, H_q, H_kv
+    Int32, Int32, Float32,                  # iterations, n_seeds, lr
+    UnsafePointer[Float32, MutAnyOrigin]
+) -> Int32
+
+
+fn cal_svq_train_try_launch(
+    v: UnsafePointer[Float32, MutAnyOrigin],
+    attn: UnsafePointer[Float32, MutAnyOrigin],
+    init_cb: UnsafePointer[Float32, MutAnyOrigin],
+    rp: UnsafePointer[Float32, MutAnyOrigin],
+    out_cb: UnsafePointer[Float32, MutAnyOrigin],
+    out_wtrm: UnsafePointer[Float32, MutAnyOrigin],
+    N: Int, T: Int, H_q: Int, H_kv: Int,
+    iterations: Int, n_seeds: Int, lr: Float32
+) -> Bool:
+    """Turnamen SmartVQ full-GPU (train_smartvq.py) via FFI."""
+    var disable = getenv("BONSAI_DISABLE_CUDA_FFI")
+    if disable and (disable == "1" or disable == "true"):
+        return False
+    try:
+        var h = try_open_cuda_lib()
+        var f = h.get_function[CudaCalSvqTrainFn]("launch_cal_svq_train")
+        var cuda_stream = UnsafePointer[Float32, MutAnyOrigin]()
+        var ret = f(
+            v, attn, init_cb, rp, out_cb, out_wtrm,
+            Int32(N), Int32(T), Int32(H_q), Int32(H_kv),
+            Int32(iterations), Int32(n_seeds), lr,
+            cuda_stream
+        )
+        return ret == 0
+    except:
+        return False
+
+
 fn causal_conv1d_sm75_launch_on[
     T: DType
 ](

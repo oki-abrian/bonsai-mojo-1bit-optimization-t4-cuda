@@ -123,6 +123,12 @@ else
     echo ">> [WARN] nvcc tidak tersedia atau qmv_sm75_kernel.cu tidak ditemukan — fallback ke Mojo native"
 fi
 
+# KHQ TIDAK diuji di sini. Kalibrasi hanya bermakna dijalankan atas dump K/V
+# hasil forward pass MODEL ASLI (referensi: precompute_centroids.py mengumpulkan
+# k_unroped + v + skor softmax dari forward pass nyata, SEQ_LEN=1024 x 32 batch).
+# Dump buatan/palsu tidak membuktikan apa pun, jadi dihapus. Pipeline KHQ nyata
+# ada di langkah 5b (butuh bobot model + binary + GPU).
+
 echo ""
 echo "========================================================="
 echo " 4. CROSS-COMPILATION TARGET T4 (sm_75) DI CPU"
@@ -377,6 +383,349 @@ PYEOF
     BONSAI_DUMP_TOP2=1 BONSAI_PREFILL_PER_TOKEN=1 "$WORKING/bonsai_infer" --model-dir "$KMODEL" \
         --prompt-tokens "$PROMPT_TOKENS" --max-tokens 24 --gpu 2>&1 | tee "$DIST_DIR/infer_t4_pertoken.log" \
         || echo ">> [WARN] inferensi per-token gagal — periksa log di atas"
+
+    # ---------------------------------------------------------------
+    # 5b. KHQ: DUMP K/V ASLI DARI MODEL -> KALIBRASI GPU -> UJI RUNTIME
+    #     TIDAK ada dump sintetis. K/V diambil dari forward pass bobot
+    #     asli lewat hook khq_dump_kv (K post-norm PRE-rope + V), dan
+    #     skor softmax dari khq_dump_attn — persis yang dikumpulkan
+    #     precompute_centroids.py (k_unroped + v + scores).
+    # ---------------------------------------------------------------
+    KHQ_DIR="$WORKING/khq_real"
+    KHQ_TOKENS="${KHQ_DUMP_TOKENS:-512}"
+    rm -rf "$KHQ_DIR"; mkdir -p "$KHQ_DIR"
+    echo ""
+    echo ">> [KHQ] 5b.1 dump K/V asli dari model ($KHQ_TOKENS token, prompt panjang)"
+    BONSAI_DUMP_TOP2=1 BONSAI_DUMP_KV_DIR="$KHQ_DIR" "$WORKING/bonsai_infer" --model-dir "$KMODEL" \
+        --prompt-tokens "$PROMPT_TOKENS_LONG" --max-tokens "$KHQ_TOKENS" --gpu \
+        2>&1 | tee "$DIST_DIR/khq_dump.log" \
+        || echo ">> [KHQ-FAIL] run dump gagal — periksa $DIST_DIR/khq_dump.log"
+
+    echo ">> [KHQ] 5b.2 verifikasi dump (harus dari bobot asli, bukan placeholder)"
+    if python3 - "$KMODEL" "$KHQ_DIR" <<'PYEOF'
+import json, os, struct, sys
+import numpy as np
+mdir, ddir = sys.argv[1], sys.argv[2]
+
+# Parsing MENGIKUTI main.mojo: parameter teks bisa bersarang di 'text_config',
+# dan key yang tidak ada memakai default QwenConfig.qwen_27b_default().
+raw = json.load(open(os.path.join(mdir, "config.json")))
+cfg = raw.get("text_config", raw) or raw
+
+
+def num(key, default):
+    v = cfg.get(key, raw.get(key))
+    return default if v is None else int(v)
+
+
+H_kv = num("num_key_value_heads", 4)
+hd = num("head_dim", 256)
+n_layers = num("num_hidden_layers", 64)
+interval = num("full_attention_interval", 4)
+dim_expect = H_kv * hd
+attn_layers = [i for i in range(n_layers) if i % interval == interval - 1]
+print(f"   config: layers={n_layers} H_kv={H_kv} head_dim={hd} "
+      f"-> dim={dim_expect}, {len(attn_layers)} layer attention")
+
+p = os.path.join(ddir, "kv_dump.bin")
+if not os.path.exists(p):
+    print(f">> [KHQ-FAIL] {p} tidak ada"); sys.exit(1)
+buf = open(p, "rb").read()
+magic, nl, dim = struct.unpack_from("<III", buf, 0)
+print(f"   kv_dump: magic={hex(magic)} layers={nl} dim={dim} bytes={len(buf)}")
+if magic != 0x4451484B:
+    print(">> [KHQ-FAIL] magic dump salah"); sys.exit(1)
+if dim != dim_expect:
+    print(f">> [KHQ-FAIL] dim dump {dim} != model {H_kv}x{hd}={dim_expect}"); sys.exit(1)
+
+tbl = [struct.unpack_from("<II", buf, 12 + 8 * i) for i in range(nl)]
+ids = [t[0] for t in tbl]
+print(f"   layer_ids dump = {ids}")
+if ids != attn_layers:
+    print(f">> [KHQ-FAIL] layer_id dump != layer attention model {attn_layers}"); sys.exit(1)
+tokset = sorted({t[1] for t in tbl})
+if len(tokset) != 1 or tokset[0] < 8:
+    print(f">> [KHQ-FAIL] jumlah token antar layer tidak seragam/kekecilan: {tokset}"); sys.exit(1)
+ntok = tokset[0]
+need = 12 + 8 * nl + sum(2 * t[1] * dim * 4 for t in tbl)
+if need != len(buf):
+    print(f">> [KHQ-FAIL] ukuran dump {len(buf)} != ekspektasi {need}"); sys.exit(1)
+print(f"   token/layer = {ntok}, ukuran konsisten")
+
+off = 12 + 8 * nl
+bad = []
+for lid, nt in tbl:
+    k = np.frombuffer(buf, dtype="<f4", count=nt * dim, offset=off)
+    v = np.frombuffer(buf, dtype="<f4", count=nt * dim, offset=off + nt * dim * 4)
+    off += 2 * nt * dim * 4
+    ks, vs = float(k.std()), float(v.std())
+    if not (np.isfinite(k).all() and np.isfinite(v).all()):
+        bad.append(f"L{lid}:NaN/Inf")
+    if ks < 1e-6 or vs < 1e-6 or ks > 1e3 or vs > 1e3:
+        bad.append(f"L{lid}:std_k={ks:.3e},std_v={vs:.3e}")
+    if np.array_equal(k, v):
+        bad.append(f"L{lid}:K==V")
+print(f"   realness: std K/V diperiksa ({nl} layer)")
+if bad:
+    print(">> [KHQ-FAIL] data dump tidak wajar -> " + "; ".join(bad)); sys.exit(1)
+
+# File attn WAJIB ada dan jumlah tokennya harus sama dengan dump; kalau tidak,
+# kalibrasi V tidak lagi attention-aware (calib.mojo akan menolak).
+for lid in attn_layers:
+    ap = os.path.join(ddir, f"attn_{lid}.bin")
+    if not os.path.exists(ap):
+        print(f">> [KHQ-FAIL] attn_{lid}.bin tidak ada — kalibrasi akan gagal"); sys.exit(1)
+    ab = open(ap, "rb").read()
+    am, ahq, akv, ad = struct.unpack_from("<IIII", ab, 0)
+    if am != 0x4151484B:
+        print(f">> [KHQ-FAIL] magic attn_{lid} salah: {hex(am)}"); sys.exit(1)
+    if ad != hd or akv != H_kv:
+        print(f">> [KHQ-FAIL] attn_{lid} D={ad}/H_kv={akv} "
+              f"!= model {hd}/{H_kv}"); sys.exit(1)
+    o, cnt = 16, 0
+    while o + 4 <= len(ab):
+        (nv,) = struct.unpack_from("<I", ab, o)
+        o += 4 + ahq * nv * 2
+        cnt += 1
+    if cnt != ntok:
+        print(f">> [KHQ-FAIL] attn_{lid} punya {cnt} token, dump {ntok}")
+        sys.exit(1)
+print(f"   attn: {len(attn_layers)} layer x {ntok} token, H_q={ahq}, D={ad} — cocok dengan dump")
+print(">> [KHQ-OK] dump ASLI dari model valid")
+PYEOF
+    then
+        echo ">> [KHQ] 5b.3 kalibrasi GPU penuh atas dump asli (kv_dump -> khq_calib.bin)"
+        pixi run mojo run -I . src/khq/calib.mojo "$KHQ_DIR" "$KHQ_DIR/khq_calib.bin" \
+            2>&1 | tee "$DIST_DIR/khq_calib.log" \
+            || echo ">> [KHQ-FAIL] kalibrasi gagal — periksa $DIST_DIR/khq_calib.log"
+
+        if [ -f "$KHQ_DIR/khq_calib.bin" ]; then
+            python3 - "$KHQ_DIR/khq_calib.bin" <<'PYEOF'
+import struct, sys
+buf = open(sys.argv[1], "rb").read()
+magic, ver, nl, dim = struct.unpack("<IIII", buf[:16])
+if magic != 0x4B51484B:
+    print(f">> [KHQ-FAIL] magic centroid salah: {hex(magic)}"); sys.exit(1)
+print(f">> [KHQ] centroid: ver={ver} layers={nl} dim={dim} bytes={len(buf)}")
+off, ok, D = 16, True, 256
+
+def rd(n, name):
+    global off, ok
+    vals = struct.unpack_from(f"<{n}f", buf, off); off += 4 * n
+    bad = sum(1 for v in vals if v != v or abs(v) > 1e6)
+    if bad: ok = False
+    print(f"   {name}: n={n} bad={bad} min={min(vals):+.4f} max={max(vals):+.4f}")
+    return vals
+
+for _ in range(nl):
+    (lid,) = struct.unpack_from("<I", buf, off); off += 4
+    ts_k, ak = struct.unpack_from("<ff", buf, off); off += 8
+    dk = rd(D, f"L{lid} d_k"); rd(4 * D, f"L{lid} cents_k"); rd(64 * 16, f"L{lid} rpk")
+    ts_v, av = struct.unpack_from("<ff", buf, off); off += 8
+    rd(D, f"L{lid} d_v"); rd(4 * D, f"L{lid} cents_v"); rd(64 * 16, f"L{lid} rpv")
+    rd(64 * 768, f"L{lid} vq")
+    print(f"   L{lid}: ts_k={ts_k:.4f} alpha_k={ak:.4f} ts_v={ts_v:.4f} alpha_v={av:.4f}")
+    if not (0.05 < ts_k < 1000 and 0.05 < ts_v < 1000): ok = False
+    if any(abs(v) != 1.0 for v in dk[:16]): ok = False
+if ok and off == len(buf):
+    print(">> [KHQ-OK] centroid valid, semua nilai finite, ukuran pas")
+else:
+    print(f">> [KHQ-FAIL] centroid tidak valid (sisa {len(buf)-off} byte)"); sys.exit(1)
+PYEOF
+
+            echo ">> [KHQ] 5b.4 uji RUNTIME dengan centroid hasil kalibrasi (BONSAI_KHQ_PATH)"
+            echo ">> [KHQ] $KHQ_TOKENS token supaya watermark 256->kompres 128 benar-benar terpicu"
+            BONSAI_KHQ_PATH="$KHQ_DIR/khq_calib.bin" BONSAI_DUMP_TOP2=1 BONSAI_KHQ_DEBUG=1 "$WORKING/bonsai_infer" \
+                --model-dir "$KMODEL" --prompt-tokens "$PROMPT_TOKENS_LONG" \
+                --max-tokens "$KHQ_TOKENS" --gpu 2>&1 | tee "$DIST_DIR/khq_runtime.log" \
+                || echo ">> [KHQ-FAIL] run runtime KHQ gagal — periksa $DIST_DIR/khq_runtime.log"
+
+            python3 - "$DIST_DIR/khq_dump.log" "$DIST_DIR/khq_runtime.log" \
+                     "$KMODEL" "$KHQ_DIR/kv_dump.bin" <<'PYEOF'
+import json, os, re, struct, sys
+import numpy as np
+
+def read(path):
+    try:
+        return open(path).read()
+    except FileNotFoundError:
+        return ""
+
+
+def toks(txt):
+    return [int(m) for m in re.findall(r"\[GEN\] token id:\s*(\d+)", txt)]
+
+
+def top2(txt):
+    m = re.search(r"\[TOP2\] 1st:\s*(\d+)\s*=\s*([-\d.eE+]+)\s*\|\s*2nd:\s*(\d+)\s*="
+                  r"\s*([-\d.eE+]+)\s*\|\s*gap:\s*([-\d.eE+]+)", txt)
+    if not m:
+        return None
+    return int(m.group(1)), float(m.group(2)), int(m.group(3)), float(m.group(4))
+
+
+base_txt, khq_txt = read(sys.argv[1]), read(sys.argv[2])
+aktif = "jalur KV terkompresi AKTIF" in khq_txt
+base, khq = toks(base_txt), toks(khq_txt)
+print(f"   baseline token={len(base)} | KHQ token={len(khq)} | jalur aktif={aktif}")
+if not aktif:
+    print(">> [KHQ-FAIL] jalur KV terkompresi tidak aktif di runtime"); sys.exit(1)
+if not base or not khq:
+    print(">> [KHQ-FAIL] token tidak terekam di log"); sys.exit(1)
+
+# 1) GATE UTAMA — pembanding numerik di batas prefill (murni jalur window,
+#    kompresi belum aktif). Token greedy bersifat chaotic: satu flip argmax
+#    mengubah seluruh lanjutannya, jadi kecocokan token BUKAN ukuran yang
+#    tegas. Logit top-1 inilah yang dibandingkan langsung.
+gagal = []
+tb, tk = top2(base_txt), top2(khq_txt)
+if tb and tk:
+    print(f"   TOP2 baseline: id={tb[0]}/{tb[2]} val={tb[1]:.6f}/{tb[3]:.6f}")
+    print(f"   TOP2 KHQ     : id={tk[0]}/{tk[2]} val={tk[1]:.6f}/{tk[3]:.6f}")
+    d1 = abs(tb[1] - tk[1])
+    print(f"   |delta| logit top-1 = {d1:.6f}")
+    if tb[0] != tk[0]:
+        gagal.append(f"top-1 logit berbeda ({tb[0]} vs {tk[0]})")
+    if d1 > 0.1:
+        gagal.append(f"|delta| logit {d1:.6f} > 0.1")
+else:
+    print("   [WARN] TOP2 tidak terbaca di salah satu log")
+
+# 2) INFO — prefix token identik. Sebelum perbaikan reduksi warp, divergensi
+#    terjadi di token ke-5 (jauh sebelum kompresi di token 256); prefix sangat
+#    pendek menandakan jalur window/merge masih jauh berbeda.
+n = min(len(base), len(khq))
+prefix = 0
+while prefix < n and base[prefix] == khq[prefix]:
+    prefix += 1
+sama = sum(1 for i in range(n) if base[i] == khq[i])
+print(f"   prefix identik = {prefix} token | cocok total = {sama}/{n} "
+      f"(greedy, bukan gate)")
+if prefix < 16:
+    gagal.append(f"prefix token hanya {prefix} — jalur window/merge belum setara")
+
+# 3) GATE CADENCE — bukti LANGSUNG dari instrumen BONSAI_KHQ_DEBUG=1.
+#    Pola yang diharapkan: event#1 saat write_pos=256 (boundary 0->128), lalu
+#    TIAP 128 token berikutnya (boundary 256, 384, ...) karena setelah kompres
+#    jendela raw tersisa 128, jadi 128 token baru sudah membuatnya penuh lagi.
+ev = {}
+for m in re.finditer(r"\[KHQ-COMPRESS\] layer (\d+) event# (\d+) boundary (\d+) "
+                     r"write_pos (\d+) raw_window (\d+)", khq_txt):
+    lay, num, bnd, wp, raw = (int(x) for x in m.groups())
+    ev.setdefault(lay, []).append((num, bnd, wp, raw))
+if not ev:
+    print("   [WARN] tidak ada baris KHQ-COMPRESS — cadence tidak terukur langsung")
+else:
+    jml = sorted({len(v) for v in ev.values()})
+    print(f"   cadence: {len(ev)} layer, event per layer = {jml} "
+          f"(harus seragam)")
+    beda = []
+    for lay, lst in sorted(ev.items()):
+        for k, (num, bnd, wp, raw) in enumerate(lst, 1):
+            if num != k or bnd != 128 * k or raw != 128:
+                beda.append(f"L{lay}#{k}:b{bnd}/raw{raw}")
+    l0 = min(ev)
+    print(f"   cadence layer {l0}: " + " ".join(
+        f"wp{wp}->b{bnd}(raw{raw})" for _, bnd, wp, raw in ev[l0]))
+    if len(jml) != 1:
+        gagal.append(f"jumlah event antar layer tidak seragam: {jml}")
+    if beda:
+        gagal.append("pola cadence menyimpang: " + "; ".join(beda[:4]))
+
+# 4) GATE ISI PAYLOAD — membuktikan baris yang dikompres benar-benar token
+#    TERTUA, bukan sekadar jumlah eventnya benar. Instrumen membuang norma K
+#    tiap baris yang baru dikompres (h_knorm, bit fp16). Norma itu fingerprint
+#    isi: dibandingkan dengan norma K token yang sama dari dump asli, lalu
+#    dibandingkan juga pada alignment BERGESER — alignment yang benar harus
+#    jauh lebih cocok, kalau tidak berarti yang dikompres token yang salah.
+knd = [m for m in re.finditer(r"\[KHQ-NORM\] (\d+) (\d+) (\d+) ([0-9 ]+)", khq_txt)]
+if not knd:
+    gagal.append("instrumen KHQ-NORM tidak ada — isi payload tidak terverifikasi")
+else:
+    # jumlah token harus identik dengan run dump, kalau tidak ground truth tak berlaku
+    if base != khq:
+        print(f"   [WARN] token run dump != run runtime "
+              f"({sum(1 for a,b in zip(base,khq) if a==b)}/{min(len(base),len(khq))} cocok)"
+              f" — ground truth isi dilewati")
+    else:
+        raw = json.load(open(os.path.join(sys.argv[3], "config.json")))
+        cf = raw.get("text_config", raw) or raw
+        H_kv = int(cf.get("num_key_value_heads", 4))
+        hd = int(cf.get("head_dim", 256))
+        dim = H_kv * hd
+        buf = open(sys.argv[4], "rb").read()
+        nl = struct.unpack_from("<I", buf, 4)[0]
+        tbl = [struct.unpack_from("<II", buf, 12 + 8 * i) for i in range(nl)]
+        goff, off = {}, 12 + 8 * nl
+        for lid, nt in tbl:
+            goff[lid] = (off, nt)
+            off += 2 * nt * dim * 4
+
+        def gt_norm(lid):
+            base_off, nt = goff[lid]
+            k = np.frombuffer(buf, dtype="<f4", count=nt * dim,
+                              offset=base_off).reshape(nt, H_kv, hd)
+            return np.sqrt((k.astype(np.float64) ** 2).sum(axis=2))
+
+        cache, hasil = {}, []
+        for m in knd:
+            lid, B, nrows = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            bits = np.array([int(x) for x in m.group(4).split()], dtype=np.uint16)
+            if len(bits) != nrows:
+                gagal.append(f"L{lid} B{B}: {len(bits)} norma != {nrows} baris")
+                continue
+            if lid not in cache:
+                cache[lid] = gt_norm(lid)
+            g = cache[lid]
+            nt = g.shape[0]
+            got = bits.view(np.float16).astype(np.float64)
+            r0 = B * H_kv
+            idx = np.arange(nrows)
+            tok = B + idx // H_kv
+            hd_i = idx % H_kv
+
+            def err(tokens):
+                ok = (tokens >= 0) & (tokens < nt)
+                if not ok.any():
+                    return None
+                a = g[tokens[ok], hd_i[ok]]
+                b = got[ok]
+                return float(np.mean(np.abs(a - b) / (np.abs(a) + 1e-6)))
+
+            e0 = err(tok)
+            e_up = err(tok + 128)
+            e_dn = err(tok - 128)
+            hasil.append((lid, B, r0, e0, e_up, e_dn))
+
+        if hasil:
+            e0 = np.array([h[3] for h in hasil])
+            print(f"   isi payload: {len(hasil)} event diperiksa, "
+                  f"rel-err norma (alignment benar) max={e0.max():.3e} "
+                  f"mean={e0.mean():.3e}")
+            ups = np.array([h[4] for h in hasil if h[4] is not None])
+            dns = np.array([h[5] for h in hasil if h[5] is not None])
+            alt = np.concatenate([a for a in (ups, dns) if a.size]) if (ups.size or dns.size) else None
+            if alt is not None:
+                print(f"   pembanding alignment bergeser (+-128 token): "
+                      f"mean={alt.mean():.3e}")
+            if e0.max() > 1e-2:
+                gagal.append(f"norma payload menyimpang dari ground truth "
+                             f"(max rel-err {e0.max():.3e})")
+            if alt is not None and alt.mean() < 5 * e0.mean():
+                gagal.append("alignment benar tidak lebih cocok dari yang bergeser "
+                             "— isi payload kemungkinan token yang salah")
+
+if gagal:
+    print(">> [KHQ-FAIL] " + "; ".join(gagal)); sys.exit(1)
+print(">> [KHQ-OK] jalur window setara secara numerik; cadence kompresi "
+      "terukur (256 pertama, lalu tiap 128)")
+PYEOF
+        else
+            echo ">> [KHQ-FAIL] khq_calib.bin tidak dihasilkan"
+        fi
+    else
+        echo ">> [KHQ-FAIL] dump asli tidak valid — kalibrasi dibatalkan"
+    fi
 
     kill $CLOCK_PID 2>/dev/null || true
     nvidia-smi --query-gpu=clocks.sm,power.draw,temperature.gpu --format=csv,noheader > "$DIST_DIR/gpu_clock_after.txt" 2>/dev/null || true
