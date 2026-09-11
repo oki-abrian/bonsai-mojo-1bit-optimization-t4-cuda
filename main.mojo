@@ -916,6 +916,10 @@ fn main() raises:
         var acc_gdn: Int = 0
         var acc_attn: Int = 0
         var acc_lm: Int = 0
+        # Pecahan acc_lm (hanya bermakna saat prof aktif — butuh sync pemisah).
+        var acc_lm_gemm: Int = 0
+        var acc_lm_am: Int = 0
+        var acc_lm_d2h: Int = 0
         for step in range(max_tokens - 1):
             var t0 = monotonic()
             embed_lookup_1bit_sm75_launch_on[T](
@@ -973,13 +977,23 @@ fn main() raises:
                     fnorm_dev, True, D, cfg.rms_norm_eps
                 )
             lm_proj.forward_device(act_x_norm_dev, act_logits_dev, 1)
+            if prof:
+                gpu_ctx_ptr[].synchronize()
+            var t_lm_gemm = monotonic()
             argmax_sm75_launch_on[T](
                 gpu_ctx_ptr[], act_logits_dev, act_stage1_vals_dev, act_stage1_idxs_dev,
                 act_token_out_dev, V
             )
+            if prof:
+                gpu_ctx_ptr[].synchronize()
+            var t_lm_am = monotonic()
             gpu_ctx_ptr[].enqueue_copy(next_tok_host, h_token_out_holder[])
             gpu_ctx_ptr[].synchronize()
-            acc_lm += monotonic() - tlm
+            var t_lm_end = monotonic()
+            acc_lm_gemm += t_lm_gemm - tlm
+            acc_lm_am += t_lm_am - t_lm_gemm
+            acc_lm_d2h += t_lm_end - t_lm_am
+            acc_lm += t_lm_end - tlm
             next_tok = Int(next_tok_host[0])
             pos += 1
             generated[n_generated] = next_tok
@@ -1002,10 +1016,24 @@ fn main() raises:
                   "tok/s | decode", n_dec, "token")
             print(">> [PERF] rata-rata decode:", dec_ms / n_dec, "ms/token |",
                   Float64(n_dec) * 1000.0 / dec_ms if dec_ms > 0.0 else 0.0, "tok/s")
-            print(">> [PROF/SPLIT] per token -> GDN:",
-                  Float64(acc_gdn) / 1e6 / n_dec, "ms | ATTN:",
-                  Float64(acc_attn) / 1e6 / n_dec, "ms | LM_HEAD+argmax:",
-                  Float64(acc_lm) / 1e6 / n_dec, "ms")
+            # Tanpa BONSAI_PROFILE tidak ada sync per-layer, jadi acc_gdn/acc_attn
+            # hanyalah waktu SUBMIT CPU dan acc_lm menyerap seluruh kerja GPU token
+            # yang terkuras di sync terakhir. Menampilkannya sebagai "ms per
+            # subsistem" pernah menyesatkan; sekarang dinyatakan terang-terangan.
+            if prof:
+                print(">> [PROF/SPLIT] per token -> GDN:",
+                      Float64(acc_gdn) / 1e6 / n_dec, "ms | ATTN:",
+                      Float64(acc_attn) / 1e6 / n_dec, "ms | LM_HEAD+argmax:",
+                      Float64(acc_lm) / 1e6 / n_dec, "ms")
+                print(">> [PROF/LM] gemm:", Float64(acc_lm_gemm) / 1e6 / n_dec,
+                      "ms | argmax:", Float64(acc_lm_am) / 1e6 / n_dec,
+                      "ms | D2H+sync:", Float64(acc_lm_d2h) / 1e6 / n_dec, "ms")
+            else:
+                print(">> [PROF/SPLIT] BONSAI_PROFILE tidak aktif:",
+                      Float64(acc_gdn + acc_attn) / 1e6 / n_dec,
+                      "ms/token submit CPU (bukan GPU) |",
+                      Float64(acc_lm) / 1e6 / n_dec,
+                      "ms/token = kerja GPU SELURUH token, bukan LM head")
         print(">> [PERF] total:", total_ms, "ms")
         khq_prof_report()
         print(">> Selesai:", n_generated, "token di-generate (greedy).")

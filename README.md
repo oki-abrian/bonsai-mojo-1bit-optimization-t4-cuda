@@ -45,7 +45,11 @@ Catatan: angka "53,2 → 75,0 ms/token (+22 ms)" yang sempat dilaporkan **tidak 
 
 Ukuran KV terkompresi turun dari **1024 B → 220 B** per (token, head) — sekitar **4,7×** lebih kecil. Karena biaya attention tumbuh linear terhadap panjang sekuens, keuntungan memori ini baru terasa pada konteks panjang.
 
-**Yang sebenarnya mendominasi decode bukan KHQ.** Profil per-subsistem (`BONSAI_PROFILE`) konsisten menunjukkan `LM_HEAD+argmax` = **47–63 ms dari 50–67 ms/token (≈93%)**, sementara seluruh layer (GDN + attention) hanya ≈3–4 ms/token. `lm_head` juga 1-bit (159 MB + 39 MB skala), jadi 47 ms berarti ≈4 GB/s — sedangkan kernel layer lain berjalan ≈290 GB/s (43 MB dalam ≈0,15 ms). Selisih ini belum dijelaskan dan merupakan target optimasi terbesar.
+**Catatan soal profil per-subsistem.** Baris `[PROF/SPLIT]` **tidak** memecah waktu GPU per subsistem pada konfigurasi default. Di `main.mojo`, `acc_gdn +=` dan `acc_attn +=` berada **di luar** `if prof:` — hanya `synchronize()`-nya yang di dalam `if prof:`. Karena `BONSAI_PROFILE` dimatikan di `deploy_on_kaggle.sh` (sengaja: sync 65×/token mematikan pipeline async), `prof` bernilai false, sehingga `acc_gdn`/`acc_attn` hanyalah waktu *submit CPU* dan `acc_lm` adalah waktu GPU **seluruh token** yang terkuras pada sync terakhir.
+
+Konsekuensinya, angka `LM_HEAD+argmax` pada baris itu (~47 ms) **bukan** biaya LM head — itu waktu forward satu token penuh. Kalau angka itu benar-benar LM head, 64 layer harus membaca 4,9 GB dataset bobot dalam ~3 ms = ~1.500 GB/s, jauh di atas puncak bandwidth T4 (320 GB/s).
+
+Yang bisa disimpulkan: decode benar-benar bandwidth-bound, membaca ~4,9 GB bobot per token dalam ~47 ms ≈ **104 GB/s** (≈33% puncak T4). Pemecahan per-subsistem yang sah hanya didapat dengan `BONSAI_PROFILE=1` di sesi profiling terpisah.
 
 ---
 

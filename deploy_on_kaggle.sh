@@ -574,6 +574,35 @@ PYEOF
                 --max-tokens "$KHQ_TOKENS" --gpu 2>&1 | tee "$DIST_DIR/khq_prof.log" \
                 | grep -E "KHQ-PROF|PERF" || true
 
+            # 5b.7 PROFIL SUB-SISTEM YANG SAH — BONSAI_PROFILE=1 menyalakan sync
+            # per layer, sehingga GDN / ATTN / LM head benar-benar terpisah dan
+            # acc_lm tidak lagi menyerap seluruh kerja GPU token. Total ms/token
+            # memang lebih buruk di sini (sync 65x/token memutus pipeline async);
+            # yang dibaca adalah PEMBAGIAN waktunya. Tanpa flag ini, angka
+            # [PROF/SPLIT] menyesatkan (lihat catatan di README).
+            echo ">> [KHQ] 5b.7 profil sub-sistem sah (BONSAI_PROFILE=1, baseline)"
+            BONSAI_PROFILE=1 "$WORKING/bonsai_infer" \
+                --model-dir "$KMODEL" --prompt-tokens "$PROMPT_TOKENS_LONG" \
+                --max-tokens 64 --gpu 2>&1 | tee "$DIST_DIR/prof_base.log" \
+                | grep -E "PROF/|PERF" || true
+
+            python3 - "$DIST_DIR" <<'PYEOF'
+import os, re, sys
+
+txt = open(os.path.join(sys.argv[1], "prof_base.log")).read()
+seg = re.findall(r"\[PROF/SPLIT\][^\n]*\n[^\n]*\[PROF/LM\][^\n]*", txt)
+if not seg:
+    print("   [WARN] blok PROF tidak ditemukan di prof_base.log")
+else:
+    print("   --- pembagian waktu GPU per subsistem (BONSAI_PROFILE=1) ---")
+    for ln in seg[-1].splitlines():
+        print("   " + ln.strip())
+    tot = re.search(r"rata-rata decode:\s*([\d.]+)", txt)
+    if tot:
+        print(f"   (total decode dgn sync per-layer: {float(tot.group(1)):.2f} ms/token"
+              " — lebih lambat dari run normal, wajar)")
+PYEOF
+
             python3 - "$DIST_DIR" <<'PYEOF'
 import os, re, sys
 
