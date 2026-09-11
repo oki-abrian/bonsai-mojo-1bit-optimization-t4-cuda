@@ -603,6 +603,25 @@ else:
               " — lebih lambat dari run normal, wajar)")
 PYEOF
 
+            # 5b.8 A/B DI KONTEKS PENDEK — regime angka headline (18-19,5 tok/s).
+            # A/B di 5b.5 memakai konteks ~568, dan biaya per token NAIK seiring
+            # konteks (terukur dlm satu run: 60 ms di token awal -> 87 ms di token
+            # akhir). Tanpa pasangan ini, angka konteks panjang mudah disalah-
+            # artikan sebagai "model melambat".
+            echo ">> [KHQ] 5b.8 A/B konteks pendek (regime headline)"
+            for cfg in "base:" "khq:16"; do
+                name="${cfg%%:*}"; sp="${cfg##*:}"
+                if [ "$name" = "base" ]; then
+                    env_khq=""
+                else
+                    env_khq="BONSAI_KHQ_PATH=$KHQ_DIR/khq_calib.bin BONSAI_KHQ_SPLITS=$sp"
+                fi
+                env $env_khq "$WORKING/bonsai_infer" --model-dir "$KMODEL" \
+                    --prompt-tokens "$PROMPT_TOKENS" --max-tokens 24 --gpu \
+                    2>&1 | tee "$DIST_DIR/short_$name.log" \
+                    | grep -E "PERF" || true
+            done
+
             python3 - "$DIST_DIR" <<'PYEOF'
 import os, re, sys
 
@@ -616,6 +635,47 @@ def ms_per_token(path):
         return None
     m = re.search(r"rata-rata decode:\s*([-\d.eE+]+)\s*ms/token", txt)
     return float(m.group(1)) if m else None
+
+
+print("   --- A/B konteks pendek (prompt 9 token, decode 23 token) ---")
+for nm, lbl in (("base", "baseline fp16"), ("khq", "KHQ splits=16")):
+    v = ms_per_token(os.path.join(d, f"short_{nm}.log"))
+    if v:
+        print(f"   {lbl:<14}: {v:.2f} ms/token | {1000.0 / v:.2f} tok/s")
+b = ms_per_token(os.path.join(d, "short_base.log"))
+k = ms_per_token(os.path.join(d, "short_khq.log"))
+if b and k:
+    print(f"   beban KHQ di konteks pendek: {k - b:+.2f} ms/token ({(k / b - 1) * 100:+.1f}%)")
+PYEOF
+
+            python3 - "$DIST_DIR" "$PROMPT_TOKENS_LONG" "$KHQ_TOKENS" <<'PYEOF'
+import os, re, sys
+
+d = sys.argv[1]
+PT, MT = sys.argv[2], sys.argv[3]
+# ms/token absolut BERGANTUNG KONTEKS: biaya per token naik seiring KV tumbuh.
+# Sertakan kondisinya supaya angka ini tidak dibandingkan dgn angka headline
+# (yg diukur pada konteks pendek) tanpa sadar.
+print(f"   --- A/B split-K (ms/token, tanpa debug) ---")
+print(f"   kondisi: prompt {PT} token, decode {int(MT)-1} token "
+      f"-> konteks akhir ~{int(PT) + int(MT) - 1}; angka = rata-rata sepanjang run")
+
+
+def ms_per_token(path):
+    try:
+        txt = open(path).read()
+    except FileNotFoundError:
+        return None
+    m = re.search(r"rata-rata decode:\s*([-\d.eE+]+)\s*ms/token", txt)
+    return float(m.group(1)) if m else None
+
+
+def ms_list(path):
+    try:
+        txt = open(path).read()
+    except FileNotFoundError:
+        return []
+    return [float(m) for m in re.findall(r"\[GEN\] token id:\s*\d+\s*\|\s*([\d.]+) ms", txt)]
 
 
 def toks(path):
@@ -664,6 +724,12 @@ for sp in (1, 4, 8, 16):
     warn = "" if eff == sp else f"  [WARN] jalan sebagai splits={eff}"
     print(f"   KHQ splits={sp:<2}                  : {v:.2f} ms/token | "
           f"prefix token {pfx}/{n}{tag}{warn}")
+    g = ms_list(p)
+    if len(g) >= 50:
+        a = sum(g[:25]) / 25.0
+        z = sum(g[-25:]) / 25.0
+        print(f"        tren dlm run: 25 token awal {a:.2f} -> 25 token akhir "
+              f"{z:.2f} ms/token ({(z / a - 1) * 100:+.1f}%)")
 if ref and len(rows) > 1:
     best_sp, best = min(rows, key=lambda r: r[1])
     print(f"   split-K terbaik: splits={best_sp} -> {best:.2f} ms/token "
