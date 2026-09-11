@@ -248,7 +248,11 @@ fn khq_dump_attn(
         _pack_u32(hdr + 12, UInt32(D_in))
         _ = f.write_bytes(Span[UInt8, MutAnyOrigin](ptr=hdr, length=16))
         hdr.free()
-        _dg()[].ad.files[layer_idx] = f ^
+        # init_pointee_move, BUKAN `files[i] = f ^`: slot array ini berasal dari
+        # alloc[...] yang belum diinisialisasi, dan move-assign biasa akan
+        # memanggil destruktor nilai lama (sampah heap) -> crash di FileClose.
+        # Terbukti: attn_3.bin berhenti tepat setelah header 16 byte.
+        (_dg()[].ad.files + layer_idx).init_pointee_move(f ^)
         _dg()[].ad.opened[layer_idx] = True
 
     # salin q (gather interleaved [H_q,2D] -> [H_q,D]) dan k roped

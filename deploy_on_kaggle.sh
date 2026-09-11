@@ -630,13 +630,11 @@ if ref and len(rows) > 1:
         print("   [WARN] split-K belum memperbaiki apa pun di konfigurasi ini")
     if base:
         print(f"   (KHQ vs baseline fp16: {ref / base:.3f}x pada splits=1)")
-PH = ["ring-write", "compress-K", "compress-V", "gather-q",
-      "attn-kompresi", "attn-jendela", "merge+gate"]
 try:
     ptxt = open(os.path.join(d, "khq_prof.log")).read()
 except FileNotFoundError:
     ptxt = ""
-lines = re.findall(r"KHQ-PROF\]\s+(\S+)\s+([-\d.eE+]+)ms\s+\|\s+([-\d.eE+]+)%", ptxt)
+lines = re.findall(r"KHQ-PROF\]\s+(\S+)\s+([-\d.eE+]+)\s*ms\s*\|\s*([-\d.eE+]+)\s*%", ptxt)
 if lines:
     print("   --- profil per-fase (sync tiap fase) ---")
     for name, ms, pct in lines:
