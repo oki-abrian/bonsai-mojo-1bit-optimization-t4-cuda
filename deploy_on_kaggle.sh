@@ -652,13 +652,18 @@ PYEOF
 import os, re, sys
 
 d = sys.argv[1]
-PT, MT = sys.argv[2], sys.argv[3]
-# ms/token absolut BERGANTUNG KONTEKS: biaya per token naik seiring KV tumbuh.
-# Sertakan kondisinya supaya angka ini tidak dibandingkan dgn angka headline
-# (yg diukur pada konteks pendek) tanpa sadar.
+# PROMPT_TOKENS_LONG berbentuk daftar id ("56,249,...") di mana elemen PERTAMA
+# adalah panjangnya (lihat parse_int_list di main.mojo), jadi jangan int() utuh.
+PT = int(sys.argv[2].split(",")[0])
+MT = int(sys.argv[3].split(",")[0])
+# Ukuran absolut ms/token TIDAK stabil: GPU melambat saat dibebani terus
+# (~+46% dari token awal ke akhir dlm satu run 36 detik; konfigurasi pendek
+# yg sama juga terukur 54,5 ms di awal sesi vs 59,4 ms di akhir sesi).
+# Selalu sertakan kondisi + tren, jangan bandingkan lintas run.
 print(f"   --- A/B split-K (ms/token, tanpa debug) ---")
-print(f"   kondisi: prompt {PT} token, decode {int(MT)-1} token "
-      f"-> konteks akhir ~{int(PT) + int(MT) - 1}; angka = rata-rata sepanjang run")
+print(f"   kondisi: prompt {PT} token, decode {MT-1} token "
+      f"-> konteks akhir ~{PT + MT - 1}; angka = rata-rata sepanjang run "
+      f"(bukan angka sustain/headline)")
 
 
 def ms_per_token(path):
