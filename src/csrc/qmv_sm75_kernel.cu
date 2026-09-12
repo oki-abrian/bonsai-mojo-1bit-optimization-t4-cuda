@@ -888,7 +888,11 @@ __global__ void khq_attn_kernel(
     if (head_idx >= (uint)num_heads) return;
     const uint head_idx_kv = head_idx / (uint)n_rep;
 
-    const __half* q_ptr = q_p + (total_id * D_v);
+    // Q dibaca LANGSUNG dari buffer interleaved [H_q, 2*D] (q di 0..D-1),
+    // sama seperti kernel GQA baseline. Dulu ada kernel gather_q terpisah
+    // yang menyalin ke layout kontigu hanya untuk dibaca di sini — kernel
+    // ekstra + satu lintasan 12 KB per layer per token yang sia-sia.
+    const __half* q_ptr = q_p + ((size_t)head_idx * 2 * D_v);
 
     float freqs[8];
     for (int j = 0; j < 8; j++) freqs[j] = 1.0f;
@@ -1259,7 +1263,7 @@ __global__ void khq_attn_reduce_kernel(
 // supaya bisa digabung dengan region terkompresi via logsumexp (V21.23).
 // Satu block per (query head); K/V sudah roped di ring, jadi tanpa RoPE di sini.
 __global__ void khq_window_attn_kernel(
-    const __half* __restrict__ q,        // (H_q, D) — q_buf tanpa gate (stride D)
+    const __half* __restrict__ q,        // (H_q, 2*D) — INTERLEAVED, q di 0..D-1
     const __half* __restrict__ ring_k,   // (H_kv, RING, D)
     const __half* __restrict__ ring_v,   // (H_kv, RING, D)
     float* __restrict__ out_attn,        // (H_q, D+2) float
@@ -1287,7 +1291,8 @@ __global__ void khq_window_attn_kernel(
     float qv[8];
     for (int i = 0; i < 8; i++) {
         int idx = tid + i * blockDim.x;
-        qv[i] = (idx < D_v) ? __half2float(q[h * D_v + idx]) : 0.0f;
+        // Layout interleaved [H_q, 2*D]: q head h menempati 0..D-1.
+        qv[i] = (idx < D_v) ? __half2float(q[h * 2 * D_v + idx]) : 0.0f;
     }
 
     for (int s = 0; s < win_len; s++) {
@@ -2984,7 +2989,7 @@ int launch_khq_compress_fp16(
 // Attention terfusi atas KV terkompresi KHQ. Output (num_queries, D+2) float:
 // acc unnormalized + max_s + sum_exp (merge logsumexp dilakukan di Mojo).
 int launch_khq_attn_fp16(
-    const void* q,               // (num_queries, D) __half
+    const void* q,               // (H_q, 2*D) __half INTERLEAVED (q di 0..D-1)
     const void* k_payload,       // (N_kv, 40) uint8
     const void* v_payload,       // (N_kv, 104) uint8
     const void* v_shared_meta,   // (N_kv, 4) float
@@ -3048,7 +3053,7 @@ int launch_khq_attn_fp16(
 
 // Attention jendela raw fp16 (unnormalized) untuk merge logsumexp.
 int launch_khq_window_attn_fp16(
-    const void* q,          // (H_q, D) __half (q_buf tanpa gate, stride D)
+    const void* q,          // (H_q, 2*D) __half INTERLEAVED (q di 0..D-1), bukan q_buf terpisah
     const void* ring_k,     // (H_kv, RING, D) __half (sudah RoPE)
     const void* ring_v,     // (H_kv, RING, D) __half
     void* out_attn,         // (H_q, D+2) float

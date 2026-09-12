@@ -26,7 +26,6 @@ from src.ops import (
     khq_compress_sm75_try_launch,
     khq_attn_sm75_try_launch,
     khq_window_attn_sm75_try_launch,
-    khq_gather_q_sm75_try_launch,
     khq_merge_gate_try,
 )
 from os import getenv
@@ -45,14 +44,13 @@ alias KHQ_MAX_SPLITS = 32
 alias KHQ_MIN_TOKENS_PER_SPLIT = 8
 
 # Fase profiling (BONSAI_KHQ_PROF=1).
-alias KHQ_P_RING = 0    # tulis 3 ring (K unroped, K roped, V)
+alias KHQ_P_RING = 0    # tulis ring (K roped + V sekaligus; K unroped di capture)
 alias KHQ_P_CK = 1      # kompresi K
 alias KHQ_P_CV = 2      # kompresi V
-alias KHQ_P_GATHER = 3  # pisah Q dari buffer interleaved
-alias KHQ_P_ATTN = 4    # attention region terkompresi (+ reduce split-K)
-alias KHQ_P_WIN = 5     # attention jendela raw
-alias KHQ_P_MERGE = 6   # merge logsumexp + sigmoid gate
-alias KHQ_N_PHASES = 7
+alias KHQ_P_ATTN = 3    # attention region terkompresi (+ reduce split-K)
+alias KHQ_P_WIN = 4     # attention jendela raw
+alias KHQ_P_MERGE = 5   # merge logsumexp + sigmoid gate
+alias KHQ_N_PHASES = 6
 
 # --------------------------------------------------------------- alokasi helper
 fn _mk_f16(mut ctx: DeviceContextGPU, n: Int) raises -> UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]:
@@ -115,7 +113,6 @@ struct KhqLayer:
     var h_vsm: UnsafePointer[DeviceBuffer[DType.uint8], MutAnyOrigin]
 
     # scratch
-    var h_qbuf: UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]
     var h_ac: UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]
     var h_aw: UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]
     var h_ap: UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]
@@ -150,7 +147,6 @@ struct KhqLayer:
         self.h_vnorm = UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]()
         self.h_vrn = UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]()
         self.h_vsm = UnsafePointer[DeviceBuffer[DType.uint8], MutAnyOrigin]()
-        self.h_qbuf = UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]()
         self.h_ac = UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]()
         self.h_aw = UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]()
         self.h_ap = UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]()
@@ -245,7 +241,6 @@ fn khq_prof_report():
     _khq_prof_line(KHQ_P_RING, "ring-write   ", tot)
     _khq_prof_line(KHQ_P_CK, "compress-K   ", tot)
     _khq_prof_line(KHQ_P_CV, "compress-V   ", tot)
-    _khq_prof_line(KHQ_P_GATHER, "gather-q     ", tot)
     _khq_prof_line(KHQ_P_ATTN, "attn-kompresi", tot)
     _khq_prof_line(KHQ_P_WIN, "attn-jendela ", tot)
     _khq_prof_line(KHQ_P_MERGE, "merge+gate   ", tot)
@@ -371,7 +366,7 @@ fn khq_init(mut ctx: DeviceContextGPU, path: String, max_seq: Int) raises -> Boo
         L[].ready = False
 
     _g()[].ready = True
-    _g()[].splits = _khq_env_int("BONSAI_KHQ_SPLITS", 8)
+    _g()[].splits = _khq_env_int("BONSAI_KHQ_SPLITS", 16)
     if _g()[].splits < 1:
         _g()[].splits = 1
     if _g()[].splits > KHQ_MAX_SPLITS:
@@ -419,7 +414,6 @@ fn khq_init_layer(
     L[].h_vnorm = _mk_f16(ctx, rows_total)
     L[].h_vrn = _mk_f16(ctx, rows_total)
     L[].h_vsm = _mk_u8(ctx, rows_total * 4)
-    L[].h_qbuf = _mk_f16(ctx, H_q * d)
     L[].h_ac = _mk_f32(ctx, H_q * (d + 2))
     L[].h_aw = _mk_f32(ctx, H_q * (d + 2))
     L[].h_ap = _mk_f32(ctx, H_q * KHQ_MAX_SPLITS * (d + 2))
@@ -548,20 +542,14 @@ fn khq_step(
                   "write_pos", L[].write_pos,
                   "raw_window", L[].write_pos - L[].boundary)
 
-    # 3. attention: Q dipisah dari buffer interleaved (dipakai kedua region)
+    # 3. attention: kedua region membaca Q langsung dari buffer interleaved
+    #    [H_q, 2*d] (q di 0..d-1) — tidak ada kernel gather_q lagi.
     var c_len = L[].boundary
     var has_c = c_len > 0
     var win_len = L[].write_pos - c_len
     var has_w = win_len > 0
     if not (has_c or has_w):
         return False
-    var tg = monotonic() if _g()[].prof else 0
-    if not khq_gather_q_sm75_try_launch(
-        q_gate_dev, L[].h_qbuf[].unsafe_ptr(), H_q, d):
-        return False
-    if _g()[].prof:
-        ctx.synchronize()
-        khq_prof_add(KHQ_P_GATHER, monotonic() - tg)
 
     if has_c:
         var n_rep = H_q // H_kv
@@ -571,7 +559,7 @@ fn khq_step(
         var n_sp = _khq_split_count(c_len)
         var ta = monotonic() if _g()[].prof else 0
         var ok = khq_attn_sm75_try_launch(
-            L[].h_qbuf[].unsafe_ptr(),
+            q_gate_dev,
             L[].h_kpay[].unsafe_ptr(), L[].h_vpay[].unsafe_ptr(),
             L[].h_vsm[].unsafe_ptr(), L[].h_kmask[].unsafe_ptr(),
             L[].h_knorm[].unsafe_ptr(), L[].h_krn[].unsafe_ptr(),
@@ -596,7 +584,7 @@ fn khq_step(
         var win_start = c_len % KHQ_RING
         var tw = monotonic() if _g()[].prof else 0
         var ok = khq_window_attn_sm75_try_launch(
-            L[].h_qbuf[].unsafe_ptr(), L[].h_ring_k[].unsafe_ptr(),
+            q_gate_dev, L[].h_ring_k[].unsafe_ptr(),
             L[].h_ring_v[].unsafe_ptr(), L[].h_aw[].unsafe_ptr(),
             win_start, win_len, KHQ_RING, H_q, H_kv, d, scale)
         if _g()[].prof:
