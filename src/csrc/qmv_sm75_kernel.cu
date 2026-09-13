@@ -553,7 +553,7 @@ __global__ void gdn_seq_sm75_kernel(
     const __half* __restrict__ b,   // [T, ab_stride] (b di +b_off)
     const float* __restrict__ a_log,   // [Hv]
     const float* __restrict__ dt_bias, // [Hv]
-    __half* __restrict__ state,        // [Hv, Dv, Dk] fp16 in/out
+    float* __restrict__ state,         // [Hv, Dv, Dk] fp32 in/out
     __half* __restrict__ y,            // [T, y_stride] (head hv di hv*Dv)
     int T, int Hv, int Hk, int Dk, int Dv,
     int qk_stride, int v_stride, int ab_stride, int y_stride,
@@ -571,13 +571,14 @@ __global__ void gdn_seq_sm75_kernel(
     const __half* vp = v + hv * Dv + dv;
     __half* yp = y + hv * Dv + dv;
 
-    // State ke register (fp32) — baris S[hv, dv, :]
-    __half* sp = state + ((size_t)n * Dv + dv) * Dk;
+    // State ke register (fp32) — baris S[hv, dv, :]. State disimpan FP32 di
+    // VRAM (WAJIB: config `mamba_ssm_dtype: float32`; llama.cpp GGML_TYPE_F32).
+    float* sp = state + ((size_t)n * Dv + dv) * Dk;
     float st[NPT];
 #pragma unroll
     for (int i = 0; i < NPT; ++i) {
         int sidx = NPT * lane + i;
-        st[i] = (sidx < Dk) ? __half2float(sp[sidx]) : 0.0f;
+        st[i] = (sidx < Dk) ? sp[sidx] : 0.0f;
     }
 
     const float al = a_log[hv];
@@ -600,10 +601,10 @@ __global__ void gdn_seq_sm75_kernel(
             float kv = (sidx < Dk) ? __half2float(kp[(size_t)t * qk_stride + sidx]) : 0.0f;
             kt[i] = kv;
             qt[i] = (sidx < Dk) ? __half2float(qp[(size_t)t * qk_stride + sidx]) : 0.0f;
-            // Replika persis kernel per-token: decay lalu ROUND fp16 (state
-            // disimpan fp16), sedangkan kv_mem memakai nilai decay BELUM round.
+            // State tetap FP32 penuh — TIDAK ada round fp16 per langkah.
+            // Rounding per-langkah + decay ~1.0 = drift terakumulasi.
             float sdec = st[i] * dec;
-            st[i] = __half2float(__float2half(sdec));
+            st[i] = sdec;
             kv_mem += sdec * kt[i];
         }
         kv_mem = gdn_seq_warp_sum(kv_mem);
@@ -613,20 +614,20 @@ __global__ void gdn_seq_sm75_kernel(
         float out = 0.f;
 #pragma unroll
         for (int i = 0; i < NPT; ++i) {
-            // out memakai state baru BELUM round; state disimpan round fp16.
+            // State tetap FP32 penuh — TIDAK ada round fp16 per langkah.
             float snew = st[i] + kt[i] * delta;
             out += snew * qt[i];
-            st[i] = __half2float(__float2half(snew));
+            st[i] = snew;
         }
         out = gdn_seq_warp_sum(out);
         if (lane == 0) yp[(size_t)t * y_stride] = __float2half(out);
     }
 
-    // Tulis balik state akhir (fp16) — SEKALI untuk seluruh sekuens
+    // Tulis balik state akhir (fp32) — SEKALI untuk seluruh sekuens
 #pragma unroll
     for (int i = 0; i < NPT; ++i) {
         int sidx = NPT * lane + i;
-        if (sidx < Dk) sp[sidx] = __float2half(st[i]);
+        if (sidx < Dk) sp[sidx] = st[i];
     }
 }
 
@@ -2921,7 +2922,7 @@ int launch_gdn_seq_sm75_fp16(
     const __half* bp = reinterpret_cast<const __half*>(b);
     const float* alp = reinterpret_cast<const float*>(a_log);
     const float* dbp = reinterpret_cast<const float*>(dt_bias);
-    __half* sp = reinterpret_cast<__half*>(state);
+    float* sp = reinterpret_cast<float*>(state);
     __half* yp = reinterpret_cast<__half*>(y);
 
     // 1 warp per baris dv: block (32, 4), grid (1, ceil(Dv/4), Hv)

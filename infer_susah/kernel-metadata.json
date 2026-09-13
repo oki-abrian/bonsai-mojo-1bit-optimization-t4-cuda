@@ -1,0 +1,21 @@
+{
+  "id": "okiabrian/bonsai-infer-susah",
+  "title": "bonsai-infer-susah",
+  "code_file": "run_infer.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "okiabrian/bonsai-mojo-source",
+    "okiabrian/bonsai-27b-mlx-1bit"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [
+    "okiabrian/bonsai-mojo-t4-build"
+  ],
+  "model_sources": []
+}

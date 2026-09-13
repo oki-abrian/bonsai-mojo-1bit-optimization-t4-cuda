@@ -54,6 +54,53 @@ cp -r tests "$PKG_DIR/"
 cp -r benchmarks "$PKG_DIR/"
 cp -r scripts "$PKG_DIR/" 2>/dev/null || true
 
+# --- Teruskan variabel lingkungan BONSAI_* ke container T4 -------------------
+# PENTING: variabel yang diset di shell LOKAL (mis. BONSAI_COH_THINK=both)
+# TIDAK otomatis sampai ke kernel Kaggle — env shell lokal tidak ikut terkirim,
+# dan run_deploy.py tidak menyuntikkan env apa pun. Tanpa blok ini, perintah
+# seperti `BONSAI_COH_THINK=both ./push_to_kaggle.sh` akan DIAM-DIAM mengabaikan
+# variabelnya dan T4 berjalan dengan default (hasilnya negatif palsu).
+# Solusi: bekukan di sini, lalu run_deploy.py men-source-nya di dalam container.
+# Catatan: `case` TIDAK boleh ditaruh di dalam $( ... ) di sini — bash 3.2
+# (bawaan macOS) salah-parse `)` dari pola `BONSAI_*)` sebagai penutup $( ).
+# Karena itu env dibekukan ke snapshot lalu dibaca dua kali dari shell utama
+# (sekali untuk menulis file, sekali untuk menampilkan) — sekaligus menghindari
+# hilangnya variabel akibat subshell pada pipeline.
+ENV_SNAPSHOT="/tmp/bonsai_env_snapshot.$$"
+env > "$ENV_SNAPSHOT"
+
+ENV_FILE="$PKG_DIR/bonsai_env.sh"
+{
+    echo "# Dibuat otomatis oleh push_to_kaggle.sh pada $TIMESTAMP"
+    echo "# Di-source oleh run_deploy.py di dalam container T4, sebelum deploy_on_kaggle.sh."
+    echo "# Jangan disunting tangan - isinya mengikuti environment shell saat push."
+} > "$ENV_FILE"
+
+while IFS='=' read -r _k _v; do
+    case "$_k" in
+        BONSAI_*)
+            printf 'export %s=%q\n' "$_k" "$_v" >> "$ENV_FILE"
+            ;;
+    esac
+done < "$ENV_SNAPSHOT"
+
+echo ">> [ENV] Variabel BONSAI_* yang diteruskan ke T4 (bonsai_env.sh):"
+N_BONSAI=0
+while IFS='=' read -r _k _v; do
+    case "$_k" in
+        BONSAI_*)
+            printf '>>        %s=%s\n' "$_k" "$_v"
+            N_BONSAI=$((N_BONSAI + 1))
+            ;;
+    esac
+done < "$ENV_SNAPSHOT"
+rm -f "$ENV_SNAPSHOT"
+
+if [ "$N_BONSAI" -eq 0 ]; then
+    echo ">>        (tidak ada) -> T4 akan memakai default."
+    echo ">>        Contoh: BONSAI_COH_THINK=both ./push_to_kaggle.sh"
+fi
+
 echo ">> Mengompres source code bersih (tanpa ._* dan file metadata macOS)..."
 export COPYFILE_DISABLE=1
 tar --exclude="._*" \

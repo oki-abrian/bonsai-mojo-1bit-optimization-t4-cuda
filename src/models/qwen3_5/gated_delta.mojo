@@ -20,9 +20,12 @@ from src.ops import (
 struct GatedDeltaNetState:
     """
     State Memori Kausal Rekuren Penuh:
-    1. Causal Conv1D State: [3, 12288]
-    2. Recurrent Memory Matrix S: [64 heads, 128, 128]
-    Total memori per layer = 4.14 MiB.
+    1. Causal Conv1D State: [3, conv_dim]  (Bonsai-27B: conv_dim = 10240)
+    2. Recurrent Memory Matrix S: [H_v, D_v, D_k]  (Bonsai-27B: 48 x 128 x 128)
+    Total memori per layer = 3 x 10240 x 4 B + 48 x 128 x 128 x 4 B
+                           = 120 KiB + 3,0 MiB ≈ 3,1 MiB.
+    (Angka lama 4,14 MiB berasal dari dimensi checkpoint lama 64x128x128 /
+     conv_dim 12288 dan sudah tidak berlaku.)
     Mendukung alokasi VRAM device untuk Full GPU execution.
     """
     var conv_state: CausalConv1dState
@@ -32,21 +35,29 @@ struct GatedDeltaNetState:
     var head_k_dim: Int
     var s_elements: Int
     var conv_dim: Int
-    # Buffer device di VRAM — state S disimpan FP16 (hemat 2x trafik DRAM;
-    # math di dalam kernel tetap FP32). State awal selalu nol.
-    var state_s_dev: UnsafePointer[Float16, MutAnyOrigin]
-    var state_s_dev_buf: UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]
+    # Buffer device di VRAM — state S disimpan FP32 (WAJIB, bukan FP16).
+    # Referensi: config model `mamba_ssm_dtype: float32`, mlx-lm (mx.float32),
+    # dan llama.cpp-prism (`recurrent_type_k/v = GGML_TYPE_F32`). Karena decay
+    # mendekati 1.0, error pembulatan per-langkah akan terakumulasi ratusan
+    # langkah dan merusak state. State awal selalu nol.
+    var state_s_dev: UnsafePointer[Float32, MutAnyOrigin]
+    var state_s_dev_buf: UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]
     var conv_buf_dev: UnsafePointer[Float32, MutAnyOrigin]
     var conv_buf_dev_buf: UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]
     var dev_ready: Bool
 
     fn __init__(
         out self,
-        conv_dim: Int = 12288,
-        num_v_heads: Int = 64,
+        conv_dim: Int = 10240,
+        num_v_heads: Int = 48,
         head_v_dim: Int = 128,
         head_k_dim: Int = 128
     ):
+        """Default = dimensi Bonsai-27B yang SEBENARNYA (config.mojo
+        `qwen_27b_default`): conv_dim 10240 = 2*(16*128) + 48*128,
+        H_v 48 x 128, H_k 16 x 128. Default lama (12288 / 64 head) berasal dari
+        checkpoint lain dan membuat konstruksi tanpa argumen mengalokasikan
+        state yang salah bentuk."""
         self.conv_dim = conv_dim
         self.num_v_heads = num_v_heads
         self.head_v_dim = head_v_dim
@@ -54,28 +65,24 @@ struct GatedDeltaNetState:
         self.s_elements = num_v_heads * head_v_dim * head_k_dim
         self.conv_state = CausalConv1dState(conv_dim=conv_dim, kernel_size=4)
         self.state_s = alloc[Float32](self.s_elements)
-        self.state_s_dev = UnsafePointer[Float16, MutAnyOrigin]()
-        self.state_s_dev_buf = UnsafePointer[DeviceBuffer[DType.float16], MutAnyOrigin]()
+        self.state_s_dev = UnsafePointer[Float32, MutAnyOrigin]()
+        self.state_s_dev_buf = UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]()
         self.conv_buf_dev = UnsafePointer[Float32, MutAnyOrigin]()
         self.conv_buf_dev_buf = UnsafePointer[DeviceBuffer[DType.float32], MutAnyOrigin]()
         self.dev_ready = False
         self.reset()
 
     fn init_device(mut self, mut ctx: DeviceContextGPU) raises:
-        """Alokasikan state S (FP16) dan conv buffer (FP32) di VRAM."""
+        """Alokasikan state S (FP32) dan conv buffer (FP32) di VRAM."""
         if self.dev_ready:
             return
-        var sb_holder = alloc[DeviceBuffer[DType.float16]](1)
+        var sb_holder = alloc[DeviceBuffer[DType.float32]](1)
         sb_holder.init_pointee_move(
-            ctx.enqueue_create_buffer[DType.float16](self.s_elements)
+            ctx.enqueue_create_buffer[DType.float32](self.s_elements)
         )
-        # State awal = nol: tulis nol FP16 dari host (state FP32 lama tidak
-        # pernah berisi apa pun sebelum token pertama, jadi tidak perlu copy).
-        var z16 = alloc[Float16](self.s_elements)
-        for i in range(self.s_elements):
-            z16[i] = Float16(0.0)
-        ctx.enqueue_copy(sb_holder[], z16)
-        z16.free()
+        # State awal = nol: copy langsung dari host state_s (FP32, sudah nol
+        # setelah reset()). Tidak ada konversi dtype lagi.
+        ctx.enqueue_copy(sb_holder[], self.state_s)
         self.state_s_dev_buf = sb_holder
         self.state_s_dev = sb_holder[].unsafe_ptr()
 
@@ -199,17 +206,38 @@ fn qwen3_5_gdn_step(
     #    paritas Qwen3NextRMSNormGated(head_v_dim); bobot asli [128], bukan
     #    [H_v*D_v]. Fallback: fused tanpa bobot (jalur sintetis lama).
     if has_params:
-        var out_total = H_v * D_v
-        for i in range(out_total):
-            gdn_out[i] = gdn_out[i] * silu(z_ptr[i])
+        # PARITAS Qwen3NextRMSNormGated (mlx-lm qwen3_next.py:71-78):
+        # variance dihitung atas keluaran rekurensi MURNI, dikali bobot norm,
+        # lalu silu(z) DIKALIKAN TERAKHIR. Urutan terbalik menghasilkan galat
+        # gain per-head rms(x)/rms(x*silu(z)) di setiap layer GDN.
+        #
+        # SAKELAR A/B `BONSAI_GDN_NORM_ORDER=gate_first`: reproduksi bug LAMA
+        # (gate dulu, norm atas x*silu(z)) supaya dampaknya terukur di T4.
+        # Disamakan dgn kernel GPU (elementwise_sm75.mojo) agar tes paritas
+        # GPU-vs-CPU tetap bermakna di KEDUA mode. Default = urutan benar.
+        var legacy_env = getenv("BONSAI_GDN_NORM_ORDER")
+        var legacy = Bool(
+            legacy_env
+            and (legacy_env == "gate_first" or legacy_env == "legacy"
+                 or legacy_env == "1")
+        )
         for hv in range(H_v):
             var out_head = gdn_out.offset(hv * D_v)
+            var z_head = z_ptr.offset(hv * D_v)
             var ss: Float32 = 0.0
-            for d in range(D_v):
-                ss += out_head[d] * out_head[d]
-            var inv = 1.0 / sqrt(ss / Float32(D_v) + config.rms_norm_eps)
-            for d in range(D_v):
-                out_head[d] = out_head[d] * inv * norm_w[d]
+            if legacy:
+                for d in range(D_v):
+                    var g = out_head[d] * silu(z_head[d])
+                    ss += g * g
+                var inv0 = 1.0 / sqrt(ss / Float32(D_v) + config.rms_norm_eps)
+                for d in range(D_v):
+                    out_head[d] = (out_head[d] * silu(z_head[d]) * inv0 * norm_w[d])
+            else:
+                for d in range(D_v):
+                    ss += out_head[d] * out_head[d]
+                var inv = 1.0 / sqrt(ss / Float32(D_v) + config.rms_norm_eps)
+                for d in range(D_v):
+                    out_head[d] = (out_head[d] * inv * norm_w[d]) * silu(z_head[d])
     else:
         for hv in range(H_v):
             var out_head = gdn_out.offset(hv * D_v)

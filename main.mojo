@@ -21,6 +21,7 @@ from src import (
     khq_active, khq_activate, khq_prof_report
 )
 from time import monotonic
+from math import exp
 from src.jsonlite import JsonDoc
 from src.safetensors import SafeTensorsIndex, fuse_u8, fuse_f32, load_qlinear
 from src.models.qwen3_5.linear import use_gpu_matmul, DeviceContextGPU
@@ -76,73 +77,141 @@ fn find_flex(index: SafeTensorsIndex, name: String) -> Int:
     return index.find("language_model." + name)
 
 fn read_scales_eff(index: SafeTensorsIndex, e_s: Int, numel: Int) raises -> UnsafePointer[Float32, MutAnyOrigin]:
-    """Scales efektif = s_checkpoint / 2 (untuk kernel (2q-1)*s_eff)."""
+    """Scales efektif = s_checkpoint / 2 (untuk kernel (2q-1)*s_eff).
+
+    GAGAL KERAS bila tensor scales tidak ada. Sebelumnya `e_s == -1` hanya
+    menghasilkan buffer `alloc` yang TAK-TERINISIALISASI: kernel QMV/QMM lalu
+    membaca skala sampah dan mengeluarkan hasil salah TANPA satu pun pesan
+    error. Sama kelasnya dengan bug "hasil read dibuang" (FIX-5), tetapi di
+    jalur skala — yang justru mengalikan seluruh kontribusi bobot.
+    """
+    if e_s == -1 and numel > 0:
+        raise Error(
+            "FATAL: tensor scales tidak ditemukan (numel=" + String(numel)
+            + "). Tanpa skala, kernel 1-bit membaca memori tak-terinisialisasi "
+            + "dan hasilnya salah tanpa error."
+        )
     var p = alloc[Float32](numel if numel > 0 else 1)
     if e_s != -1 and numel > 0:
-        var _ = index.read_f32(e_s, p, numel)
+        if not index.read_f32(e_s, p, numel):
+            raise Error(
+                "FATAL: gagal baca scales (numel=" + String(numel)
+                + ") — dtype/jumlah elemen tidak cocok dgn header safetensors."
+            )
         for i in range(numel):
             p[i] *= Float32(0.5)
     return p
 
 fn read_biases_f32(index: SafeTensorsIndex, e_b: Int, numel: Int) raises -> UnsafePointer[Float32, MutAnyOrigin]:
-    """Biases checkpoint mentah (w = q*s_ckpt + b, affine eksak)."""
+    """Biases checkpoint mentah (w = q*s_ckpt + b, affine eksak).
+
+    Bila tensor biases TIDAK ADA, buffer dikembalikan dalam keadaan NOL (bukan
+    tak-terinisialisasi). Ini aman karena kernel QMV/QMM MENDERIVASI bias
+    sebagai `-s_eff` dan tidak pernah membaca tensor biases; nol membuat
+    perilaku itu eksplisit, bukan kebetulan. Bila biases ADA tetapi gagal
+    dibaca, kita tetap gagal keras.
+    """
     var p = alloc[Float32](numel if numel > 0 else 1)
+    for i in range(numel if numel > 0 else 1):
+        p[i] = 0.0
     if e_b != -1 and numel > 0:
-        var _ = index.read_f32(e_b, p, numel)
+        if not index.read_f32(e_b, p, numel):
+            raise Error(
+                "FATAL: gagal baca biases (numel=" + String(numel)
+                + ") — dtype/jumlah elemen tidak cocok dgn header safetensors."
+            )
     return p
 
-fn embed_row_dequant(
-    hidden: UnsafePointer[Float32, MutAnyOrigin],
-    packed: UnsafePointer[UInt8, MutAnyOrigin],
-    scales: UnsafePointer[Float32, MutAnyOrigin],
+fn must_read_f32(
+    index: SafeTensorsIndex,
+    e: Int,
+    dst: UnsafePointer[Float32, MutAnyOrigin],
+    numel: Int,
+    what: String
+) raises:
+    """Baca FP32 dan GAGAL KERAS bila tidak cocok.
+
+    Sebelumnya semua pemanggil memakai `var _ = index.read_f32(...)` — nilai
+    balik dibuang. Bila dtype/jumlah elemen tidak cocok, read_f32 mengembalikan
+    False dan buffer hasil `alloc` tetap TAK-TERINISIALISASI, lalu dipakai
+    sebagai A_log / dt_bias / bobot norm tanpa satu pun pesan error.
+    """
+    if not index.read_f32(e, dst, numel):
+        raise Error(
+            "FATAL: gagal baca " + what + " (numel=" + String(numel)
+            + ") — dtype/jumlah elemen tidak cocok dgn header safetensors."
+        )
+
+fn must_read_raw(
+    index: SafeTensorsIndex,
+    e: Int,
+    dst: UnsafePointer[UInt8, MutAnyOrigin],
+    nbytes: Int,
+    what: String
+) raises:
+    """Baca blob mentah (bobot 1-bit terpak) dan gagal keras bila tidak cocok."""
+    if not index.read_raw(e, dst, nbytes):
+        raise Error(
+            "FATAL: gagal baca " + what + " (nbytes=" + String(nbytes) + ")."
+        )
+
+
+fn verify_affine_zero_bias(
+    s: UnsafePointer[Float32, MutAnyOrigin],
     biases: UnsafePointer[Float32, MutAnyOrigin],
-    token: Int,
-    D: Int
-):
-    """Dequant SATU baris embedding 1-bit affine (w = q*s + b) langsung ke
-    hidden — paritas mx.dequantize(weight[ids], scales[ids], biases[ids])."""
-    var base = token * (D // 8)
-    var srow = token * (D // 128)
-    for k in range(D):
-        var bit = Float32((Int(packed[base + (k >> 3)]) >> (k & 7)) & 1)
-        hidden[k] = bit * scales[srow + (k >> 7)] + biases[srow + (k >> 7)]
+    numel: Int,
+    s_is_eff: Bool,
+    what: String
+) raises:
+    """Verifikasi kontrak affine checkpoint: `biases == -scales_ckpt / 2`.
 
-fn lm_head_argmax_packed(
-    hidden: UnsafePointer[Float32, MutAnyOrigin],
-    packed: UnsafePointer[UInt8, MutAnyOrigin],
-    scales: UnsafePointer[Float32, MutAnyOrigin],
-    biases: UnsafePointer[Float32, MutAnyOrigin],
-    V: Int,
-    D: Int
-) -> Int:
-    """Argmax logits = lm_head @ hidden langsung dari data 1-bit terpaket —
-    dequant affine (q*s + b) di dalam loop komputasi (kernel non-fused)."""
-    var best = Float32(-3.0e38)
-    var best_v = 0
-    for v in range(V):
-        var rowb = v * (D // 8)
-        var srow = v * (D // 128)
-        var acc: Float32 = 0.0
-        for k in range(D):
-            var bit = Float32((Int(packed[rowb + (k >> 3)]) >> (k & 7)) & 1)
-            acc += (bit * scales[srow + (k >> 7)] + biases[srow + (k >> 7)]) * hidden[k]
-        if acc > best:
-            best = acc
-            best_v = v
-    return best_v
+    Dua konvensi pemakaian skala hidup berdampingan, dan KEDUANYA bergantung
+    pada kontrak yang sama:
+      * `s_is_eff=True`  -> `s` sudah s_eff = s_ckpt/2 (loader membagi 2).
+        Dipakai QwenLinear1Bit -> kernel QMV/QMM yang MENDERIVASI bias sebagai
+        `-s_eff` dan tidak pernah membaca tensor biases. Harapan: b == -s.
+      * `s_is_eff=False` -> `s` masih s_ckpt mentah. Dipakai kernel embed
+        (`bit*s + b`, affine penuh). Harapan: b == -s/2.
 
-fn argmax_f32(
-    x: UnsafePointer[Float32, MutAnyOrigin],
-    n: Int
-) -> Int:
-    var best = x[0]
-    var bi = 0
-    for i in range(1, n):
-        if x[i] > best:
-            best = x[i]
-            bi = i
-    return bi
+    INI ADALAH SATU-SATUNYA alasan `GDN_AFFINE_ZERO_CORRECTION=True` boleh
+    melewati loop koreksi affine per grup (src/models/qwen3_5/linear.mojo:40-45).
+    Sebelum ini kontrak tersebut hanya "diukur sekali dgn tangan" dan tidak
+    pernah diverifikasi per tensor — bila satu grup menyimpang, hasilnya salah
+    TANPA satu pun pesan error.
 
+    Sampel merata maks 4096 titik; set BONSAI_VERIFY_AFFINE=full utk menyisir
+    seluruh elemen.
+    """
+    if numel <= 0:
+        return
+    var full = getenv("BONSAI_VERIFY_AFFINE")
+    var semua = full and (full == "full" or full == "1")
+    var n_chk = numel if semua else min(numel, 4096)
+    var step = numel // n_chk
+    if step < 1:
+        step = 1
+    # Harapan bias utk skala s: -s bila s sudah s_eff, -s/2 bila s masih mentah.
+    var k = Float32(1.0) if s_is_eff else Float32(0.5)
+    var worst: Float32 = 0.0
+    var worst_i = 0
+    var i = 0
+    while i < numel:
+        var sv = s[i]
+        var bv = biases[i]
+        # Relatif thd |s| supaya skala besar/kecil diperlakukan sama.
+        var rel = abs(bv + sv * k) / (abs(sv) * k + Float32(1e-12))
+        if rel > worst:
+            worst = rel
+            worst_i = i
+        i += step
+    if worst > Float32(1e-3):
+        raise Error(
+            "FATAL: kontrak affine dilanggar pada " + what + " (indeks "
+            + String(worst_i) + "): |b + s*" + String(k) + "| / |s*" + String(k)
+            + "| = " + String(worst) + ". GDN_AFFINE_ZERO_CORRECTION=True "
+            + "TIDAK valid — loop koreksi affine per grup WAJIB dijalankan, "
+            + "kalau tidak hasilnya salah tanpa error apa pun."
+        )
 
 fn parse_int_list(spec: String) -> UnsafePointer[Int, MutAnyOrigin]:
     """Parse "1,2,3" -> array Int; slot 0 menyimpan jumlah elemen,
@@ -173,12 +242,190 @@ fn parse_int_list(spec: String) -> UnsafePointer[Int, MutAnyOrigin]:
     out[0] = idx - 1 # jumlah elemen efektif
     return out
 
+
+fn is_stop_token(id: Int, stops: UnsafePointer[Int, MutAnyOrigin]) -> Bool:
+    """True bila `id` termasuk daftar token henti (stops[0] = jumlah elemen).
+
+    Dipakai loop decode untuk berhenti di EOS. Sebelumnya loop selalu
+    menjalankan `max_tokens - 1` langkah tanpa syarat, sehingga token yang
+    dihasilkan SETELAH model mengakhiri gilirannya tetap dipaksa keluar —
+    keluarannya di luar distribusi dan mudah runtuh jadi pengulangan.
+    """
+    if not stops:
+        return False
+    for i in range(1, stops[0] + 1):
+        if stops[i] == id:
+            return True
+    return False
+
 fn read_small_file(path: String, out_buf: UnsafePointer[UInt8, MutAnyOrigin], cap: Int) raises -> Int:
     """Baca file teks kecil (config.json) — kembalikan jumlah byte terbaca."""
     var f = open(path, "r")
     var n = f.read(Span[UInt8, MutAnyOrigin](ptr=out_buf, length=cap))
     f.close()
     return n
+
+
+fn env_int(name: String, dflt: Int) -> Int:
+    """Baca env var integer; kembalikan dflt bila tidak diset / tidak valid."""
+    var v = getenv(name)
+    if not v:
+        return dflt
+    try:
+        return Int(v)
+    except:
+        return dflt
+
+
+fn rng_next(state: UnsafePointer[UInt64, MutAnyOrigin]) -> UInt64:
+    """Xorshift64 — cukup untuk sampling, tidak untuk kriptografi."""
+    var x = state[0]
+    x ^= x << 13
+    x ^= x >> 7
+    x ^= x << 17
+    state[0] = x
+    return x
+
+
+fn sample_from_logits(
+    h_logits: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    V: Int,
+    cand_val: UnsafePointer[Float32, MutAnyOrigin],
+    topk_val: UnsafePointer[Float32, MutAnyOrigin],
+    topk_p: UnsafePointer[Float32, MutAnyOrigin],
+    topk_idx: UnsafePointer[Int32, MutAnyOrigin],
+    rep_flag: UnsafePointer[UInt8, MutAnyOrigin],
+    temp_x100: Int,
+    top_k_in: Int,
+    top_p_x1000: Int,
+    min_p_x1000: Int,
+    rep_x100: Int,
+    rep_win: Int,
+    rng_state: UnsafePointer[UInt64, MutAnyOrigin],
+    generated: UnsafePointer[Int, MutAnyOrigin],
+    n_generated: Int,
+) -> Int:
+    """Sampling sesuai resep resmi Bonsai: top-k -> top-p -> min-p -> temperature.
+
+    Parameter env diskalakan ke integer (temp_x100, top_p_x1000, min_p_x1000,
+    rep_x100) supaya tidak perlu parsing float. Hanya dipakai bila temp_x100 > 0
+    — jalur greedy lama sama sekali tidak tersentuh.
+
+    Urutan mengikuti rantai sampler llama.cpp: top-k, top-p, dan min-p bekerja
+    pada logits MENTAH; temperature diterapkan paling akhir, tepat sebelum
+    pengundian. Repetition penalty tidak ada di spesifikasi resmi Bonsai, jadi
+    default-nya mati (rep_x100 = 100).
+
+    Buffer topk_val/topk_p/topk_idx disediakan pemanggil, ukurannya K_MAX = 256.
+    """
+    # top-k dibatasi supaya buffer tetap kecil; top-k > 256 tidak realistis.
+    var K = top_k_in
+    if K < 1:
+        K = 1
+    if K > 256:
+        K = 256
+    var rep_pen = Float32(rep_x100) / 100.0
+
+    # 1) Tandai token yang sudah muncul di jendela terakhir (rep_win token).
+    var lo = n_generated - rep_win
+    if lo < 0:
+        lo = 0
+    var use_rep = rep_pen != 1.0 and n_generated > 0
+    if use_rep:
+        for j in range(lo, n_generated):
+            rep_flag[generated[j]] = 1
+
+    # 2) Logits mentah (+ penalti opsional) ke cand_val. TIDAK diskala suhu dulu:
+    #    top-k/top-p/min-p resmi bekerja pada logits mentah.
+    for i in range(V):
+        var x = Float32(h_logits[i])
+        if use_rep and rep_flag[i] == 1:
+            x = x / rep_pen if x > 0.0 else x * rep_pen
+        cand_val[i] = x
+
+    if use_rep:
+        for j in range(lo, n_generated):
+            rep_flag[generated[j]] = 0
+
+    # 3) top-k: sisipkan ke daftar kecil yang selalu urut menurun.
+    #    O(V) dengan konstanta kecil — hanya geser bila kandidat lolos ambang.
+    var cnt = 0
+    for i in range(V):
+        var x = cand_val[i]
+        if cnt < K:
+            var p = cnt
+            while p > 0 and topk_val[p - 1] < x:
+                topk_val[p] = topk_val[p - 1]
+                topk_idx[p] = topk_idx[p - 1]
+                p -= 1
+            topk_val[p] = x
+            topk_idx[p] = Int32(i)
+            cnt += 1
+        elif x > topk_val[K - 1]:
+            var p = K - 1
+            while p > 0 and topk_val[p - 1] < x:
+                topk_val[p] = topk_val[p - 1]
+                topk_idx[p] = topk_idx[p - 1]
+                p -= 1
+            topk_val[p] = x
+            topk_idx[p] = Int32(i)
+
+    if cnt == 0:
+        return 0
+
+    # 4) Softmax atas kandidat top-k (stabil: kurangi nilai maksimum).
+    var m = topk_val[0]
+    var total = Float32(0.0)
+    for j in range(cnt):
+        var e = exp(topk_val[j] - m)
+        topk_p[j] = e
+        total += e
+    if total <= Float32(0.0):
+        return Int(topk_idx[0])
+    for j in range(cnt):
+        topk_p[j] = topk_p[j] / total
+
+    # 5) top-p (nucleus): ambil prefix terkecil dengan kumulatif >= p.
+    var p_target = Float32(top_p_x1000) / 1000.0
+    var keep = 1
+    var acc = Float32(0.0)
+    for j in range(cnt):
+        acc += topk_p[j]
+        keep = j + 1
+        if acc >= p_target:
+            break
+
+    # 6) min-p: buang token dengan peluang < min_p x peluang maksimum.
+    #    Karena sudah urut menurun, yang lolos selalu berupa prefix.
+    var keep2 = keep
+    if min_p_x1000 > 0:
+        var thr = (Float32(min_p_x1000) / 1000.0) * topk_p[0]
+        keep2 = 1
+        for j in range(keep):
+            if topk_p[j] >= thr:
+                keep2 = j + 1
+
+    # 7) Temperature diterapkan paling akhir, lalu pengundian kumulatif.
+    var inv_temp = 100.0 / Float32(temp_x100)
+    var tot = Float32(0.0)
+    for j in range(keep2):
+        var w = exp((topk_val[j] - topk_val[0]) * inv_temp)
+        topk_p[j] = w
+        tot += w
+    if tot <= Float32(0.0):
+        return Int(topk_idx[0])
+
+    var u = Float32(Float64(rng_next(rng_state) >> UInt64(11)) / 9007199254740992.0)
+    var target = u * tot
+    var acc2 = Float32(0.0)
+    var pick = Int(topk_idx[0])
+    for j in range(keep2):
+        acc2 += topk_p[j]
+        if acc2 >= target:
+            pick = Int(topk_idx[j])
+            break
+    return pick
+
 
 fn main() raises:
     # ---------------- 0. Argumen CLI ----------------
@@ -205,14 +452,21 @@ fn main() raises:
         i += 1
 
     if not have_model_dir or len(prompt_spec) == 0:
-        print("Pemakaian: mojo run main.mojo -- --model-dir <dir> --prompt-tokens <id,id,...> --max-tokens <n> [--gpu]")
+        print("Pemakaian: mojo run main.mojo -- --model-dir <dir> --prompt-tokens <id,id,...> --max-tokens <n> --gpu")
         return
 
-    if use_gpu_matmul():
-        print(">> [MOJO-NATIVE] Inferensi Bonsai-27B-mlx-1bit (JALUR GPU T4)")
-    else:
-        print(">> [MOJO-NATIVE] Inferensi Bonsai-27B-mlx-1bit (FP32 host-sim)")
-        print(">> CATATAN: decode 27B di CPU lambat (validasi kebenaran); performa via jalur GPU MAX")
+    # GAGAL CEPAT bila jalur GPU tidak aktif. Tanpa ini program memuat SELURUH
+    # bobot 1-bit (~2,8 GB dari shard safetensors) dulu, baru berhenti di akhir
+    # main() — membuang waktu menit-an dan mengubur salah-set env di balik log
+    # pemuatan yang panjang. CPU fallback sudah dihapus, jadi tidak ada alasan
+    # melanjutkan tanpa GPU.
+    if not use_gpu_matmul():
+        raise Error(
+            "Jalur GPU wajib: set BONSAI_USE_GPU=1 atau jalankan dengan flag "
+            "--gpu. CPU fallback (host-sim) telah dihapus — program berhenti di "
+            "sini, SEBELUM memuat bobot."
+        )
+    print(">> [MOJO-NATIVE] Inferensi Bonsai-27B-mlx-1bit (JALUR GPU T4)")
 
     # ---------------- 1. Config ----------------
     var cfg = QwenConfig.qwen_27b_default()
@@ -261,11 +515,24 @@ fn main() raises:
             # rope_theta ASLI ada di objek bersarang "rope_parameters"
             # (qwen3_5: 10000000) — key flat "rope_theta" TIDAK ADA di
             # text_config; tanpa ini RoPE memakai default 100000 (salah).
+            # partial_rotary_factor JUGA bersarang di sana (lihat definisi
+            # arsitektur mlx-lm qwen3_5.py:55-84) — sebelumnya hanya dibaca
+            # dari level atas, sehingga rotary_dim diam-diam tertinggal di
+            # nilai default. rotary_dim dihitung ULANG setelah override ini.
             var rp = cdoc.obj_get(r, "rope_parameters")
             if rp != -1:
                 var rt = cdoc.obj_get(rp, "rope_theta")
                 if rt != -1:
                     cfg.rope_theta = Float32(cdoc.as_f64(rt))
+                var prf = cdoc.obj_get(rp, "partial_rotary_factor")
+                if prf != -1:
+                    cfg.partial_rotary_factor = Float32(cdoc.as_f64(prf))
+            cfg.rotary_dim = Int(
+                Float32(cfg.head_dim) * cfg.partial_rotary_factor
+            )
+            print(">> Config RoPE: theta=", cfg.rope_theta,
+                  " partial_rotary_factor=", cfg.partial_rotary_factor,
+                  " rotary_dim=", cfg.rotary_dim, " head_dim=", cfg.head_dim)
             nd = cdoc.obj_get(r, "linear_num_value_heads")
             if nd != -1:
                 cfg.gdn_num_v_heads = cdoc.as_int(nd)
@@ -294,8 +561,7 @@ fn main() raises:
     var index = SafeTensorsIndex()
     index.open_dir(model_dir)
     if not index.ok:
-        print(">> [ERROR] Tidak ada tensor safetensors ditemukan di", model_dir)
-        return
+        raise Error("FATAL: tidak ada tensor safetensors ditemukan di " + model_dir)
     print(">> [STEP] indeks:", index.n_entries, "tensor /", index.n_shards, "shard")
 
     # ---------------- 3. Muat bobot global (TETAP 1-BIT TERPAKET) ----------------
@@ -305,23 +571,25 @@ fn main() raises:
     print(">> [STEP] cari embed...")
     var e_emb = find_flex(index, "model.embed_tokens.weight")
     var e_emb_s = find_flex(index, "model.embed_tokens.scales")
+    # Gagal KERAS (raise), bukan print+return: `return` dari main() keluar
+    # dengan status 0, sehingga gerbang CI/deploy membaca "sukses" padahal
+    # inferensi tidak pernah berjalan.
     if e_emb == -1 or e_emb_s == -1:
-        print(">> [ERROR] embed_tokens/scales tidak ditemukan (kedua prefix)")
-        return
+        raise Error("FATAL: embed_tokens/scales tidak ditemukan (kedua prefix).")
     var V_emb = index.entries[e_emb].d0
     var D_real = index.entries[e_emb].d1 * 32 # kata U32 -> elemen (bits=1)
     var embed_w = alloc[UInt8](index.entries[e_emb].nbytes)
-    if not index.read_raw(e_emb, embed_w, index.entries[e_emb].nbytes):
-        print(">> [ERROR] baca embed gagal")
-        return
+    must_read_raw(index, e_emb, embed_w, index.entries[e_emb].nbytes, "model.embed_tokens.weight")
     var embed_s = alloc[Float32](V_emb * (D_real // 128))
-    if not index.read_f32(e_emb_s, embed_s, V_emb * (D_real // 128)):
-        print(">> [ERROR] baca scales embed gagal")
-        return
+    must_read_f32(index, e_emb_s, embed_s, V_emb * (D_real // 128), "model.embed_tokens.scales")
     var e_emb_b = find_flex(index, "model.embed_tokens.biases")
     var embed_b = alloc[Float32](V_emb * (D_real // 128))
     if e_emb_b != -1:
-        var _ = index.read_f32(e_emb_b, embed_b, V_emb * (D_real // 128))
+        must_read_f32(index, e_emb_b, embed_b, V_emb * (D_real // 128), "embed_tokens.biases")
+        # Skala embed masih MENTAH (kernel embed memakai affine penuh q*s+b).
+        verify_affine_zero_bias(
+            embed_s, embed_b, V_emb * (D_real // 128), False, "model.embed_tokens"
+        )
     D = D_real
     V = V_emb
     cfg.hidden_size = D
@@ -330,29 +598,30 @@ fn main() raises:
     var final_norm_w = alloc[Float32](D)
     var e_fnorm = find_flex(index, "model.norm.weight")
     if e_fnorm != -1:
-        var _ = index.read_f32(e_fnorm, final_norm_w, D)
+        must_read_f32(index, e_fnorm, final_norm_w, D, "model.norm.weight")
 
     var e_lm = find_flex(index, "lm_head.weight")
     var e_lm_s = find_flex(index, "lm_head.scales")
     if e_lm == -1 or e_lm_s == -1:
-        print(">> [ERROR] lm_head/scales tidak ditemukan")
-        return
+        raise Error("FATAL: lm_head.weight / lm_head.scales tidak ditemukan.")
     var V_lm = index.entries[e_lm].d0
     var lm_w = alloc[UInt8](index.entries[e_lm].nbytes)
-    if not index.read_raw(e_lm, lm_w, index.entries[e_lm].nbytes):
-        print(">> [ERROR] baca lm_head gagal")
-        return
+    must_read_raw(index, e_lm, lm_w, index.entries[e_lm].nbytes, "lm_head.weight")
     var lm_s = alloc[Float32](V_lm * (D // 128))
-    if not index.read_f32(e_lm_s, lm_s, V_lm * (D // 128)):
-        print(">> [ERROR] baca scales lm_head gagal")
-        return
+    must_read_f32(index, e_lm_s, lm_s, V_lm * (D // 128), "lm_head.scales")
     var e_lm_b = find_flex(index, "lm_head.biases")
     var lm_b = alloc[Float32](V_lm * (D // 128))
     if e_lm_b != -1:
-        var _ = index.read_f32(e_lm_b, lm_b, V_lm * (D // 128))
+        must_read_f32(index, e_lm_b, lm_b, V_lm * (D // 128), "lm_head.biases")
     # Kontrak kernel: scales_eff = s_ckpt / 2 (kernel menghitung (2q-1)*s_eff).
     for i in range(V_lm * (D // 128)):
         lm_s[i] = lm_s[i] * 0.5
+    if e_lm_b != -1:
+        # Skala sudah s_eff (dibagi 2) -> kernel MENDERIVASI bias = -s_eff.
+        verify_affine_zero_bias(lm_s, lm_b, V_lm * (D // 128), True, "lm_head")
+    else:
+        print(">> [AFFINE-WARN] lm_head.biases tidak ada — kontrak affine "
+              "TIDAK dapat diverifikasi (kernel tetap mengasumsikan b=-s_eff).")
     var lm_proj = QwenLinear1Bit(lm_w, lm_s, lm_b, V_lm, D)
     V = V_lm
     print(">> [STEP] bobot global siap (packed 1-bit, V=", V, " D=", D, ")")
@@ -388,11 +657,11 @@ fn main() raises:
         var ln1 = alloc[Float32](D)
         var e_ln1 = find_flex(index, prefix + "input_layernorm.weight")
         if e_ln1 != -1:
-            var _ = index.read_f32(e_ln1, ln1, D)
+            must_read_f32(index, e_ln1, ln1, D, prefix + "input_layernorm.weight")
         var ln2 = alloc[Float32](D)
         var e_ln2 = find_flex(index, prefix + "post_attention_layernorm.weight")
         if e_ln2 != -1:
-            var _ = index.read_f32(e_ln2, ln2, D)
+            must_read_f32(index, e_ln2, ln2, D, prefix + "post_attention_layernorm.weight")
         layers[li].input_layernorm_w = ln1
         layers[li].post_attn_layernorm_w = ln2
 
@@ -407,13 +676,18 @@ fn main() raises:
             if e_fused_w != -1:
                 var nb = index.entries[e_fused_w].nbytes
                 w_all = alloc[UInt8](nb)
-                var _ = index.read_raw(e_fused_w, w_all, nb)
+                must_read_raw(index, e_fused_w, w_all, nb, prefix + "linear_attn.in_proj_all.weight")
                 n_all = index.dim0(e_fused_w)
                 k_all = nb * 8 // n_all
                 var e_fused_s = find_flex(index, prefix + "linear_attn.in_proj_all.scales")
                 s_all = read_scales_eff(index, e_fused_s, n_all * (k_all // 128))
                 var e_fused_b = find_flex(index, prefix + "linear_attn.in_proj_all.biases")
                 b_all = read_biases_f32(index, e_fused_b, n_all * (k_all // 128))
+                if e_fused_b != -1:
+                    verify_affine_zero_bias(
+                        s_all, b_all, n_all * (k_all // 128), True,
+                        prefix + "linear_attn.in_proj_all"
+                    )
             else:
                 # fusion manual 4 proyeksi (paritas loader.py)
                 var pq = load_qlinear(index, prefix + "linear_attn.in_proj_qkv.weight", prefix + "linear_attn.in_proj_qkv.scales", prefix + "linear_attn.in_proj_qkv.biases")
@@ -421,8 +695,10 @@ fn main() raises:
                 var pb = load_qlinear(index, prefix + "linear_attn.in_proj_b.weight", prefix + "linear_attn.in_proj_b.scales", prefix + "linear_attn.in_proj_b.biases")
                 var pa = load_qlinear(index, prefix + "linear_attn.in_proj_a.weight", prefix + "linear_attn.in_proj_a.scales", prefix + "linear_attn.in_proj_a.biases")
                 if not (pq.ok and pz.ok and pb.ok and pa.ok):
-                    print(">> [ERROR] bobot GDN tidak lengkap pada layer", li)
-                    return
+                    raise Error(
+                        "FATAL: bobot GDN tidak lengkap pada layer " + String(li)
+                        + " (in_proj_qkv/z/b/a)."
+                    )
                 var w01 = fuse_u8(pq.w, pq.nbytes, pz.w, pz.nbytes)
                 var w23 = fuse_u8(pb.w, pb.nbytes, pa.w, pa.nbytes)
                 w_all = fuse_u8(w01, pq.nbytes + pz.nbytes, w23, pb.nbytes + pa.nbytes)
@@ -440,7 +716,10 @@ fn main() raises:
             var cw = alloc[Float32](cfg.gdn_conv_dim * cfg.gdn_conv_kernel)
             var e_cw = find_flex(index, prefix + "linear_attn.conv1d.weight")
             if e_cw != -1:
-                var _ = index.read_f32(e_cw, cw, cfg.gdn_conv_dim * cfg.gdn_conv_kernel)
+                must_read_f32(
+                    index, e_cw, cw, cfg.gdn_conv_dim * cfg.gdn_conv_kernel,
+                    prefix + "linear_attn.conv1d.weight"
+                )
             layers[li].gdn_conv_weights = cw
 
             # out_proj
@@ -453,13 +732,18 @@ fn main() raises:
             if e_ow != -1:
                 var nb = index.entries[e_ow].nbytes
                 ow = alloc[UInt8](nb)
-                var _ = index.read_raw(e_ow, ow, nb)
+                must_read_raw(index, e_ow, ow, nb, prefix + "linear_attn.out_proj.weight")
                 on = index.dim0(e_ow)
                 ok_ = nb * 8 // on
                 var e_os = find_flex(index, prefix + "linear_attn.out_proj.scales")
                 os_ = read_scales_eff(index, e_os, on * (ok_ // 128))
                 var e_ob = find_flex(index, prefix + "linear_attn.out_proj.biases")
                 ob_ = read_biases_f32(index, e_ob, on * (ok_ // 128))
+                if e_ob != -1:
+                    verify_affine_zero_bias(
+                        os_, ob_, on * (ok_ // 128), True,
+                        prefix + "linear_attn.out_proj"
+                    )
             layers[li].gdn_out_proj = QwenLinear1Bit(ow, os_, ob_, on, ok_)
 
             # Parameter riil Qwen3-Next: A_log, dt_bias, norm GDN
@@ -467,19 +751,19 @@ fn main() raises:
             if e_al != -1:
                 var nn_al = index.entries[e_al].d0 * max(index.entries[e_al].d1, 1)
                 var a_log = alloc[Float32](nn_al)
-                var _ = index.read_f32(e_al, a_log, nn_al)
+                must_read_f32(index, e_al, a_log, nn_al, prefix + "linear_attn.A_log")
                 layers[li].gdn_a_log = a_log
             var e_dt = find_flex(index, prefix + "linear_attn.dt_bias")
             if e_dt != -1:
                 var nn_dt = index.entries[e_dt].d0 * max(index.entries[e_dt].d1, 1)
                 var dtb = alloc[Float32](nn_dt)
-                var _ = index.read_f32(e_dt, dtb, nn_dt)
+                must_read_f32(index, e_dt, dtb, nn_dt, prefix + "linear_attn.dt_bias")
                 layers[li].gdn_dt_bias = dtb
             var e_gn = find_flex(index, prefix + "linear_attn.norm.weight")
             if e_gn != -1:
                 var nn_gn = index.entries[e_gn].d0 * max(index.entries[e_gn].d1, 1)
                 var gnw = alloc[Float32](nn_gn)
-                var _ = index.read_f32(e_gn, gnw, nn_gn)
+                must_read_f32(index, e_gn, gnw, nn_gn, prefix + "linear_attn.norm.weight")
                 layers[li].gdn_norm_w = gnw
             if e_al != -1 and e_dt != -1 and e_gn != -1:
                 layers[li].gdn_has_params = True
@@ -499,8 +783,10 @@ fn main() raises:
             var pv = load_qlinear(index, prefix + "self_attn.v_proj.weight", prefix + "self_attn.v_proj.scales", prefix + "self_attn.v_proj.biases")
             var po = load_qlinear(index, prefix + "self_attn.o_proj.weight", prefix + "self_attn.o_proj.scales", prefix + "self_attn.o_proj.biases")
             if not (pq.ok and pk.ok and pv.ok and po.ok):
-                print(">> [ERROR] bobot attention tidak lengkap pada layer", li)
-                return
+                raise Error(
+                    "FATAL: bobot attention tidak lengkap pada layer " + String(li)
+                    + " (q/k/v/o_proj)."
+                )
             layers[li].attn_q_proj = QwenLinear1Bit(pq.w, pq.scales, pq.biases, pq.n_rows, pq.k_dim)
             layers[li].attn_k_proj = QwenLinear1Bit(pk.w, pk.scales, pk.biases, pk.n_rows, pk.k_dim)
             layers[li].attn_v_proj = QwenLinear1Bit(pv.w, pv.scales, pv.biases, pv.n_rows, pv.k_dim)
@@ -512,14 +798,14 @@ fn main() raises:
             if e_qn != -1:
                 nn_q = index.entries[e_qn].d0 * max(index.entries[e_qn].d1, 1)
                 var qnw = alloc[Float32](nn_q)
-                var _ = index.read_f32(e_qn, qnw, nn_q)
+                must_read_f32(index, e_qn, qnw, nn_q, prefix + "self_attn.q_norm.weight")
                 layers[li].attn_q_norm_w = qnw
             var e_kn = find_flex(index, prefix + "self_attn.k_norm.weight")
             var nn_k = 0
             if e_kn != -1:
                 nn_k = index.entries[e_kn].d0 * max(index.entries[e_kn].d1, 1)
                 var knw = alloc[Float32](nn_k)
-                var _ = index.read_f32(e_kn, knw, nn_k)
+                must_read_f32(index, e_kn, knw, nn_k, prefix + "self_attn.k_norm.weight")
                 layers[li].attn_k_norm_w = knw
             if e_qn != -1 and e_kn != -1:
                 layers[li].attn_has_norms = True
@@ -538,21 +824,27 @@ fn main() raises:
         if e_guw != -1:
             var nb = index.entries[e_guw].nbytes
             var wb = alloc[UInt8](nb)
-            var _ = index.read_raw(e_guw, wb, nb)
+            must_read_raw(index, e_guw, wb, nb, prefix + "mlp.gate_up_proj.weight")
             var nn = index.dim0(e_guw)
             var kk = nb * 8 // nn
             var e_gus = find_flex(index, prefix + "mlp.gate_up_proj.scales")
             var sb = read_scales_eff(index, e_gus, nn * (kk // 128))
             var e_gub = find_flex(index, prefix + "mlp.gate_up_proj.biases")
             var gb = read_biases_f32(index, e_gub, nn * (kk // 128))
+            if e_gub != -1:
+                verify_affine_zero_bias(
+                    sb, gb, nn * (kk // 128), True, prefix + "mlp.gate_up_proj"
+                )
             layers[li].mlp_gate_up_proj = QwenLinear1Bit(wb, sb, gb, nn, kk)
         else:
             # MLP: fusion gate+up (paritas loader.py)
             var pg = load_qlinear(index, prefix + "mlp.gate_proj.weight", prefix + "mlp.gate_proj.scales", prefix + "mlp.gate_proj.biases")
             var pu = load_qlinear(index, prefix + "mlp.up_proj.weight", prefix + "mlp.up_proj.scales", prefix + "mlp.up_proj.biases")
             if not (pg.ok and pu.ok):
-                print(">> [ERROR] bobot MLP tidak lengkap pada layer", li)
-                return
+                raise Error(
+                    "FATAL: bobot MLP tidak lengkap pada layer " + String(li)
+                    + " (gate_proj/up_proj)."
+                )
             layers[li].mlp_gate_up_proj = QwenLinear1Bit(
                 fuse_u8(pg.w, pg.nbytes, pu.w, pu.nbytes),
                 fuse_f32(pg.scales, pg.n_rows * (pg.k_dim // 128), pu.scales, pu.n_rows * (pu.k_dim // 128)),
@@ -565,14 +857,21 @@ fn main() raises:
         if e_dw != -1 and e_ds != -1:
             var nb = index.entries[e_dw].nbytes
             var wb = alloc[UInt8](nb)
-            var _ = index.read_raw(e_dw, wb, nb)
+            must_read_raw(index, e_dw, wb, nb, prefix + "mlp.down_proj.weight")
             var nn = index.dim0(e_dw)
             var kk = nb * 8 // nn
             var sb = read_scales_eff(index, e_ds, nn * (kk // 128))
             var db = read_biases_f32(index, e_db, nn * (kk // 128))
+            if e_db != -1:
+                verify_affine_zero_bias(
+                    sb, db, nn * (kk // 128), True, prefix + "mlp.down_proj"
+                )
             layers[li].mlp_down_proj = QwenLinear1Bit(wb, sb, db, nn, kk)
 
     print(">> Bobot termuat:", n_layers, "layer (", n_gdn, "GDN,", n_kv, "attention )")
+    print(">> [AFFINE] kontrak biases == -scales_ckpt/2 terverifikasi utk "
+          "setiap tensor 1-bit yang dimuat (sampel; BONSAI_VERIFY_AFFINE=full "
+          "utk menyisir semua elemen).")
 
     # DeviceContext tunggal: bobot diunggah sekali ke global memory T4, bukan
     # per token. Tanpa ini tiap proyeksi membuat-buang context (release race).
@@ -599,6 +898,10 @@ fn main() raises:
     var act_attn_scores_dev = UnsafePointer[Float32, MutAnyOrigin]()
     var h_hidden_holder = alloc[DeviceBuffer[T]](1)
     var h_token_out_holder = alloc[DeviceBuffer[DType.int32]](1)
+    # Buffer logits device di-hoist ke scope fungsi: blok setup buffer dan blok
+    # loop decode adalah DUA `if use_gpu_matmul():` yang terpisah, jadi `h_log`
+    # yang lokal di blok pertama tidak terlihat dari loop decode.
+    var logits_buf = UnsafePointer[DeviceBuffer[T], MutAnyOrigin]()
 
     if use_gpu_matmul():
         gpu_ctx_ptr = gpu_ctx_new()
@@ -669,6 +972,7 @@ fn main() raises:
         var h_log = alloc[DeviceBuffer[T]](1)
         h_log.init_pointee_move(gpu_ctx_ptr[].enqueue_create_buffer[T](V))
         act_logits_dev = h_log[].unsafe_ptr()
+        logits_buf = h_log
 
         h_token_out_holder.init_pointee_move(gpu_ctx_ptr[].enqueue_create_buffer[DType.int32](1))
         act_token_out_dev = h_token_out_holder[].unsafe_ptr()
@@ -698,6 +1002,31 @@ fn main() raises:
     var prompt_len = ptoks[0] # slot 0 = jumlah elemen
     print(">> Prompt tokens:", prompt_len, "| max_tokens:", max_tokens)
 
+    # Penjaga panjang konteks. KV cache (`AttentionKVCache(max_seq, ...)`) dan
+    # workspace skor attention (`H_q * max_seq` Float32) dialokasikan SEKALI
+    # dengan ukuran `max_seq`; tidak ada satu pun batas di dalam kernel. Prompt
+    # yang lebih panjang (atau prompt + generasi yang melewati `max_seq`) akan
+    # membuat `kv_cache_append` menulis di luar buffer dan `gqa_attention`
+    # mengindeks `attn_scores[hq*max_seq_len + t]` di luar workspace — kerusakan
+    # memori SENYAP di GPU (bisa salah token, bisa crash, tanpa pesan).
+    # `--prompt-tokens` datang dari CLI, jadi ini benar-benar bisa dipicu.
+    if prompt_len <= 0:
+        raise Error("FATAL: prompt kosong (0 token).")
+    if prompt_len > max_seq:
+        raise Error(
+            "FATAL: panjang prompt " + String(prompt_len) + " > max_seq "
+            + String(max_seq) + " — KV cache & workspace attention akan "
+            + "meluap. Perpendek prompt (atau naikkan max_seq di main.mojo)."
+        )
+    if prompt_len + max_tokens > max_seq:
+        var boleh = max_seq - prompt_len
+        raise Error(
+            "FATAL: prompt " + String(prompt_len) + " + max_tokens "
+            + String(max_tokens) + " = " + String(prompt_len + max_tokens)
+            + " > max_seq " + String(max_seq) + " — decode akan meluap. "
+            + "Maksimum --max-tokens yang aman: " + String(boleh) + "."
+        )
+
     # ---------------- 6. Generasi greedy ----------------
     # Warmup clock GPU (metodologi benchmark MLX): beberapa iterasi GEMM
     # terbesar (lm_head) menaikkan clock ke keadaan sustain SEBELUM timer —
@@ -709,15 +1038,53 @@ fn main() raises:
         gpu_ctx_ptr[].synchronize()
 
     var t_all = monotonic()
-    var hidden = alloc[Float32](D)
     var generated = alloc[Int](max_tokens + 1)
     var n_generated = 0
     var pos = 0
     var next_tok = 0
-    var logits = alloc[Float32](V)
 
     if use_gpu_matmul():
         var next_tok_host = alloc[Int32](1)
+
+        # ---------------- Sampling opsional (default: greedy) ----------------
+        # Semua default membuat jalur greedy tetap utuh, jadi kontrak bit-exact
+        # (gate KHQ di deploy_on_kaggle.sh) tidak berubah sama sekali.
+        #   BONSAI_TEMP_X100=70     -> temperature 0.70 (0 = mati/greedy)
+        #   BONSAI_TOP_K=20         -> top-k    (resep resmi Bonsai: 20)
+        #   BONSAI_TOP_P_X1000=950  -> top-p    (resep resmi: 850-950)
+        #   BONSAI_MIN_P_X1000=0    -> min-p    (resep resmi: 0)
+        #   BONSAI_REP_PENALTY_X100 -> repetition penalty (100 = mati). TIDAK ada
+        #                              di spesifikasi resmi -> default MATI.
+        #   BONSAI_REP_WINDOW=256   -> jendela token yang dikenai penalti
+        #   BONSAI_SEED=1234        -> seed RNG
+        var samp_temp_x100 = env_int("BONSAI_TEMP_X100", 0)
+        var samp_top_k = env_int("BONSAI_TOP_K", 20)
+        var samp_top_p_x1000 = env_int("BONSAI_TOP_P_X1000", 950)
+        var samp_min_p_x1000 = env_int("BONSAI_MIN_P_X1000", 0)
+        var samp_rep_x100 = env_int("BONSAI_REP_PENALTY_X100", 100)
+        var samp_rep_win = env_int("BONSAI_REP_WINDOW", 256)
+        var samp_seed = env_int("BONSAI_SEED", 1234)
+        var sampling_on = samp_temp_x100 > 0
+        var h_logits = alloc[Scalar[T]](V)
+        var samp_cand = alloc[Float32](V)
+        var samp_flag = alloc[UInt8](V)
+        for i in range(V):
+            samp_flag[i] = 0
+        # Buffer top-k tetap kecil; K dibatasi 256 di dalam sample_from_logits.
+        var samp_topk_val = alloc[Float32](256)
+        var samp_topk_p = alloc[Float32](256)
+        var samp_topk_idx = alloc[Int32](256)
+        var h_rng = alloc[UInt64](1)
+        h_rng[0] = UInt64(samp_seed) * 2654435761 + 12345
+        if sampling_on:
+            print(">> [SAMPLE] temperature =", Float32(samp_temp_x100) / 100.0,
+                  "| top_k =", samp_top_k,
+                  "| top_p =", Float32(samp_top_p_x1000) / 1000.0,
+                  "| min_p =", Float32(samp_min_p_x1000) / 1000.0,
+                  "| rep_penalty =", Float32(samp_rep_x100) / 100.0,
+                  "| seed =", samp_seed)
+        else:
+            print(">> [SAMPLE] mati — decoding greedy (argmax)")
 
         # Upload embedding 1-bit ke VRAM SEKALI (packed + skala + bias):
         # lookup per token jalan di GPU (embed_lookup_1bit_sm75) — menghapus
@@ -920,6 +1287,16 @@ fn main() raises:
         var acc_lm_gemm: Int = 0
         var acc_lm_am: Int = 0
         var acc_lm_d2h: Int = 0
+        # Token henti (EOS): default <|im_end|> = 248046 (ChatML Qwen3).
+        # Override dgn BONSAI_STOP_IDS="id1,id2,..."; set "none" untuk mematikan
+        # (berguna saat ingin mengukur perilaku SETELAH giliran berakhir).
+        var stop_env = getenv("BONSAI_STOP_IDS")
+        var stop_spec = stop_env if len(stop_env) > 0 else String("248046")
+        var stop_off = stop_spec == "none" or stop_spec == "off"
+        var stop_ids = parse_int_list(String("") if stop_off else stop_spec)
+        if stop_ids[0] > 0:
+            print(">> [STOP] henti-di-EOS aktif:", stop_ids[0], "token id")
+
         for step in range(max_tokens - 1):
             var t0 = monotonic()
             embed_lookup_1bit_sm75_launch_on[T](
@@ -980,21 +1357,39 @@ fn main() raises:
             if prof:
                 gpu_ctx_ptr[].synchronize()
             var t_lm_gemm = monotonic()
-            argmax_sm75_launch_on[T](
-                gpu_ctx_ptr[], act_logits_dev, act_stage1_vals_dev, act_stage1_idxs_dev,
-                act_token_out_dev, V
-            )
-            if prof:
-                gpu_ctx_ptr[].synchronize()
-            var t_lm_am = monotonic()
-            gpu_ctx_ptr[].enqueue_copy(next_tok_host, h_token_out_holder[])
-            gpu_ctx_ptr[].synchronize()
-            var t_lm_end = monotonic()
             acc_lm_gemm += t_lm_gemm - tlm
-            acc_lm_am += t_lm_am - t_lm_gemm
-            acc_lm_d2h += t_lm_end - t_lm_am
-            acc_lm += t_lm_end - tlm
-            next_tok = Int(next_tok_host[0])
+            if sampling_on:
+                # Logits fp16 (V=248320 ≈ 0,5 MB) ditarik ke host lalu disampling
+                # di CPU. Biaya D2H + sampling kecil dibanding ~54 ms/token.
+                gpu_ctx_ptr[].enqueue_copy(h_logits, logits_buf[])
+                gpu_ctx_ptr[].synchronize()
+                var t_samp = monotonic()
+                next_tok = sample_from_logits(
+                    h_logits, V, samp_cand,
+                    samp_topk_val, samp_topk_p, samp_topk_idx, samp_flag,
+                    samp_temp_x100, samp_top_k, samp_top_p_x1000, samp_min_p_x1000,
+                    samp_rep_x100, samp_rep_win,
+                    h_rng, generated, n_generated
+                )
+                var t_samp_end = monotonic()
+                acc_lm_am += t_samp - t_lm_gemm
+                acc_lm_d2h += t_samp_end - t_samp
+                acc_lm += t_samp_end - tlm
+            else:
+                argmax_sm75_launch_on[T](
+                    gpu_ctx_ptr[], act_logits_dev, act_stage1_vals_dev, act_stage1_idxs_dev,
+                    act_token_out_dev, V
+                )
+                if prof:
+                    gpu_ctx_ptr[].synchronize()
+                var t_lm_am = monotonic()
+                gpu_ctx_ptr[].enqueue_copy(next_tok_host, h_token_out_holder[])
+                gpu_ctx_ptr[].synchronize()
+                var t_lm_end = monotonic()
+                acc_lm_am += t_lm_am - t_lm_gemm
+                acc_lm_d2h += t_lm_end - t_lm_am
+                acc_lm += t_lm_end - tlm
+                next_tok = Int(next_tok_host[0])
             pos += 1
             generated[n_generated] = next_tok
             n_generated += 1
@@ -1002,13 +1397,19 @@ fn main() raises:
             var ms = Float64(dt) / 1e6
             var tps = 1000.0 / ms if ms > 0.0 else 0.0
             print(">> [GEN] token id:", next_tok, "|", ms, "ms |", tps, "tok/s")
+            if is_stop_token(next_tok, stop_ids):
+                print(">> [STOP] token henti", next_tok, "pada langkah", step + 1,
+                      "— generasi dihentikan")
+                break
 
         next_tok_host.free()
 
         var total_ms = Float64(monotonic() - t_all) / 1e6
         var dec_ms = Float64(monotonic() - t_decode) / 1e6
         var prefill_ms = Float64(t_decode - t_prefill_start) / 1e6
-        var n_dec = max_tokens - 1
+        # Jumlah langkah decode yang BENAR-BENAR dijalankan (bisa < max_tokens-1
+        # bila berhenti di EOS). n_generated sudah termasuk token hasil prefill.
+        var n_dec = n_generated - 1
         if n_dec > 0:
             print(">> [PERF] prefill", prompt_len, "token |", prefill_ms, "ms |",
                   prefill_ms / Float64(prompt_len), "ms/token |",
@@ -1036,7 +1437,12 @@ fn main() raises:
                       "ms/token = kerja GPU SELURUH token, bukan LM head")
         print(">> [PERF] total:", total_ms, "ms")
         khq_prof_report()
-        print(">> Selesai:", n_generated, "token di-generate (greedy).")
+        # Sebelumnya baris ini selalu mencetak "(greedy)" walau sampling aktif —
+        # menyesatkan saat membaca log gerbang koherensi.
+        if sampling_on:
+            print(">> Selesai:", n_generated, "token di-generate (sampling).")
+        else:
+            print(">> Selesai:", n_generated, "token di-generate (greedy).")
         if khq_dir:
             khq_dump_flush()
     else:
@@ -1047,6 +1453,4 @@ fn main() raises:
             "Set BONSAI_USE_GPU=1 agar inferensi berjalan di NVIDIA T4."
         )
 
-    hidden.free()
-    logits.free()
     generated.free()

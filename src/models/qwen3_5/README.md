@@ -2,6 +2,32 @@
 
 Dokumen ini ditujukan sebagai **panduan teknis komprehensif bagi AI Agent, LLM, dan Pengembang** untuk memahami struktur internal, persamaan matematika, kontrak tensor, dan alur eksekusi dari paket modul `src/models/qwen3_5/`.
 
+> **⚠️ PERINGATAN DIMENSI — BACA DULU.**
+> Dokumen ini ditulis untuk konfigurasi generik lama dan **angka-angkanya masih
+> memakai konfigurasi itu** (hidden 4096, intermediate 11008, 32 query head,
+> 8 KV head, GDN 64 V-head, rotary_dim 32, vocab 152064). Model yang benar-benar
+> dijalankan adalah **Bonsai-27B-mlx-1bit** dengan dimensi di
+> `config.mojo::qwen_27b_default()` — **angka itulah yang otoritatif**:
+>
+> | Parameter | Nilai Bonsai-27B (otoritatif) | Angka lama di dokumen ini |
+> | :--- | :--- | :--- |
+> | `hidden_size` | **5120** | 4096 |
+> | `intermediate_size` | **17408** | 11008 |
+> | `num_attention_heads` (H_q) | **24** | 32 |
+> | `num_key_value_heads` (H_kv) | **4** | 8 |
+> | `head_dim` | **256** | 128 |
+> | `rotary_dim` (partial 0.25) | **64** dari 256 | 32 dari 128 |
+> | `vocab_size` | **248320** | 152064 |
+> | `rope_theta` | **1e7** | 100000 |
+> | GDN H_v / H_k / D_v=D_k | **48 / 16 / 128** | 64 / 16 / 128 |
+> | `gdn_conv_dim` | **10240** | 12288 |
+> | `gate_up_proj` | **[34816, 5120]** | [22016, 4096] |
+> | `down_proj` | **[5120, 17408]** | [4096, 11008] |
+>
+> GQA `group_size` = 24 // 4 = **6** (bukan 4 atau 5). Setiap angka pada tabel
+> ini terverifikasi thd `config.json` checkpoint dan dipakai oleh jalur GPU
+> produksi; angka di badan dokumen hanya relevan sebagai latar historis.
+
 ---
 
 ## 1. Ringkasan Arsitektur
