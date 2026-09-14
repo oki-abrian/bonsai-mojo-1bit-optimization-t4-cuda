@@ -13,24 +13,49 @@ class QwenTokenizer:
     Mendukung tokenizer Hugging Face (jika terpasang) dengan fallback native tokenizer.json.
     """
 
-    # Special Token ID Qwen
-    EOS_TOKEN_ID = 151643     # <|endoftext|>
-    IM_START_TOKEN_ID = 151644 # <|im_start|>
-    IM_END_TOKEN_ID = 151645   # <|im_end|>
+    # Cadangan bila config.json checkpoint tidak terbaca.
+    # Terverifikasi thd config.json Bonsai-27B: eos_token_id=248046,
+    # bos_token_id=248044; tokenizer_config.json: eos_token="<|im_end|>".
+    # BUKAN 151643/151644/151645 — itu rentang Qwen2.5/Qwen3.0 (vocab 151936);
+    # model ini generasi berikutnya dgn vocab 248320, ID-nya beda.
+    EOS_TOKEN_ID = 248046       # <|im_end|>
+    IM_START_TOKEN_ID = 248045  # <|im_start|>
+    IM_END_TOKEN_ID = 248046    # <|im_end|>
 
     def __init__(self, model_dir: str):
         self.model_dir = model_dir
         self.hf_tokenizer = None
+        self.eos_token_id = self.EOS_TOKEN_ID
+        self.im_start_token_id = self.IM_START_TOKEN_ID
+        self.im_end_token_id = self.IM_END_TOKEN_ID
+        self._load_special_ids()
         self._load_tokenizer()
 
+    def _load_special_ids(self):
+        """config.json checkpoint = otoritatif untuk eos id (bukan ingatan)."""
+        path = os.path.join(self.model_dir, "config.json")
+        if not os.path.exists(path):
+            return
+        try:
+            cfg = json.load(open(path))
+        except Exception:
+            return
+        cfg = cfg.get("text_config", cfg)
+        if isinstance(cfg.get("eos_token_id"), int):
+            self.eos_token_id = cfg["eos_token_id"]
+            self.im_end_token_id = cfg["eos_token_id"]
+
     def _load_tokenizer(self):
+        hf_err = None
+        tok_err = None
+
         try:
             from transformers import AutoTokenizer
             self.hf_tokenizer = AutoTokenizer.from_pretrained(self.model_dir, trust_remote_code=True)
             print(">> [TOKENIZER] Berhasil memuat HuggingFace AutoTokenizer.")
             return
-        except Exception:
-            pass
+        except Exception as e:
+            hf_err = e
 
         # Coba tokenizer.json native
         tok_json_path = os.path.join(self.model_dir, "tokenizer.json")
@@ -40,36 +65,31 @@ class QwenTokenizer:
                 self.hf_tokenizer = Tokenizer.from_file(tok_json_path)
                 print(">> [TOKENIZER] Berhasil memuat native tokenizers.Tokenizer dari tokenizer.json.")
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                tok_err = e
 
-        print(">> [WARN] Library HuggingFace tokenizers tidak tersedia. Menggunakan fallback byte-level tokenizer.")
+        raise RuntimeError(
+            "Gagal memuat tokenizer dari " + self.model_dir
+            + " (transformers: " + str(hf_err) + "; tokenizers: " + str(tok_err) + "). "
+            "Fallback byte-level sudah dihapus: nilai byte 0..255 sebagai token id "
+            "menghasilkan prompt yang salah secara senyap pada vocab 248320. "
+            "Pasang `transformers` atau `tokenizers`, atau pakai model_dir yang benar."
+        )
 
     def encode(self, text: str) -> List[int]:
         """Mengubah string teks menjadi array token ID."""
-        if self.hf_tokenizer is not None:
-            if hasattr(self.hf_tokenizer, "encode"):
-                res = self.hf_tokenizer.encode(text)
-                if hasattr(res, "ids"):
-                    return res.ids
-                return res
-        # Fallback byte encoding
-        return [b for b in text.encode("utf-8")]
+        res = self.hf_tokenizer.encode(text)
+        if hasattr(res, "ids"):
+            return res.ids
+        return res
 
     def decode(self, tokens: List[int]) -> str:
         """Mengubah array token ID menjadi string teks."""
-        if self.hf_tokenizer is not None:
-            if hasattr(self.hf_tokenizer, "decode"):
-                return self.hf_tokenizer.decode(tokens)
-        # Fallback byte decoding
-        try:
-            return bytes(tokens).decode("utf-8", errors="replace")
-        except Exception:
-            return ""
+        return self.hf_tokenizer.decode(tokens)
 
     def is_stop_token(self, token_id: int) -> bool:
         """Mengecek apakah token adalah stop/end-of-sequence token."""
-        return token_id in (self.EOS_TOKEN_ID, self.IM_END_TOKEN_ID)
+        return token_id in (self.eos_token_id, self.im_end_token_id)
 
 
 class StreamingDetokenizer:

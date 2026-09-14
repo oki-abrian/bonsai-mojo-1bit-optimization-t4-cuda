@@ -4,7 +4,7 @@
 #          - RMSNorm (warp shuffle reduction di shared memory)
 #          - Causal Conv1D 4-tap depthwise paralel di VRAM
 #          - Head RMSNorm untuk Q-Norm & K-Norm
-#          - Rekurensi Gated DeltaNet (64 block x 128 thread masif-paralel)
+#          - Rekurensi Gated DeltaNet (H_v block x D_v thread; Bonsai-27B: 48 x 128)
 #          - Fused Gated RMSNorm GDN (SiLU gate + per-head RMSNorm)
 #          - SwiGLU FFN (SiLU(gate) * up langsung di register GPU SFU)
 #          - In-place Residual Vector Addition
@@ -350,13 +350,13 @@ fn head_rmsnorm_sm75_gpu[
 
 
 # ----------------------------------------------------------------------------
-# 6. Gated DeltaNet Recurrence GPU Kernel (64 block x 128 thread masif-paralel)
+# 6. Gated DeltaNet Recurrence GPU Kernel (H_v block x D_v thread; 48 x 128)
 # ----------------------------------------------------------------------------
 fn gdn_recurrence_sm75_gpu[
     T: DType,
     HAS_PARAMS: Bool = True
 ](
-    state_s: UnsafePointer[Scalar[T], MutAnyOrigin],
+    state_s: UnsafePointer[Float32, MutAnyOrigin],
     q_normed: UnsafePointer[Scalar[T], MutAnyOrigin],
     k_normed: UnsafePointer[Scalar[T], MutAnyOrigin],
     v_ptr: UnsafePointer[Scalar[T], MutAnyOrigin],
@@ -371,11 +371,11 @@ fn gdn_recurrence_sm75_gpu[
 ):
     """
     Mengeksekusi rekurensi Gated DeltaNet 100% di GPU registers & shared memory:
-    - 64 block (1 block per value head hv in 0..63).
-    - 128 thread (1 thread per baris dv in 0..127).
-    - k dan q distage ke shared memory (256 float = 1 KiB SMEM).
+    - H_v block (1 block per value head hv). Bonsai-27B: H_v = 48.
+    - D_v thread (1 thread per baris dv in 0..D_v-1). Bonsai-27B: D_v = 128.
+    - k dan q distage ke shared memory (2 x 256 float = 2 KiB SMEM; D_k <= 256).
     - Setiap thread dv memperbarui row S[dv, :] dan menghasilkan out[dv] secara paralel.
-    Memangkas 50.33 juta iterasi CPU (90 ms) menjadi ~0.15 ms di Tesla T4!
+    Memangkas puluhan juta iterasi CPU menjadi ~0,15 ms di Tesla T4!
     """
     var hv = block_idx.x
     var dv = thread_idx.x
@@ -417,19 +417,21 @@ fn gdn_recurrence_sm75_gpu[
     var row_offset = hv * (D_v * D_k) + dv * D_k
     var row_ptr = state_s + row_offset
 
-    # 1. kv_mem = sum(state_s * k) dengan decay — state FP16 di VRAM, math
-    #    FP32 di register (akses float4, baris 16B-aligned)
+    # 1. kv_mem = sum(state_s * k) dengan decay — state S disimpan FP32 di
+    #    VRAM (WAJIB: rounding per-langkah terakumulasi karena decay ~ 1.0;
+    #    lihat config `mamba_ssm_dtype: float32` & llama.cpp GGML_TYPE_F32).
+    #    Akses float4, baris 16B-aligned.
     var kv_mem: Float32 = 0.0
     var dk4 = 0
     while dk4 + 3 < D_k:
-        var s4 = row_ptr.load[width=4](dk4).cast[DType.float32]()
+        var s4 = row_ptr.load[width=4](dk4)
         var sd = s4 * g_decay
-        row_ptr.store[width=4](dk4, sd.cast[T]())
+        row_ptr.store[width=4](dk4, sd)
         kv_mem += sd[0] * smem_k[dk4] + sd[1] * smem_k[dk4 + 1] + sd[2] * smem_k[dk4 + 2] + sd[3] * smem_k[dk4 + 3]
         dk4 += 4
     while dk4 < D_k:
-        var s_decayed = state_s[row_offset + dk4].cast[DType.float32]() * g_decay
-        state_s[row_offset + dk4] = Scalar[T](s_decayed)
+        var s_decayed = state_s[row_offset + dk4] * g_decay
+        state_s[row_offset + dk4] = s_decayed
         kv_mem += s_decayed * smem_k[dk4]
         dk4 += 1
 
@@ -441,14 +443,14 @@ fn gdn_recurrence_sm75_gpu[
     var read_out: Float32 = 0.0
     dk4 = 0
     while dk4 + 3 < D_k:
-        var s4 = row_ptr.load[width=4](dk4).cast[DType.float32]()
+        var s4 = row_ptr.load[width=4](dk4)
         var n4 = s4 + SIMD[DType.float32, 4](smem_k[dk4], smem_k[dk4 + 1], smem_k[dk4 + 2], smem_k[dk4 + 3]) * delta
-        row_ptr.store[width=4](dk4, n4.cast[T]())
+        row_ptr.store[width=4](dk4, n4)
         read_out += n4[0] * smem_q[dk4] + n4[1] * smem_q[dk4 + 1] + n4[2] * smem_q[dk4 + 2] + n4[3] * smem_q[dk4 + 3]
         dk4 += 4
     while dk4 < D_k:
-        var s_new = state_s[row_offset + dk4].cast[DType.float32]() + smem_k[dk4] * delta
-        state_s[row_offset + dk4] = Scalar[T](s_new)
+        var s_new = state_s[row_offset + dk4] + smem_k[dk4] * delta
+        state_s[row_offset + dk4] = s_new
         read_out += s_new * smem_q[dk4]
         dk4 += 1
 
@@ -468,13 +470,34 @@ fn gdn_norm_gate_sm75_gpu[
     D_v: Int,
     eps: Float32,
     out_row_stride: Int = 0,
-    z_row_stride: Int = 0
+    z_row_stride: Int = 0,
+    legacy_gate_first: Int = 0
 ):
     """
-    1 block per head hv (64 block total), 128 thread per block.
-    1. Mengalikan out[dv] * silu(z[dv])
-    2. Menghitung RMSNorm per head (D_v elemen)
-    3. Mengalikan dengan bobot norm_w[dv] (jika HAS_NORM_W=True)
+    1 block per head hv, D_v thread per block.
+    1. Menghitung RMSNorm per head ATAS x = keluaran rekurensi MURNI
+    2. Mengalikan dengan bobot norm_w[dv] (jika HAS_NORM_W=True)
+    3. BARU dikalikan silu(z[dv]) — gate SETELAH normalisasi
+
+    PARITAS WAJIB dgn Qwen3NextRMSNormGated:
+      * mlx-lm `qwen3_next.py:71-78`:
+            x = mx.fast.rms_norm(hidden_states, self.weight, eps)
+            return silu(gate) * x
+      * Prism CUDA `rmsnorm_gated.cu:80-96`:
+            local_sq += xv*xv            # x MURNI, bukan x*silu(g)
+            normed = xv * scale * wv
+            gated  = normed * silu(gv)
+
+    Urutan terbalik (gate dulu, lalu norm atas x*silu(z)) menghasilkan galat
+    gain per-head rms(x)/rms(x*silu(z)) di SETIAP layer GDN, prefill maupun
+    decode — dan tidak terdeteksi oleh tes paritas apa pun karena kembar CPU
+    ikut salah.
+
+    `legacy_gate_first` (SAKELAR A/B, default 0 = BENAR):
+      * 0 -> urutan referensi (norm atas x murni, gate terakhir).
+      * != 0 -> reproduksi bug LAMA (norm atas x*silu(z)) HANYA untuk mengukur
+        besar dampaknya di T4. JANGAN dipakai produksi. Di-set dari env
+        `BONSAI_GDN_NORM_ORDER=gate_first` oleh peluncur di ops.mojo.
     """
     var hv = block_idx.x
     var dv = thread_idx.x
@@ -487,12 +510,16 @@ fn gdn_norm_gate_sm75_gpu[
         32, Float32, alignment = 16, address_space = AddressSpace.SHARED
     ]()
 
+    var x_val = Float32(gdn_out[block_idx.y * out_row_stride + idx])
     var z_val = Float32(z_ptr[block_idx.y * z_row_stride + idx])
     var silu_z = z_val / (1.0 + exp(-z_val))
-    var gated_val = Float32(gdn_out[block_idx.y * out_row_stride + idx]) * silu_z
 
-    # Hitung mean kuadrat pada 128 thread
-    var sq = gated_val * gated_val
+    # Nilai yang dinormalkan: x MURNI (default, paritas referensi). Mode A/B
+    # menormalkan x*silu(z) — persis perilaku lama.
+    var norm_in = (x_val * silu_z) if legacy_gate_first != 0 else x_val
+
+    # Hitung mean kuadrat atas norm_in
+    var sq = norm_in * norm_in
     sq += shuffle_down(sq, 16)
     sq += shuffle_down(sq, 8)
     sq += shuffle_down(sq, 4)
@@ -518,7 +545,17 @@ fn gdn_norm_gate_sm75_gpu[
     @parameter
     if HAS_NORM_W:
         gamma = norm_w[dv]
-    gdn_out[block_idx.y * out_row_stride + idx] = Scalar[T](gated_val * inv_rms * gamma)
+    if legacy_gate_first != 0:
+        # SAKELAR A/B: bug lama — gate dulu, norm atas (x*silu(z)).
+        # silu(z) TIDAK dikali lagi di sini (sudah masuk ke norm_in).
+        gdn_out[block_idx.y * out_row_stride + idx] = Scalar[T](
+            norm_in * inv_rms * gamma
+        )
+    else:
+        # Paritas referensi: norm atas x murni, gate silu(z) BELAKANGAN.
+        gdn_out[block_idx.y * out_row_stride + idx] = Scalar[T](
+            (x_val * inv_rms * gamma) * silu_z
+        )
 
 
 # ----------------------------------------------------------------------------
@@ -741,7 +778,8 @@ fn gqa_attention_sm75_gpu[
     Fused GQA Attention pada GPU NVIDIA T4:
     - 1 block per Query Head (H_q block).
     - 128 thread per block (1 thread per head_dim = 128).
-    - Grouped Query Attention: group_size = H_q // H_kv (Bonsai-27B: 40//8 = 5).
+    - Grouped Query Attention: group_size = H_q // H_kv.
+      Bonsai-27B (config.mojo): H_q=24, H_kv=4 -> group_size = 6 (bukan 40//8).
     - Memuat query head ke Shared Memory.
     - Menghitung scaled dot-product attention scores S[t] untuk t in [0..seq_len-1].
     - Numerically stable Softmax dengan intra-warp & inter-warp reduction.
@@ -756,13 +794,12 @@ fn gqa_attention_sm75_gpu[
     var hkv = hq // group_size
     var kv_dim = H_kv * head_dim
 
-    # Buffer Shared Memory Terpadu (192 Float32 = 768 B) untuk eliminasi aliasing NVPTX
+    # Buffer Shared Memory Terpadu: head_dim (256) untuk Q + 32 reduksi warp
+    # + 32 broadcast = 320 float (1280 B). Model riil Bonsai: head_dim=256,
+    # H_q=24, H_kv=4 (terverifikasi [GQA DIAG] Run #50).
     # HINDARI pointer arithmetic di shared memory (smem + offset) karena NVPTX
     # mungkin mengonversi AddressSpace.SHARED ke GENERIC → illegal memory access.
     # Gunakan direct indexing smem[offset + idx] saja.
-    # Buffer Shared Memory Terpadu: head_dim (256) untuk Q + 32 reduksi warp
-    # + 32 broadcast = 320 float. Model riil Bonsai: head_dim=256, H_q=24,
-    # H_kv=4 (terverifikasi [GQA DIAG] Run #50).
     alias GQA_SMEM_ELEMS: Int = 320   # 256 (q) + 32 (reduce) + 32 (bcast)
     alias GQA_REDUCE_OFF: Int = 256
     alias GQA_BCAST_OFF: Int = 288

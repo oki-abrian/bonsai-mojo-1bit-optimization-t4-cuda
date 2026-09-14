@@ -314,13 +314,20 @@ struct QwenDecoderLayer:
         var prof = pos == 0
         var pv = getenv("BONSAI_PROFILE")
         prof = prof and pv and pv[0] == "1"
-        var fuse = not (getenv("BONSAI_NO_FUSE") and getenv("BONSAI_NO_FUSE") == "1")
+        var no_fuse = getenv("BONSAI_NO_FUSE")
+        var fuse = not (no_fuse and no_fuse == "1")
 
         # 1. Pre-Layer RMSNorm di GPU (menggunakan pointer bobot VRAM)
-        # dilewati bila prenorm_done (sudah dikerjakan fusi residual layer
-        # sebelumnya — hasil bit-exact identik, hememat 1 launch/layer).
+        # dilewati HANYA bila `prenorm_done` DAN fusi aktif. `prenorm_done`
+        # (dikirim main.mojo sebagai `li > 0`) mengasumsikan layer SEBELUMNYA
+        # sudah menulis x_norm_dev lewat fusi residual-2 + pre-norm. Dengan
+        # BONSAI_NO_FUSE=1 fusi itu MATI (residual-2 hanya vec_add), sehingga
+        # x_norm_dev masih berisi nilai lama dari layer terakhir yang benar-benar
+        # menormalkan (layer 0) — dan SEMUA layer 1..63 akan membaca pre-norm
+        # yang salah tanpa satu pun error. Itulah sebabnya syaratnya harus
+        # `prenorm_done and fuse`, bukan `prenorm_done` saja.
         var t0 = monotonic()
-        if not prenorm_done:
+        if not (prenorm_done and fuse):
             rmsnorm_sm75_launch_on[T](
                 ctx, hidden_states_dev, x_norm_dev,
                 self.input_layernorm_w_dev, self.input_layernorm_w_dev != UnsafePointer[Float32, MutAnyOrigin](),
@@ -354,7 +361,7 @@ struct QwenDecoderLayer:
                 q_gate_dev, k_dev, v_dev, attn_out_dev, attn_scores_dev,
                 self.attn_q_proj, self.attn_k_proj, self.attn_v_proj, self.attn_o_proj,
                 self.attn_q_norm_w_dev, self.attn_k_norm_w_dev, self.attn_has_norms,
-                kv_cache, pos, self.config
+                kv_cache, pos, self.config, self.layer_idx
             )
         var t_step = 0.0
         if prof:
@@ -594,7 +601,7 @@ struct QwenDecoderLayer:
                     attn_scores_dev,
                     self.attn_q_norm_w_dev, self.attn_k_norm_w_dev,
                     self.attn_has_norms,
-                    kv_cache, pos_base + t, self.config
+                    kv_cache, pos_base + t, self.config, self.layer_idx
                 )
 
             # 4. o_proj GEMM batched: attn out (gdn_m rows, [M,6144]) -> sublayer_m

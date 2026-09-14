@@ -24,9 +24,13 @@ fn qwen3_5_swiglu_mlp_step(
 ) raises:
     """
     SwiGLU FFN:
-    1. gate_up_proj memproyeksikan x ke [2 * intermediate_size] (N=22016, K=4096)
+    1. gate_up_proj memproyeksikan x ke [2 * intermediate_size]
     2. Aktivasi non-linear: swiglu_act = silu(gate) * up
-    3. down_proj memproyeksikan balik ke hidden_size (N=4096, K=11008)
+    3. down_proj memproyeksikan balik ke hidden_size
+
+    Dimensi Bonsai-27B (config.mojo): gate_up_proj [N=34816, K=5120],
+    down_proj [N=5120, K=17408]. (Angka lama N=22016/K=4096 & N=4096/K=11008
+    berasal dari konfigurasi lain dan sudah tidak berlaku.)
     """
     var gate_up_buf = alloc[Float32](2 * intermediate_size)
     var swiglu_act  = alloc[Float32](intermediate_size)

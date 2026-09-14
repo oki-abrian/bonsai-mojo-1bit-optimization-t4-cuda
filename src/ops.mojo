@@ -828,6 +828,7 @@ fn copy_vec_sm75_launch_on[
         block_dim=(256, 1, 1)
     )
 
+
 # GDN sequence fused (tiru gdn_step_kernel MLX fork): 1 launch per layer
 # untuk seluruh chunk T token, state di register.
 alias CudaGdnSeqFnFP16 = fn(
@@ -838,7 +839,7 @@ alias CudaGdnSeqFnFP16 = fn(
     UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # b
     UnsafePointer[Float32, MutAnyOrigin],                # a_log
     UnsafePointer[Float32, MutAnyOrigin],                # dt_bias
-    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # state fp16 in/out
+    UnsafePointer[Float32, MutAnyOrigin],                # state fp32 in/out
     UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # y [T, y_stride]
     Int32, Int32, Int32, Int32, Int32,                   # T, Hv, Hk, Dk, Dv
     Int32, Int32, Int32, Int32,                          # qk,v,ab,y strides
@@ -856,7 +857,7 @@ fn gdn_seq_sm75_try_launch(
     b: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
     a_log: UnsafePointer[Float32, MutAnyOrigin],
     dt_bias: UnsafePointer[Float32, MutAnyOrigin],
-    state: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    state: UnsafePointer[Float32, MutAnyOrigin],
     y: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
     T: Int, Hv: Int, Hk: Int, Dk: Int, Dv: Int,
     qk_stride: Int, v_stride: Int, ab_stride: Int, y_stride: Int,
@@ -882,6 +883,7 @@ fn gdn_seq_sm75_try_launch(
         return False
 
 
+# ============================================================================ #
 fn causal_conv1d_sm75_launch_on[
     T: DType
 ](
@@ -975,7 +977,7 @@ fn gdn_recurrence_sm75_launch_on[
     T: DType
 ](
     mut ctx: DeviceContextGPU,
-    state_s: UnsafePointer[Scalar[T], MutAnyOrigin],
+    state_s: UnsafePointer[Float32, MutAnyOrigin],
     q_normed: UnsafePointer[Scalar[T], MutAnyOrigin],
     k_normed: UnsafePointer[Scalar[T], MutAnyOrigin],
     v: UnsafePointer[Scalar[T], MutAnyOrigin],
@@ -991,9 +993,12 @@ fn gdn_recurrence_sm75_launch_on[
     D_k: Int
 ) raises:
     """Meluncurkan rekurensi Gated DeltaNet di VRAM (H_v block x D_v thread).
-    WAJIB dari config runtime — JANGAN hardcode: grid/block lama (64x128)
-    adalah dimensi checkpoint lama; model riil H_v=32 D_v=256, dan launch
-    hardcoded meluap 4 MB melewati buffer state + separuh dimensi mati."""
+    WAJIB dari config runtime — JANGAN hardcode. Dimensi Bonsai-27B yang BENAR
+    (config.mojo `qwen_27b_default`, diverifikasi thd config.json checkpoint):
+    H_v = 48, D_v = D_k = 128, H_k = 16 -> grid (48,1,1) x block (128,1,1).
+    Angka lama yang pernah ditulis di sini (64x128, lalu "H_v=32 D_v=256")
+    keduanya SALAH untuk model ini; memakai salah satunya meluap melewati
+    buffer state atau mematikan separuh dimensi."""
     if has_params and a_log != UnsafePointer[Float32, MutAnyOrigin]() and dt_bias != UnsafePointer[Float32, MutAnyOrigin]():
         ctx.enqueue_function[gdn_recurrence_sm75_gpu[T, True]](
             state_s, q_normed, k_normed, v, a, b, a_log, dt_bias,
@@ -1023,13 +1028,34 @@ fn gdn_norm_gate_sm75_launch_on[
     eps: Float32 = 1e-6,
     rows: Int = 1,
     out_row_stride: Int = 0,
-    z_row_stride: Int = 0
+    z_row_stride: Int = 0,
+    legacy_override: Int = -1
 ) raises:
     """Meluncurkan Fused GDN Gating & Per-Head RMSNorm di VRAM.
-    rows > 1 = batched prefill (grid.y = baris; stride per baris eksplisit)."""
+    rows > 1 = batched prefill (grid.y = baris; stride per baris eksplisit).
+
+    SAKELAR A/B `BONSAI_GDN_NORM_ORDER`: default (tidak diset) = urutan BENAR
+    (norm atas x murni, gate silu(z) terakhir — paritas Qwen3NextRMSNormGated).
+    Set `gate_first` (atau `legacy`/`1`) untuk mereproduksi bug LAMA supaya
+    besar dampaknya bisa diukur di T4. JANGAN dipakai produksi.
+
+    `legacy_override`: -1 = ikuti env (perilaku normal). 0/1 = PAKSA mode,
+    dipakai tes diferensial supaya bisa menguji kedua urutan tanpa menyentuh
+    environment proses.
+    """
+    var legacy_flag = 0
+    if legacy_override >= 0:
+        legacy_flag = legacy_override
+    else:
+        var legacy = getenv("BONSAI_GDN_NORM_ORDER")
+        if legacy and (legacy == "gate_first" or legacy == "legacy" or legacy == "1"):
+            legacy_flag = 1
+            print(">> [GDN-AB] BONSAI_GDN_NORM_ORDER=gate_first -> memakai urutan "
+                  "norm/gate LAMA (bug). Hanya untuk A/B, bukan produksi.")
     if has_norm_w and norm_w != UnsafePointer[Float32, MutAnyOrigin]():
         ctx.enqueue_function[gdn_norm_gate_sm75_gpu[T, True]](
             gdn_out, z, norm_w, D_v, eps, out_row_stride, z_row_stride,
+            legacy_flag,
             grid_dim=(H_v, rows, 1),
             block_dim=(D_v, 1, 1)
         )
@@ -1037,6 +1063,7 @@ fn gdn_norm_gate_sm75_launch_on[
         var null_w = UnsafePointer[Float32, MutAnyOrigin]()
         ctx.enqueue_function[gdn_norm_gate_sm75_gpu[T, False]](
             gdn_out, z, null_w, D_v, eps, out_row_stride, z_row_stride,
+            legacy_flag,
             grid_dim=(H_v, rows, 1),
             block_dim=(D_v, 1, 1)
         )
@@ -1121,6 +1148,29 @@ fn gqa_attention_sm75_launch_on[
     scale: Float32
 ) raises:
     """Meluncurkan Fused GQA Scaled Dot-Product Attention & Sigmoid Gate di VRAM."""
+    # GUARD: kernel GQA mengasumsikan head_dim == 256 PERSIS. Dua batas:
+    #   (a) shared memory berukuran TETAP — GQA_SMEM_ELEMS = 320 float =
+    #       head_dim(<=256) untuk Q + 32 reduksi warp + 32 broadcast
+    #       (elementwise_sm75.mojo:807). head_dim > 256 -> penulisan smem[tid]
+    #       MELUAP ke region reduksi/broadcast.
+    #   (b) reduksi tahap-2 di-hardcode untuk 8 WARP: `lane < 8`
+    #       (elementwise_sm75.mojo:868 dan :898, komentar "Block 256 thread =
+    #       8 warp"). Dengan head_dim < 256 jumlah warp < 8, sehingga lane
+    #       4..7 membaca slot smem yang TIDAK PERNAH DITULIS — nilainya
+    #       sampah. Akibatnya bisa salah apa saja: max softmax bisa jadi
+    #       raksasa -> seluruh exp(s-max) mendekati 0 -> denominator ~0 ->
+    #       konteks jadi nol. Ini kerusakan SENYAP, bukan crash.
+    # Karena itu hanya head_dim == 256 yang diterima. Generalisasi reduksi
+    # (mis. jumlah warp dinamis + pola shuffle menyesuaikan) adalah pekerjaan
+    # lanjutan, bukan perbaikan bug ini.
+    if head_dim != 256:
+        raise Error(
+            "FATAL: gqa_attention_sm75_gpu hanya mendukung head_dim == 256 "
+            "(SMEM tetap 320 float DAN reduksi tahap-2 di-hardcode utk 8 warp). "
+            "head_dim=" + String(head_dim)
+            + " akan meluap atau membaca shared memory tak-terinisialisasi "
+            + "dan menghasilkan nilai salah tanpa error."
+        )
     ctx.enqueue_function[gqa_attention_sm75_gpu[T]](
         q_gate, k_cache, v_cache, out_ptr, attn_scores,
         seq_len, max_seq_len, H_q, H_kv, head_dim, scale,

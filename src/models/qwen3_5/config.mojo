@@ -8,29 +8,32 @@ struct QwenConfig(Copyable, Movable, ImplicitlyCopyable):
     """
     Parameter hiper-arsitektur model Qwen 3.5 / 3.6 / 3.8:
     Mendukung konfigurasi native untuk Qwen 27B, 4B, dan varian lainnya.
+
+    Nilai pada komentar tiap field = nilai Bonsai-27B yang SEBENARNYA
+    (`qwen_27b_default`, terverifikasi thd config.json checkpoint).
     """
-    var hidden_size: Int               # Dimensi representasi token (default: 4096)
-    var intermediate_size: Int         # Dimensi proyeksi FFN SwiGLU (default: 11008)
-    var num_hidden_layers: Int         # Total lapisan transformer (default: 64)
-    var num_attention_heads: Int       # Jumlah head query pada full attention (default: 32)
-    var num_key_value_heads: Int       # Jumlah head KV pada full attention GQA (default: 8)
-    var head_dim: Int                  # Dimensi fitur per-head (default: 128)
-    var vocab_size: Int                # Ukuran kosakata tokenizer (default: 152064)
-    var rms_norm_eps: Float32          # Epsilon stabilitas RMSNorm (default: 1e-6)
-    var full_attention_interval: Int   # Rasio hybrid 3:1 (default: 4 -> 3 GDN : 1 Full Attn)
+    var hidden_size: Int               # Dimensi representasi token (27B: 5120)
+    var intermediate_size: Int         # Dimensi proyeksi FFN SwiGLU (27B: 17408)
+    var num_hidden_layers: Int         # Total lapisan transformer (27B: 64)
+    var num_attention_heads: Int       # Head query full attention (27B: 24)
+    var num_key_value_heads: Int       # Head KV pada full attention GQA (27B: 4)
+    var head_dim: Int                  # Dimensi fitur per-head (27B: 256)
+    var vocab_size: Int                # Ukuran kosakata tokenizer (27B: 248320)
+    var rms_norm_eps: Float32          # Epsilon stabilitas RMSNorm (27B: 1e-6)
+    var full_attention_interval: Int   # Rasio hybrid 3:1 (4 -> 3 GDN : 1 Full Attn)
 
     # Parameter Rotary Positional Embedding (RoPE)
-    var rope_theta: Float32            # Basis frekuensi geometrik RoPE (default: 100000.0)
-    var partial_rotary_factor: Float32 # Fraksi dimensi head yang dirotasi (default: 0.25)
-    var rotary_dim: Int                # Dimensi nyata yang dirotasi (default: 32)
+    var rope_theta: Float32            # Basis frekuensi geometrik RoPE (27B: 1e7)
+    var partial_rotary_factor: Float32 # Fraksi dimensi head yang dirotasi (27B: 0.25)
+    var rotary_dim: Int                # Dimensi nyata yang dirotasi (27B: 64)
 
     # Parameter Linear Attention Gated DeltaNet (GDN)
-    var gdn_num_v_heads: Int           # Jumlah head Value pada GDN (default: 64)
-    var gdn_num_k_heads: Int           # Jumlah head Key pada GDN (default: 16)
-    var gdn_head_k_dim: Int            # Dimensi head Key GDN (default: 128)
-    var gdn_head_v_dim: Int            # Dimensi head Value GDN (default: 128)
-    var gdn_conv_kernel: Int           # Ukuran window causal convolution (default: 4)
-    var gdn_conv_dim: Int              # Dimensi gabungan QKV konvolusi (default: 12288)
+    var gdn_num_v_heads: Int           # Jumlah head Value pada GDN (27B: 48)
+    var gdn_num_k_heads: Int           # Jumlah head Key pada GDN (27B: 16)
+    var gdn_head_k_dim: Int            # Dimensi head Key GDN (27B: 128)
+    var gdn_head_v_dim: Int            # Dimensi head Value GDN (27B: 128)
+    var gdn_conv_kernel: Int           # Ukuran window causal convolution (27B: 4)
+    var gdn_conv_dim: Int              # Dimensi gabungan QKV konvolusi (27B: 10240)
 
     @staticmethod
     fn qwen_27b_default() -> QwenConfig:

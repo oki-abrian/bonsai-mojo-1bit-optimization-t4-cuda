@@ -1,0 +1,25 @@
+{
+  "prompts": [
+    {
+      "prompt": "Sebutkan lima nama buah tropis yang umum dijumpai di Indonesia. Cukup tuliskan daftar namanya, tanpa penjelasan.",
+      "max_tokens": 96
+    },
+    {
+      "prompt": "Tulis sebuah cerita pendek sekitar 250 kata tentang seorang nelayan tua yang menemukan botol berisi peta harta karun di tepi pantai.",
+      "max_tokens": 512
+    },
+    {
+      "prompt": "Sebuah kolam dapat diisi penuh oleh pipa A dalam 6 jam dan oleh pipa B dalam 4 jam. Mula-mula kedua pipa dibuka bersamaan selama 2 jam, lalu pipa B ditutup dan hanya pipa A yang terus mengalir sampai kolam penuh. Berapa jam total waktu yang dibutuhkan untuk mengisi kolam sampai penuh? Tunjukkan langkah perhitungannya.",
+      "max_tokens": 512
+    }
+  ],
+  "max_tokens": 512,
+  "temperature_x100": 70,
+  "top_k": 20,
+  "top_p_x1000": 950,
+  "min_p_x1000": 0,
+  "rep_penalty_x100": 100,
+  "rep_window": 256,
+  "seed": 1234,
+  "catatan": "RESEP RESMI Bonsai (mode thinking): temperature 0.70, top-k 20, top-p 0.95, min-p 0. rep_penalty_x100=100 artinya MATI — repetition penalty tidak ada di spesifikasi resmi PrismML. temperature_x100=0 -> greedy (argmax). Semua nilai ini diteruskan ke main.mojo lewat env BONSAI_TEMP_X100 / BONSAI_TOP_K / BONSAI_TOP_P_X1000 / BONSAI_MIN_P_X1000 dst."
+}

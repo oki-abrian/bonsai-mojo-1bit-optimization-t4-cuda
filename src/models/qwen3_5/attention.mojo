@@ -5,6 +5,7 @@
 
 from memory import UnsafePointer, alloc
 from math import sqrt
+from os import getenv
 from gpu.host import DeviceBuffer
 from .config import QwenConfig
 from .norm import head_rms_norm, softmax, sigmoid
@@ -20,7 +21,9 @@ from src.ops import (
 struct AttentionKVCache:
     """
     KV Cache untuk layer Full Attention (Layer 3, 7, 11, ...):
-    Menyimpan token riwayat untuk 8 KV heads x 128 head_dim.
+    Menyimpan token riwayat untuk H_kv KV heads x head_dim.
+    Bonsai-27B (config.mojo `qwen_27b_default`): 4 KV heads x 256 head_dim
+    (kv_dim = 1024), BUKAN 8 x 128.
     Mendukung buffer host dan buffer VRAM (DeviceBuffer FP16).
     """
     var k_cache: UnsafePointer[Float32, MutAnyOrigin] # [max_seq_len, num_kv_heads * head_dim]
@@ -103,19 +106,22 @@ fn qwen3_5_gated_attention_step(
 ) raises:
     """
     Forward pass 1 token penuh Gated Attention sesuai qwen3_next.py:
-    1. q_proj menghasilkan Queries AND Attention Gate (32 heads x 128 x 2 = 8192)
-    2. k_proj & v_proj menghasilkan Keys dan Values (8 heads x 128 = 1024)
+    1. q_proj menghasilkan Queries AND Attention Gate (H_q head x 2*head_dim)
+    2. k_proj & v_proj menghasilkan Keys dan Values (H_kv x head_dim)
     3. Q-Norm & K-Norm per head
-    4. RoPE parsial 25% (32 dimensi pertama per head)
+    4. RoPE parsial (rotary_dim dari partial_rotary_factor)
     5. Simpan Key dan Value ke KV Cache ring buffer
-    6. Scaled Dot Product Attention dengan Grouped Query Attention (32 query : 8 KV)
+    6. Scaled Dot Product Attention dengan Grouped Query Attention
     7. Attention Output digate via Sigmoid: out_ptr = context * sigmoid(gate)
-    8. o_proj balik ke hidden_size (4096)
+    8. o_proj balik ke hidden_size
+
+    Dimensi Bonsai-27B: H_q=24, H_kv=4 (group_size 6), head_dim=256,
+    rotary_dim=64 (partial_rotary_factor 0.25), hidden_size=5120.
     """
-    var H_q = config.num_attention_heads      # 32
-    var H_kv = config.num_key_value_heads     # 8
-    var D = config.head_dim                   # 128
-    var rot_dim = config.rotary_dim           # 32
+    var H_q = config.num_attention_heads      # 24 di Bonsai-27B
+    var H_kv = config.num_key_value_heads     # 4 di Bonsai-27B
+    var D = config.head_dim                   # 256 di Bonsai-27B
+    var rot_dim = config.rotary_dim           # 64 di Bonsai-27B
     var scale: Float32 = 1.0 / sqrt(Float32(D))
 
     var q_gate_buf = alloc[Float32](H_q * D * 2)
@@ -208,23 +214,27 @@ fn qwen3_5_gated_attention_step_gpu(
     has_norms: Bool,
     mut kv_cache: AttentionKVCache,
     pos: Int,
-    config: QwenConfig
+    config: QwenConfig,
+    layer_idx: Int = -1
 ) raises:
     """
     Forward pass 1 token penuh Gated Full Attention 100% di VRAM GPU:
-    1. q_proj menghasilkan Query + Gate (40 heads x 128 x 2 = 10240) di VRAM
-    2. k_proj & v_proj menghasilkan Key dan Value (8 heads x 128 = 1024) di VRAM
+    1. q_proj menghasilkan Query + Gate (H_q x 2*head_dim) di VRAM
+    2. k_proj & v_proj menghasilkan Key dan Value (H_kv x head_dim) di VRAM
     3. Head RMSNorm berbobot per-head di VRAM
-    4. RoPE parsial 25% (32 dimensi pertama per-head) di VRAM
+    4. RoPE parsial (rotary_dim per head) di VRAM
     5. Simpan Key dan Value ke KV Cache ring buffer di VRAM
-    6. Fused GQA (40 Q : 8 KV = rasio 5:1) + Softmax + Sigmoid Gate di VRAM
-    7. o_proj balik ke hidden_size (5120) di VRAM
+    6. Fused GQA (H_q : H_kv) + Softmax + Sigmoid Gate di VRAM
+    7. o_proj balik ke hidden_size di VRAM
+
+    Dimensi Bonsai-27B: H_q=24, H_kv=4 (rasio 6:1), head_dim=256,
+    rotary_dim=64, hidden_size=5120.
     """
     alias T = DType.float16
-    var H_q = config.num_attention_heads      # 40 di Bonsai-27B
-    var H_kv = config.num_key_value_heads     # 8 di Bonsai-27B
-    var D = config.head_dim                   # 128
-    var rot_dim = config.rotary_dim           # 32
+    var H_q = config.num_attention_heads      # 24 di Bonsai-27B
+    var H_kv = config.num_key_value_heads     # 4 di Bonsai-27B
+    var D = config.head_dim                   # 256 di Bonsai-27B
+    var rot_dim = config.rotary_dim           # 64 di Bonsai-27B
     var scale: Float32 = 1.0 / sqrt(Float32(D))
 
     var ctx_ptr = q_proj.ctx_ptr
@@ -235,7 +245,12 @@ fn qwen3_5_gated_attention_step_gpu(
     # KV cache DI-INIT di main.mojo untuk semua layer attention sebelum loop.
     # Lazy init di sini dihapus: mutasi struct via parameter berisiko ter-copy
     # (ownership ambigu) — step ini read-only terhadap kv_cache.
-    if pos == 0:
+    # Diagnostik pointer hanya bila diminta (BONSAI_DEBUG_ATTN=1). Sebelumnya
+    # kedua blok ini mencetak TANPA SYARAT setiap pos==0, sehingga setiap run
+    # (termasuk gerbang koherensi) selalu mengotori log dgn 10+ baris.
+    var dbg_attn = getenv("BONSAI_DEBUG_ATTN")
+    var attn_diag_on = dbg_attn and (dbg_attn == "1" or dbg_attn == "true")
+    if attn_diag_on and pos == 0:
         var p_null = UnsafePointer[Scalar[DType.float16], MutAnyOrigin]()
         var f_null = UnsafePointer[Float32, MutAnyOrigin]()
         print(
@@ -252,8 +267,6 @@ fn qwen3_5_gated_attention_step_gpu(
             " qn_null=", q_norm_w_dev == f_null,
             " kn_null=", k_norm_w_dev == f_null
         )
-
-    if pos == 0:
         print(">> [ATTN STEP] pos=0: qkv_proj -> qk_norm (has_norms=", has_norms, ") -> rope -> kv_append -> gqa -> o_proj")
 
     # 1. Proyeksi Linear 1-Bit Masukan di VRAM (tanpa transfer host)
@@ -264,7 +277,7 @@ fn qwen3_5_gated_attention_step_gpu(
     qwen3_5_gated_attention_step_gpu_from_proj(
         ctx_ptr, q_gate_dev, k_dev, v_dev, attn_out_dev, attn_scores_dev,
         q_norm_w_dev, k_norm_w_dev, has_norms,
-        kv_cache, pos, config
+        kv_cache, pos, config, layer_idx
     )
 
     # 6. Proyeksi Keluar Linear 1-Bit o_proj di VRAM
@@ -283,7 +296,8 @@ fn qwen3_5_gated_attention_step_gpu_from_proj(
     has_norms: Bool,
     mut kv_cache: AttentionKVCache,
     pos: Int,
-    config: QwenConfig
+    config: QwenConfig,
+    layer_idx: Int = -1
 ) raises:
     """
     Langkah attention TANPA proyeksi linear (q/k/v/o_proj di luar fungsi).
@@ -292,10 +306,10 @@ fn qwen3_5_gated_attention_step_gpu_from_proj(
     RoPE parsial half-split -> append KV cache -> GQA + softmax + sigmoid gate.
     """
     alias T = DType.float16
-    var H_q = config.num_attention_heads      # 48 di Bonsai-27B
-    var H_kv = config.num_key_value_heads     # 8 di Bonsai-27B
-    var D = config.head_dim                   # 128
-    var rot_dim = config.rotary_dim           # 32
+    var H_q = config.num_attention_heads      # 24 di Bonsai-27B
+    var H_kv = config.num_key_value_heads     # 4 di Bonsai-27B
+    var D = config.head_dim                   # 256 di Bonsai-27B
+    var rot_dim = config.rotary_dim           # 64 di Bonsai-27B
     var scale: Float32 = 1.0 / sqrt(Float32(D))
 
     if not ctx_ptr:

@@ -82,8 +82,33 @@ def main():
 
     os.chmod(script_path, 0o755)
 
-    print(f">> [RUNNER] Menjalankan: cd {work_dir} && bash deploy_on_kaggle.sh", flush=True)
-    res = subprocess.run(f"cd {work_dir} && bash {script_path}", shell=True)
+    # Variabel BONSAI_* dibekukan oleh push_to_kaggle.sh ke bonsai_env.sh, karena
+    # environment shell LOKAL tidak ikut terkirim ke container Kaggle. Tanpa ini,
+    # `BONSAI_COH_THINK=both ./push_to_kaggle.sh` diabaikan tanpa peringatan dan
+    # eksperimen berjalan dengan default (negatif palsu).
+    env_file = os.path.join(work_dir, "bonsai_env.sh")
+    if os.path.exists(env_file):
+        print(f">> [RUNNER] Menerapkan variabel dari {env_file}:", flush=True)
+        try:
+            with open(env_file) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("export ") and "=" in line:
+                        print(f">> [ENV]   {line[len('export '):]}", flush=True)
+        except Exception as e:  # pragma: no cover - diagnostik saja
+            print(f">> [WARN] Gagal membaca {env_file}: {e}", flush=True)
+        # `set -a` -> semua variabel yang di-source otomatis ter-export, sehingga
+        # diwarisi oleh deploy_on_kaggle.sh DAN biner mojo yang dijalankannya.
+        cmd = (
+            f"cd {work_dir} && set -a && . ./bonsai_env.sh && set +a "
+            f"&& bash {script_path}"
+        )
+    else:
+        print(">> [RUNNER] bonsai_env.sh tidak ada -> memakai environment default.", flush=True)
+        cmd = f"cd {work_dir} && bash {script_path}"
+
+    print(f">> [RUNNER] Menjalankan: {cmd}", flush=True)
+    res = subprocess.run(cmd, shell=True)
     print(f">> [RUNNER] Eksekusi selesai dengan status code: {res.returncode}", flush=True)
     sys.exit(res.returncode)
 
