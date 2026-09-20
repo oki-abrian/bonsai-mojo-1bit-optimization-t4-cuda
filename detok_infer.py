@@ -368,9 +368,10 @@ def main():
             print(f"\n  ids = {ids[:64]}{' ...' if len(ids) > 64 else ''}")
 
     print("\n" + "=" * 72)
-    print("Catatan: main.mojo TIDAK berhenti di EOS, jadi setelah <|im_end|>")
-    print("model tetap lanjut dan menciptakan giliran percakapan berikutnya.")
-    print("Teks di atas dipotong di EOS pertama supaya jawaban aslinya jelas.")
+    print("Catatan: main.mojo BERHENTI di token henti (lihat '[STOP] token henti ...'")
+    print("di log mentah), jadi teks di atas berakhir tepat di EOS pertama. Kalau EOS")
+    print("tidak pernah muncul, generasi berakhir karena menyentuh batas max_tokens.")
+    print("Pemotongan di atas hanya untuk tampilan; isi lengkap ada di log mentah.")
 
 
 def clip(s, n):

@@ -530,6 +530,622 @@ __global__ void qmm_sm75_b1_kernel(
 } // namespace bonsai::sm75::wmma_b1
 
 // ============================================================================
+// Prefill GEMM 2-bit ternary W2A16 g128 — port qmm_sm75_b1_kernel.
+// y[L,M,N_total] = x[L,M,K] · w[N,K/4]^T ; w_eff = (q-1)*s untuk q ∈ {0,1,2}
+// (bias terserap, b = -s). Tiga perbedaan dari versi 1-bit:
+//   * 2 bit per bobot: 16 bobot per word U32, lane i di bit 2i (U32 little
+//     endian) — bukan 1 bit per bobot (32 bobot per word);
+//   * nilai bobot {-1, 0, +1}, bukan hanya ±1; q=3 tidak terpakai;
+//   * stride baris output N_total boleh LEBIH BESAR dari N: ekor dense pack
+//     Bonsai-2 (linear_attn.in_proj_b/a) menempati kolom [N, N_total) dan
+//     diisi oleh launch_qmv_sm75_dense_fp16, bukan oleh kernel ini.
+// Tile BMxBNxBK sama (64/64/64, atau 32/64/64 untuk M kecil) supaya
+// perilaku DRAM dan pemakaian SMEM identik dengan jalur 1-bit.
+// ============================================================================
+namespace bonsai::sm75::wmma_b2 {
+
+constexpr int QMM_B2_BN = 64;
+
+// (q-1) untuk q ∈ {0,1,2} -> {-1, 0, +1}, dikodekan langsung sebagai bit FP16:
+//   q=0 (a=0,b=0) -> -1.0 (0xBC00)
+//   q=1 (a=1,b=0) ->  0.0 (0x0000)
+//   q=2 (a=0,b=1) -> +1.0 (0x3C00)
+//   q=3 (a=1,b=1) -> +2.0 (0x4000) — kode tak terpakai, hanya untuk lengkap.
+//
+// DIPILIH lewat tabel 4 entri berbasis PRMT (1 IMAD + 1 PRMT + 1 AND), bukan
+// rangkaian banding/select: dekuantisasi berjalan per bobot dan menjadi
+// biaya dominan prefill, jadi tiap operasi skalar per bobot terasa.
+//   tab_a = byte {0x00,0xBC,0x00,0x00}  -> q=0: 0xBC00 ; q=1: 0x0000
+//   tab_b = byte {0x00,0x3C,0x00,0x40}  -> q=2: 0x3C00 ; q=3: 0x4000
+//   pemilih: byte-0 hasil dari indeks 2q, byte-1 dari indeks 2q+1
+//            => sel = 0x1010 + q*0x2222
+__device__ inline unsigned qmm_b2_half_bits(unsigned q) {
+    const unsigned tab_a = 0x0000BC00u;
+    const unsigned tab_b = 0x40003C00u;
+    const unsigned sel = 0x1010u + q * 0x2222u;
+    return __byte_perm(tab_a, tab_b, sel) & 0xFFFFu;
+}
+
+__device__ inline __half2 qmm_b2_expand2(unsigned q0, unsigned q1, __half2 s2) {
+    const unsigned lo = qmm_b2_half_bits(q0);
+    const unsigned hi = qmm_b2_half_bits(q1);
+    return __hmul2(
+        __halves2half2(__ushort_as_half(static_cast<unsigned short>(lo)),
+                       __ushort_as_half(static_cast<unsigned short>(hi))),
+        s2);
+}
+
+template <typename T, int BM_VAL = 64, int BN_VAL = 64, int BK_VAL = 64>
+__global__ void qmm_sm75_b2_kernel(
+    const T* __restrict__ x,
+    const uint8_t* __restrict__ w,
+    const T* __restrict__ scales,
+    T* __restrict__ y,
+    int M, int N, int N_total, int K, int L,
+    bool broadcast_w) {
+  static_assert(sizeof(T) == 2, "fp16/bf16 saja");
+
+  const int block_n = blockIdx.x * BN_VAL;
+  const int block_m = blockIdx.y * BM_VAL;
+  const int ly = blockIdx.z;
+
+  // Wt disimpan TRANSPOSED ([k][n]) supaya matrix_b row_major cocok langsung.
+  constexpr int PAD = 8;
+  __shared__ __half As[BM_VAL][BK_VAL + PAD];
+  __shared__ __half Wt[BK_VAL][BN_VAL + PAD];
+  __shared__ float Csc[4][16][16];
+
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+
+  // 2-bit: K/4 byte per baris bobot (bukan K/8 seperti 1-bit).
+  const uint8_t* wbase =
+      w + (broadcast_w ? 0 : (size_t)ly * N * (K / 4));
+  const size_t scale_stride = (K + 127) / 128;
+  const T* sbase =
+      scales + (broadcast_w ? 0 : (size_t)ly * N * scale_stride);
+
+  // Baris M yang BENAR-BENAR terpakai di blok ini. Ubin M terakhir biasanya
+  // nyaris seluruhnya bantalan (mis. M=129 dengan BM=64 -> blok ke-3 berisi 1
+  // baris), dan tanpa penjaga ini WMMA tetap menghitung seluruh BM baris.
+  const int rows_left = M - block_m;
+  const int rows_here = (rows_left < BM_VAL) ? rows_left : BM_VAL;
+
+  const int wid = tid / 32;
+  // 4 warp disusun 2x2: kelompok baris = wid/2, kelompok kolom = wid%2.
+  // Jadi tiap warp menangani BM/2 baris = BM/32 ubin WMMA 16x16.
+  constexpr int WARP_M_TILES = (BM_VAL == 32) ? 1 : (BM_VAL == 64 ? 2 : 4);
+  constexpr int WARP_N_TILES = 2;
+  const int wm = (wid / 2) * (BM_VAL / 2);
+  const int wn = (wid % 2) * 32;
+
+  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc[WARP_M_TILES][WARP_N_TILES];
+#pragma unroll
+  for (int i = 0; i < WARP_M_TILES; ++i)
+#pragma unroll
+    for (int j = 0; j < WARP_N_TILES; ++j)
+      nvcuda::wmma::fill_fragment(acc[i][j], 0.0f);
+
+  nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> fa[WARP_M_TILES];
+  nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::row_major> fb[WARP_N_TILES];
+
+  const __half2 zero2 =
+      __half2half2(__ushort_as_half(static_cast<unsigned short>(0)));
+
+  for (int k_base = 0; k_base < K; k_base += BK_VAL) {
+    // ---- 1. Muat Aktivasi A (identik dengan jalur 1-bit) ----
+    constexpr int TOTAL_VEC_A = (BM_VAL * BK_VAL) / 8;
+    for (int idx = tid; idx < TOTAL_VEC_A; idx += nthreads) {
+      int r = idx / (BK_VAL / 8);
+      int c = (idx % (BK_VAL / 8)) * 8;
+      int gm = block_m + r;
+      int gk = k_base + c;
+
+      uint4 u = make_uint4(0, 0, 0, 0);
+      if (gm < M && gk < K) {
+        if (gk + 8 <= K && (reinterpret_cast<uintptr_t>(&x[((size_t)ly * M + gm) * K + gk]) % 16 == 0)) {
+          u = *reinterpret_cast<const uint4*>(&x[((size_t)ly * M + gm) * K + gk]);
+        } else {
+          __half tmp[8] = {__ushort_as_half(0), __ushort_as_half(0),
+                           __ushort_as_half(0), __ushort_as_half(0),
+                           __ushort_as_half(0), __ushort_as_half(0),
+                           __ushort_as_half(0), __ushort_as_half(0)};
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            if (gk + e < K) {
+              tmp[e] = x[((size_t)ly * M + gm) * K + gk + e];
+            }
+          }
+          u = *reinterpret_cast<const uint4*>(tmp);
+        }
+      }
+      *reinterpret_cast<uint4*>(&As[r][c]) = u;
+    }
+
+    // ---- 2. Dekuant bobot 2-bit -> Wt ----
+    // 128 thread: r = baris N lokal (0..63), wc = 32 bobot per thread.
+    // 32 bobot = 8 byte = 2 word U32 (16 bobot per word, lane h di bit 2h).
+    {
+      int r  = tid / 2;               // baris N lokal
+      int wc = tid % 2;               // sub-kolom K lokal (0..1)
+      int gn = block_n + r;
+      int gk = k_base + wc * 32;
+
+      unsigned ww[2];
+      ww[0] = 0u;
+      ww[1] = 0u;
+      if (gn < N && gk < K) {
+        const size_t byte_offset = (size_t)gn * (K / 4) + (size_t)(gk / 4);
+        if (byte_offset % 8 == 0 && (gk + 32 <= K)) {
+          const uint2 raw = *reinterpret_cast<const uint2*>(&wbase[byte_offset]);
+          ww[0] = raw.x;
+          ww[1] = raw.y;
+        } else {
+#pragma unroll
+          for (int b = 0; b < 8; ++b) {
+            if (gk + b * 4 < K) {
+              ww[b / 4] |= (static_cast<unsigned>(wbase[byte_offset + b]) & 0xFFu)
+                           << ((b % 4) * 8);
+            }
+          }
+        }
+      }
+
+      // g128: 32 bobot berturut-turut selalu berada dalam SATU grup
+      // (gk kelipatan 32, grup lebar 128) -> satu nilai skala per thread.
+      __half2 s2 = zero2;
+      if (gn < N && gk < K) {
+        __half s_val = *reinterpret_cast<const __half*>(
+            &sbase[(size_t)gn * scale_stride + gk / 128]);
+        s2 = __half2half2(s_val);
+      }
+
+#pragma unroll
+      for (int wi = 0; wi < 2; ++wi) {          // 2 word U32 = 32 bobot
+        const unsigned word = ww[wi];
+#pragma unroll
+        for (int p = 0; p < 8; ++p) {           // 8 pasangan per word
+          const int k_offset = wc * 32 + wi * 16 + 2 * p;
+          const int gk_cur = k_base + k_offset;
+          __half2 h = zero2;
+          if (gn < N && (gk_cur + 1) < K) {
+            const unsigned q0 = (word >> (4 * p)) & 3u;
+            const unsigned q1 = (word >> (4 * p + 2)) & 3u;
+            h = qmm_b2_expand2(q0, q1, s2);
+          }
+          Wt[k_offset][r] = h.x;
+          Wt[k_offset + 1][r] = h.y;
+        }
+      }
+    }
+    __syncthreads();
+
+    // ---- 3. Komputasi sub-tile warp WMMA ----
+#pragma unroll
+    for (int sl = 0; sl < BK_VAL / 16; ++sl) {
+      const int kk = sl * 16;
+#pragma unroll
+      for (int i = 0; i < WARP_M_TILES; ++i)
+        nvcuda::wmma::load_matrix_sync(fa[i], &As[wm + 16 * i][kk], BK_VAL + PAD);
+#pragma unroll
+      for (int j = 0; j < WARP_N_TILES; ++j)
+        nvcuda::wmma::load_matrix_sync(fb[j], &Wt[kk][wn + 16 * j], BN_VAL + PAD);
+#pragma unroll
+      for (int i = 0; i < WARP_M_TILES; ++i)
+#pragma unroll
+        for (int j = 0; j < WARP_N_TILES; ++j)
+          // Lewati ubin 16 baris yang seluruhnya bantalan.
+          if (wm + 16 * i < rows_here)
+            nvcuda::wmma::mma_sync(acc[i][j], fa[i], fb[j], acc[i][j]);
+    }
+
+    __syncthreads();
+  }
+
+  // ---- 4. Epilog: tulis dengan stride baris N_total ----
+  const int lane = tid % 32;
+#pragma unroll
+  for (int i = 0; i < WARP_M_TILES; ++i)
+#pragma unroll
+    for (int j = 0; j < WARP_N_TILES; ++j) {
+      nvcuda::wmma::store_matrix_sync(&Csc[wid][0][0], acc[i][j], 16, nvcuda::wmma::mem_row_major);
+      for (int idx = lane; idx < 128; idx += 32) {
+        int r = idx / 8;
+        int c = (idx % 8) * 2;
+        int gm = block_m + wm + 16 * i + r;
+        int gn = block_n + wn + 16 * j + c;
+        if (gm < M && gn < N) {
+          size_t out_idx = ((size_t)ly * M + gm) * N_total + gn;
+          if (gn + 1 < N && (out_idx % 2 == 0)) {
+            __half2 v = __halves2half2(
+                static_cast<__half>(Csc[wid][r][c]),
+                static_cast<__half>(Csc[wid][r][c + 1]));
+            *reinterpret_cast<__half2*>(&y[out_idx]) = v;
+          } else {
+            y[out_idx] = static_cast<T>(Csc[wid][r][c]);
+            if (gn + 1 < N) {
+              y[out_idx + 1] = static_cast<T>(Csc[wid][r][c + 1]);
+            }
+          }
+        }
+      }
+    }
+}
+
+} // namespace bonsai::sm75::wmma_b2
+
+// ============================================================================
+// Prefill batched 2-bit ternary — INT8 tensor core (W2A8), jalur TAMBAHAN.
+//
+// Motivasi: T4 mempunyai 130 TOPS INT8 vs 65 TFLOPS FP16 di tensor core.
+// Jalur wmma_b2 (WMMA fp16) sudah terverifikasi numerik (lihat
+// CATATAN_IMPLEMENTASI_BONSAI2.md §12g) dan TETAK UTUH di sini — kernel ini
+// adalah jalur terpisah (namespace imma_b2) yang diaktifkan opt-in dari sisi
+// Mojo. Bila simbol tak ada atau launcher mengembalikan != 0, pemanggil
+// jatuh ke jalur wmma_b2 yang lama, lalu ke loop per-token.
+//
+// Skema (sama seperti ggml mmq untuk PQ2_0, dirujuk di
+// references/llama.cpp-prism): bobot dikodekan sebagai int8 {-1,0,+1}
+// (q ∈ {0,1,2} -> q-1) dan aktivasi dikuantisasi ke int8 [-127,127] secara
+// in-kernel. Akumulasi int32 dijalankan di tensor core int8; skala fp16
+// (s_w per grup-128 bobot, s_x per baris-per-chunk aktivasi) baru dikalikan
+// SESUDAH chunk selesai — menghindari __hmul2 per bobot yang menjadi biaya
+// dominan di jalur fp16.
+//
+// Layout register mma.sync m8n8k16 (Turing), sesuai mma.cuh:920-940 dan
+// tile<8,4,int>::get_i/get_j referensi:
+//   A .row 8x16 int8 : thread lane memegang (baris=lane/4, kolom=4*(lane%4)+e)
+//   B .col  16x8 int8 : thread lane memegang (kolom=lane/4, baris=4*(lane%4)+e)
+//   D 8x8 s32        : thread lane memegang (baris=lane/4, kolom=2*(lane%4)+{0,1})
+// Komposisi 2x m8n8k16 -> m16n8k16: A.x[0]=baris 0..7, A.x[1]=baris 8..15,
+// D.x[0..1]=baris 0..7, D.x[2..3]=baris 8..15.
+//
+// Karena A=bobot dan B=aktivasi, SMEM disusun [n][k] untuk bobot dan [m][k]
+// untuk aktivasi — KEDUA operand ter-load lewat int* 4-byte sejajar murni,
+// tanpa ldmatrix dan tanpa transpose.
+// ============================================================================
+namespace bonsai::sm75::imma_b2 {
+
+constexpr int QMM_B2_BN = 64;   // extent N per blok (baris bobot)
+constexpr int QMM_B2_BM = 64;   // extent M per blok (baris aktivasi)
+constexpr int QMM_B2_BK = 64;   // chunk K (selalu kelipatan 16 untuk mma k=16)
+
+// 16 kode 2-bit (1 word U32) -> 16 byte int8 {-1, 0, +1}.
+//   q=0 -> 0xFF (-1); q=1 -> 0x00 (0); q=2 -> 0x01 (+1); q=3 -> 0x00.
+// Nibble ke-i selector memilih byte ke-i dari TAB lewat __byte_perm:
+//   selector genap : word & 0x33333333          -> nibble i = q_{2i}
+//   selector ganjil: (word >> 2) & 0x33333333   -> nibble i = q_{2i+1}
+// Interleave genap/ganjil memakai 0x5140 / 0x7362 (konstanta yang sama
+// dipakai referensi ggml mmq-load-tiles PQ2_0).
+__device__ __forceinline__ void qmm_b2_s8_expand_word(unsigned word, unsigned out[4]) {
+    // TAB = bytes {0xFF, 0x00, 0x01, 0x02} = 0x020100FF (little-endian).
+    // Isinya harus IDENTIK dengan tabel fp16 qmm_b2_half_bits() di atas,
+    // karena jalur fp16 sudah terbukti bit-exact terhadap referensi per-token:
+    //   q=0 -> byte0 = 0xFF (-1); q=1 -> byte1 = 0x00 (0);
+    //   q=2 -> byte2 = 0x01 (+1); q=3 -> byte3 = 0x02 (+2, dari rumus q-1;
+    //   kode ini tak terpakai, hanya untuk melengkapi tabel).
+    // Hati-hati: 0x010000FF adalah bytes {FF,00,00,01} — salah, memetakan
+    // q=2 -> 0 dan q=3 -> +1 (pernah tertangkap uji PRMT host-side).
+    const unsigned TAB = 0x020100FFu;
+    const unsigned pe0 = __byte_perm(TAB, TAB,  word        & 0x33333333u);
+    const unsigned po0 = __byte_perm(TAB, TAB, (word >>  2) & 0x33333333u);
+    const unsigned pe1 = __byte_perm(TAB, TAB, (word >> 16) & 0x33333333u);
+    const unsigned po1 = __byte_perm(TAB, TAB, (word >> 18) & 0x33333333u);
+    out[0] = __byte_perm(pe0, po0, 0x5140u);   // q0..q3
+    out[1] = __byte_perm(pe0, po0, 0x7362u);   // q4..q7
+    out[2] = __byte_perm(pe1, po1, 0x5140u);   // q8..q11
+    out[3] = __byte_perm(pe1, po1, 0x7362u);   // q12..q15
+}
+
+// D = A @ B + D untuk ubin logis m16n8k16 int8 (2x m8n8k16 di Turing).
+__device__ __forceinline__ void mma_m16n8k16_s8(int d[4], int a0, int a1, int b) {
+    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%0, %1};"
+        : "+r"(d[0]), "+r"(d[1]) : "r"(a0), "r"(b));
+    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%0, %1};"
+        : "+r"(d[2]), "+r"(d[3]) : "r"(a1), "r"(b));
+}
+
+__global__ void qmm_sm75_b2_int8_kernel(
+    const __half* __restrict__ x,          // [L, M, K]
+    const uint8_t* __restrict__ w,         // [n, K/4] uint8 (2-bit packed)
+    const __half* __restrict__ scales,     // [n, K/128] __half
+    __half* __restrict__ y,                // [L, M, N_total]
+    int M, int N, int N_total, int K, int L,
+    bool broadcast_w) {
+  const int block_n = blockIdx.x * QMM_B2_BN;
+  const int block_m = blockIdx.y * QMM_B2_BM;
+  const int ly = blockIdx.z;
+  const int tid = threadIdx.x;
+
+  // PAD int8 = 16 supaya stride (64+16=80) kelipatan 16 -> simpanan uint4
+  // ke Wq/Xq sejajar, sekaligus nol konflik bank pada int-load mma
+  // (bank = (20*baris + kolom_int) % 32, 8 nilai baris terpencar merata).
+  constexpr int PAD8 = 16;
+  // __align__(16) wajib: simpanan uint4 ke Xf/Xq/Wq butuh alamat 16-byte
+  // sejajar, dan nvcc hanya menjamin alignment natural (1 byte) untuk array
+  // int8_t tanpa atribut ini.
+  __shared__ __align__(16) __half Xf[QMM_B2_BM][QMM_B2_BK + 8];  // staging aktivasi fp16
+  __shared__ __align__(16) int8_t Xq[QMM_B2_BM][QMM_B2_BK + PAD8]; // aktivasi int8 [m][k]
+  __shared__ __align__(16) int8_t Wq[QMM_B2_BN][QMM_B2_BK + PAD8]; // bobot int8 {-1,0,1} [n][k]
+  __shared__ __half sw_smem[QMM_B2_BN];               // s_w per baris N (per chunk)
+  __shared__ float  sx_scale[QMM_B2_BM];              // max|x|/127 per baris M (per chunk)
+  __shared__ float  Csc[4][8][16];                    // staging epilog per warp [m][n]
+
+  const uint8_t* wbase =
+      w + (broadcast_w ? 0 : (size_t)ly * N * (K / 4));
+  const size_t scale_stride = (K + 127) / 128;
+  const __half* sbase =
+      scales + (broadcast_w ? 0 : (size_t)ly * N * scale_stride);
+
+  const int rows_left = M - block_m;
+  const int rows_here = (rows_left < QMM_B2_BM) ? rows_left : QMM_B2_BM;
+
+  const int wid = tid / 32;
+  const int lane = tid % 32;
+  // 4 warp disusun 2x2: kelompok baris M = wid/2, kelompok kolom N = wid%2.
+  const int wm = (wid / 2) * 32;        // base M warp
+  const int wn = (wid % 2) * 32;        // base N warp
+  constexpr int WARP_M_TILES = 4;       // 4 ubin 8-baris-M
+  constexpr int WARP_N_TILES = 2;       // 2 ubin 16-baris-N
+
+  float acc[WARP_M_TILES][WARP_N_TILES][4];
+#pragma unroll
+  for (int i = 0; i < WARP_M_TILES; ++i)
+#pragma unroll
+    for (int j = 0; j < WARP_N_TILES; ++j)
+#pragma unroll
+      for (int l = 0; l < 4; ++l)
+        acc[i][j][l] = 0.0f;
+
+  for (int k_base = 0; k_base < K; k_base += QMM_B2_BK) {
+    // ---- 1. Muat aktivasi fp16 global -> Xf (sama persis dengan wmma_b2) ----
+    {
+      constexpr int TOTAL_VEC_A = (QMM_B2_BM * QMM_B2_BK) / 8;
+      for (int idx = tid; idx < TOTAL_VEC_A; idx += blockDim.x) {
+        int r = idx / (QMM_B2_BK / 8);
+        int c = (idx % (QMM_B2_BK / 8)) * 8;
+        int gm = block_m + r;
+        int gk = k_base + c;
+
+        uint4 u = make_uint4(0, 0, 0, 0);
+        if (gm < M && gk < K) {
+          if (gk + 8 <= K &&
+              (reinterpret_cast<uintptr_t>(&x[((size_t)ly * M + gm) * K + gk]) % 16 == 0)) {
+            u = *reinterpret_cast<const uint4*>(&x[((size_t)ly * M + gm) * K + gk]);
+          } else {
+            __half tmp[8] = {__ushort_as_half(0), __ushort_as_half(0),
+                             __ushort_as_half(0), __ushort_as_half(0),
+                             __ushort_as_half(0), __ushort_as_half(0),
+                             __ushort_as_half(0), __ushort_as_half(0)};
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+              if (gk + e < K) {
+                tmp[e] = x[((size_t)ly * M + gm) * K + gk + e];
+              }
+            }
+            u = *reinterpret_cast<const uint4*>(tmp);
+          }
+        }
+        *reinterpret_cast<uint4*>(&Xf[r][c]) = u;
+      }
+    }
+    __syncthreads();
+
+    // ---- 2. Kuantisasi aktivasi -> Xq + sx_inv ----
+    // Thread tid memegang 32 fp16 dari baris M lokal (tid/2), grup kolom
+    // (tid%2): [grp*32, grp*32+32). Pasangan (tid, tid^1) menutupi satu
+    // baris penuh (64 kolom) dan berada di warp yang sama, sehingga max
+    // per baris cukup satu __shfl_sync (tanpa SMEM dan tanpa sync extra).
+    {
+      const int row = tid / 2;
+      const int grp = tid % 2;
+      const int c0 = grp * 32;
+
+      float mymax = 0.0f;
+      const uint4* p = reinterpret_cast<const uint4*>(&Xf[row][c0]);
+#pragma unroll
+      for (int g = 0; g < 4; ++g) {
+        __half h[8];
+        *reinterpret_cast<uint4*>(h) = p[g];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const float av = fabsf(__half2float(h[e]));
+          if (av > mymax) mymax = av;
+        }
+      }
+      const float other =
+          __shfl_sync(0xFFFFFFFFu, mymax, (tid & 31) ^ 1);
+      const float maxabs = (mymax > other) ? mymax : other;
+      const float inv = (maxabs > 0.0f) ? (127.0f / maxabs) : 0.0f;
+      // sx_scale = maxabs/127 = KEBAALIKAN dari inv: inilah yang dikalikan
+      // ke acc_int di langkah 5 (x ≈ xq * sx_scale). Menyimpan inv di sini
+      // adalah bug pernah terjadi — gunakan register lokal inv untuk
+      // kuantisasi, dan sx_scale untuk penerapan skala.
+      if ((tid & 1) == 0)
+        sx_scale[row] = (maxabs > 0.0f) ? (maxabs * (1.0f / 127.0f)) : 0.0f;
+
+      // Tulis ulang dari SMEM lalu kuantisasi (register fp16 hanya 8 hidup
+      // sekaligus, supaya tekanan register tetap rendah).
+      // Satu thread memegang 32 nilai = 32 byte int8 = 8 unsigned = 2x uint4.
+      // JANGAN memadatkan 8 nilai ke satu `unsigned` (4 byte): geseran e*8
+      // untuk e>=4 adalah perilaku tak terdefinisi, dan separuh aktivasi
+      // hilang. Ini pernah menjadi bug nyata — gejalanya seluruh logit runtuh
+      // (gap top-2 menyusut 19x) sambil kernel tampak lebih cepat, sebab
+      // separuh simpanan memang dilewati.
+      // c0 = grp*32 menentukan KE MANA data ditulis, bukan indeks di packed:
+      // byte ke-j (0..31) selalu masuk packed[j/4] pada posisi (j%4)*8.
+      unsigned packed[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+#pragma unroll
+      for (int g = 0; g < 4; ++g) {
+        __half h[8];
+        *reinterpret_cast<uint4*>(h) = p[g];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          int qv = __float2int_rn(__half2float(h[e]) * inv);
+          if (qv > 127) qv = 127;
+          if (qv < -127) qv = -127;
+          const int j = g * 8 + e;                 // indeks byte 0..31
+          packed[j / 4] |=
+              (static_cast<unsigned>(qv) & 0xFFu) << ((j % 4) * 8);
+        }
+      }
+      *reinterpret_cast<uint4*>(&Xq[row][c0]) =
+          make_uint4(packed[0], packed[1], packed[2], packed[3]);
+      *reinterpret_cast<uint4*>(&Xq[row][c0 + 16]) =
+          make_uint4(packed[4], packed[5], packed[6], packed[7]);
+    }
+
+    // ---- 3. Dekuant bobot 2-bit -> Wq (int8 {-1,0,+1}) + stage s_w ----
+    // Catatan: q=0 adalah kode SAH yang berarti -1, jadi baris di luar N
+    // (gn >= N) HARUS ditulis nol eksplisit, bukan ekspansi word=0.
+    {
+      const int row = tid / 2;          // baris N lokal
+      const int grp = tid % 2;          // sub-kolom K lokal
+      const int gn = block_n + row;
+      const int gk = k_base + grp * 32;
+      const int g128 = k_base / 128;
+
+      __half sval = __ushort_as_half(0);
+      unsigned ww[2] = {0u, 0u};
+      if (gn < N && gk < K) {
+        sval = sbase[(size_t)gn * scale_stride + g128];
+        const size_t byte_offset = (size_t)gn * (K / 4) + (size_t)(gk / 4);
+        if (byte_offset % 8 == 0 && (gk + 32 <= K)) {
+          const uint2 raw = *reinterpret_cast<const uint2*>(&wbase[byte_offset]);
+          ww[0] = raw.x;
+          ww[1] = raw.y;
+        } else {
+#pragma unroll
+          for (int b = 0; b < 8; ++b) {
+            if (gk + b * 4 < K) {
+              ww[b / 4] |= (static_cast<unsigned>(wbase[byte_offset + b]) & 0xFFu)
+                           << ((b % 4) * 8);
+            }
+          }
+        }
+      }
+      sw_smem[row] = sval;
+
+      unsigned o0[4];
+      unsigned o1[4];
+      qmm_b2_s8_expand_word(ww[0], o0);   // kode k-lokal 0..15
+      qmm_b2_s8_expand_word(ww[1], o1);   // kode k-lokal 16..31
+      if (gn < N) {
+        *reinterpret_cast<uint4*>(&Wq[row][grp * 32 + 0]) =
+            make_uint4(o0[0], o0[1], o0[2], o0[3]);
+        *reinterpret_cast<uint4*>(&Wq[row][grp * 32 + 16]) =
+            make_uint4(o1[0], o1[1], o1[2], o1[3]);
+      } else {
+        *reinterpret_cast<uint4*>(&Wq[row][grp * 32 + 0]) = make_uint4(0, 0, 0, 0);
+        *reinterpret_cast<uint4*>(&Wq[row][grp * 32 + 16]) = make_uint4(0, 0, 0, 0);
+      }
+    }
+    __syncthreads();
+
+    // ---- 4. Komputasi int8 MMA ----
+    // Setiap warp menutupi 32 baris N (2 ubin 16) x 32 baris M (4 ubin 8).
+    // acc int32 d hidup sepanjang chunk (4 sub-langkah k=16); skala fp16
+    // diterapkan di langkah 5.
+    const int g = lane / 4;
+    const int c = lane % 4;
+    int d[WARP_M_TILES][WARP_N_TILES][4];
+#pragma unroll
+    for (int i = 0; i < WARP_M_TILES; ++i)
+#pragma unroll
+      for (int j = 0; j < WARP_N_TILES; ++j)
+#pragma unroll
+        for (int l = 0; l < 4; ++l)
+          d[i][j][l] = 0;
+
+#pragma unroll
+    for (int sl = 0; sl < QMM_B2_BK / 16; ++sl) {
+      const int k = sl * 16;
+#pragma unroll
+      for (int j = 0; j < WARP_N_TILES; ++j) {
+        const int wn_t = wn + 16 * j;
+        const int a0 = *reinterpret_cast<const int*>(&Wq[wn_t + g][k + 4 * c]);
+        const int a1 = *reinterpret_cast<const int*>(&Wq[wn_t + 8 + g][k + 4 * c]);
+#pragma unroll
+        for (int i = 0; i < WARP_M_TILES; ++i) {
+          const int wm_t = wm + 8 * i;
+          const int b = *reinterpret_cast<const int*>(&Xq[wm_t + g][k + 4 * c]);
+          // Lewati ubin 8-baris-M yang seluruhnya di luar M efektif.
+          if (wm_t < rows_here)
+            mma_m16n8k16_s8(d[i][j], a0, a1, b);
+        }
+      }
+    }
+
+    // ---- 5. Akumulasi ter-skala: acc_fp += s_w * s_x * acc_int ----
+    // Elemen l=0..3 di ubin (i,j): (n=wn_t+g, m=wm_t+2c), (n=wn_t+g,
+    // m=wm_t+2c+1), (n=wn_t+8+g, m=wm_t+2c), (n=wn_t+8+g, m=wm_t+2c+1).
+#pragma unroll
+    for (int j = 0; j < WARP_N_TILES; ++j) {
+      const int wn_t = wn + 16 * j;
+      const float sw0 = __half2float(sw_smem[wn_t + g]);
+      const float sw1 = __half2float(sw_smem[wn_t + 8 + g]);
+#pragma unroll
+      for (int i = 0; i < WARP_M_TILES; ++i) {
+        const int wm_t = wm + 8 * i;
+        const float sx0 = sx_scale[wm_t + 2 * c];
+        const float sx1 = sx_scale[wm_t + 2 * c + 1];
+        acc[i][j][0] += (sw0 * sx0) * static_cast<float>(d[i][j][0]);
+        acc[i][j][1] += (sw0 * sx1) * static_cast<float>(d[i][j][1]);
+        acc[i][j][2] += (sw1 * sx0) * static_cast<float>(d[i][j][2]);
+        acc[i][j][3] += (sw1 * sx1) * static_cast<float>(d[i][j][3]);
+      }
+    }
+
+    __syncthreads();   // sebelum chunk berikutnya menimpa Xf/Wq/Xq
+  }
+
+  // ---- 6. Epilog: acc -> Csc[wid][m][n] -> y ----
+  // Csc diberi indeks [m][n] (8x16) supaya pola baca epilog bebas konflik
+  // bank: bank = (16*m + n) % 32 terpencar merata untuk lane 0..31.
+  const int g = lane / 4;
+  const int c = lane % 4;
+#pragma unroll
+  for (int j = 0; j < WARP_N_TILES; ++j) {
+    const int wn_t = wn + 16 * j;
+#pragma unroll
+    for (int i = 0; i < WARP_M_TILES; ++i) {
+      const int wm_t = wm + 8 * i;
+      Csc[wid][2 * c]    [g]     = acc[i][j][0];
+      Csc[wid][2 * c + 1][g]     = acc[i][j][1];
+      Csc[wid][2 * c]    [g + 8] = acc[i][j][2];
+      Csc[wid][2 * c + 1][g + 8] = acc[i][j][3];
+      __syncwarp();
+
+      // 64 pasangan (8 baris M x 8 pasang kolom N) per ubin.
+      for (int idx = lane; idx < 64; idx += 32) {
+        const int m_local = idx / 8;
+        const int npair = idx % 8;
+        const int gn = block_n + wn_t + 2 * npair;
+        const int gm = block_m + wm_t + m_local;
+        const float v0 = Csc[wid][m_local][2 * npair];
+        const float v1 = Csc[wid][m_local][2 * npair + 1];
+        if (gm < M && gn < N) {
+          const size_t out_idx = ((size_t)ly * M + gm) * N_total + gn;
+          if (gn + 1 < N && (out_idx % 2 == 0)) {
+            const __half2 v = __halves2half2(
+                static_cast<__half>(v0), static_cast<__half>(v1));
+            *reinterpret_cast<__half2*>(&y[out_idx]) = v;
+          } else {
+            y[out_idx] = static_cast<__half>(v0);
+            if (gn + 1 < N) {
+              y[out_idx + 1] = static_cast<__half>(v1);
+            }
+          }
+        }
+      }
+      __syncwarp();
+    }
+  }
+}
+
+} // namespace bonsai::sm75::imma_b2
+
+// ============================================================================
 // GDN SEQUENCE FUSED (tiru struktur prefill MLX fork gdn_step_kernel.cuh):
 // SELURUH sekuens T token diproses dalam SATU launch, state S hidup di
 // register (nol round-trip VRAM per token). Gating math replika 1:1 dari
@@ -2731,6 +3347,614 @@ __global__ void cal_procrustes_ns_kernel(
 
 
 // ============================================================================
+// Bonsai-2 (Ternary-Bonsai-2-27B, Qwen3.8): pack 2-bit ternary g128 + Hadamard.
+//
+// Kontrak pack MLX prism_hadamard_qwen35 (diverifikasi numerik terhadap
+// runtime/ codec.py + runtime.py referensi prism-ml/Ternary-Bonsai-2-27B-mlx-2bit):
+//   - bobot   : U32 [N, K/16], 16 bobot per word little-endian, lane i di bit 2i
+//   - scales  : F16 [N, K/128]  (s_ckpt MENTAH, TIDAK dibagi 2)
+//   - biases  : F16 [N, K/128]  == -scales persis
+//   - dequant : w = q*s + b = q*s - s = (q - 1) * s,  q di {0,1,2} -> w di {-s,0,+s}
+//     (berbeda dari 1-bit: di sana b = -s_ckpt/2 sehingga kernel memakai
+//      (2q-1)*(s_ckpt/2); di sini TIDAK ada pembagian 2.)
+//   - signs   : F32 [K] berisi ±1 (satu vektor per lebar input K: 5120/6144/17408)
+//   - rotasi  : blockwise Hadamard blok 1024 "normalized-sylvester-walsh-hadamard"
+//     difold ke bobot offline; runtime menerapkan transformasi cocok ke
+//     AKTIVASI sebelum tiap proyeksi terfold, dan inverse ke baris embedding.
+//
+// Identitas terverifikasi: (H @ (s*x))^T @ (H @ W) == x^T @ (s*W) karena
+// H^T H = I dan H simetrik — inilah mengapa bobot terfold bekerja tanpa
+// menyimpan bobot yang sudah "dibuka".
+// ============================================================================
+
+namespace bonsai::sm75::q2t {
+
+// ----------------------------------------------------------------------------
+// Kernel GEMV decode 2-bit ternary (M kecil / per-token), W2A16 g128.
+// y[L,M,N] = x[L,M,K] @ w[N,K/4]^T ;  w_eff = (q-1)*s
+// Struktur meniru qmv_vec_nib_q1o_kernel (256 thread, 32 baris/block,
+// 8 lane per baris, tile K=1024 = 8 grup di SMEM) tetapi dot product
+// dikerjakan langsung tanpa LUT nibble (3 nilai per kode tidak muat di
+// tabel 16 entri). lanes_per_row = 8 -> tiap lane menangani 1 grup per tile.
+// ----------------------------------------------------------------------------
+template <typename T>
+__global__ void qmv_vec_q2t_kernel(
+    const T* __restrict__ x,           // [L, K] (M=1; L=batch)
+    const uint8_t* __restrict__ w,     // [L*N, K/4] uint8 (2-bit packed)
+    const T* __restrict__ scales,      // [L*N, K/128] __half (s_ckpt mentah)
+    T* __restrict__ out,
+    float* __restrict__ ws,            // nullptr => tulis langsung ke out
+    int slice_idx,
+    int m, int n, int k, int l,
+    bool broadcast_w,
+    int g_begin,
+    int g_count
+) {
+    constexpr int GS      = 8;                     // grup per tile K
+    constexpr int LPR     = 8;                     // lane per baris output
+    constexpr int RPW     = 32 / LPR;              // 4 baris per warp
+    constexpr int RPB     = 32;                    // baris per block
+    constexpr int GRP_PAD = 128 + 4;               // 132 (anti bank-conflict)
+    constexpr int K_TILE  = GS * 128;              // 1024
+
+    __shared__ __align__(16) float x_s[GS * GRP_PAD];
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int r    = lane / LPR;   // baris output warp (0..3)
+    const int grp  = lane % LPR;   // grup dalam tile (0..7)
+
+    const int row     = static_cast<int>(blockIdx.x) * RPB + warp * RPW + r;
+    const int l_idx   = static_cast<int>(blockIdx.z);
+    const int w_batch = broadcast_w ? 0 : l_idx;
+
+    const int64_t  row_base = static_cast<int64_t>(row) + static_cast<int64_t>(n) * w_batch;
+    const uint8_t* w_row    = w + row_base * (k / 4);   // 2-bit: K/4 byte per baris
+
+    const int  groups_per_row = k / 128;
+    const bool row_valid      = row < n;
+
+    const int64_t out_batch = static_cast<int64_t>(l_idx) * m * n;
+    const int64_t ws_batch  = (ws != nullptr)
+        ? static_cast<int64_t>(slice_idx) * l * m * n + static_cast<int64_t>(l_idx) * m * n
+        : 0;
+
+    float acc = 0.0f;
+    int   g0  = g_begin;
+    const int g_end = g_begin + g_count;
+
+    while (g0 < g_end) {
+        // ---- 1. Stage tile x (1024 elemen = 8 grup) ke SMEM ----
+        const int kc = g0 * 128;
+        for (int e = tid * 8; e < K_TILE; e += QMV_LUT_BLOCK_THREADS * 8) {
+            const int gi  = e / 128;
+            const int off = e % 128;
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (e + kc < k) {
+                v = *reinterpret_cast<const uint4*>(
+                    x + static_cast<int64_t>(l_idx) * k + kc + e);
+            }
+            qmv_vec_unpack8<T>(v, &x_s[gi * GRP_PAD + off]);   // helper yg sama
+        }
+        __syncthreads(); // x_s siap
+
+        // ---- 2. Dot product grup (g0 + grp): 32 byte = 128 bobot ternary ----
+        const int gg = g0 + grp;
+        if (row_valid && gg < g_end && gg < groups_per_row) {
+            const float s_val = QmvTraits<T>::to_float(
+                scales[row_base * groups_per_row + gg]);
+
+            const float* xg = &x_s[grp * GRP_PAD];
+            // 32 byte bobot = 2x uint4 (16 byte). g128 => k%128==0 => k/4
+            // kelipatan 32 => selalu 16-byte aligned (lihat pengecekan launcher).
+            const uint4* wptr = reinterpret_cast<const uint4*>(
+                w_row + static_cast<int64_t>(gg) * 32);
+            const uint4 wvec[2] = { wptr[0], wptr[1] };
+
+            float local = 0.0f;
+            #pragma unroll
+            for (int half = 0; half < 2; ++half) {        // 2x16 byte
+                const unsigned* ww = reinterpret_cast<const unsigned*>(&wvec[half]);
+                #pragma unroll
+                for (int wi = 0; wi < 4; ++wi) {          // 4 word U32 = 64 bobot
+                    const unsigned word = ww[wi];
+                    #pragma unroll
+                    for (int h = 0; h < 16; ++h) {        // lane i di bit 2i
+                        const int q = static_cast<int>((word >> (2 * h)) & 3u);
+                        // w_eff = (q-1)*s; kumpulkan (q-1)*x, kalikan s di akhir
+                        local += static_cast<float>(q - 1) * xg[half * 64 + wi * 16 + h];
+                    }
+                }
+            }
+            acc += s_val * local;
+        }
+
+        g0 += GS;
+        __syncthreads(); // sebelum x_s ditimpa tile berikutnya
+    }
+
+    // ---- 3. Reduksi per-warp (8 lane) ----
+    float v = acc;
+    #pragma unroll
+    for (int off = LPR / 2; off > 0; off >>= 1) {
+        v += __shfl_down_sync(0xffffffffu, v, off, LPR);
+    }
+
+    const int64_t flat_base = (ws != nullptr ? ws_batch : out_batch);
+    if (row_valid && grp == 0) {
+        if (ws != nullptr) {
+            ws[flat_base + static_cast<int64_t>(row)] = v;
+        } else {
+            out[flat_base + static_cast<int64_t>(row)] = QmvTraits<T>::from_float(v);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// GEMV decode 2-bit — JALUR CEPAT: ekspansi PRMT + HFMA2 (half2).
+//
+// =============== MENGAPA KERNEL INI ADA (diukur, bukan dugaan) ==============
+// qmv_vec_q2t_kernel di atas mengekstrak TIAP kode dengan
+//     q = (word >> 2h) & 3 ;  local += float(q-1) * x[h]
+// yaitu ~6 instruksi skalar per bobot (SHR, LOP3, IADD, I2F, FFMA, LDS),
+// semuanya di pipe FP32/INT. Pengukuran nvprof (lihat
+// kaggle_2bit_test/run_infer_2bit.py langkah 7) menunjukkan GEMV decode
+// menyerap ~58 ms dari 70,45 ms/token (~82%), jadi inilah biaya dominan
+// decode — dan tiap instruksi per bobot terasa.
+//
+// =============== YANG DIGANTI ==============================================
+// 1. PRMT mengembangkan 16 kode jadi 8 half2 — 1 PRMT per bobot, bukan 6
+//    instruksi. Polanya identik dengan qmm_b2_half_bits()/TAB di jalur fp16
+//    dan int8 yang sudah terbukti bit-exact.
+// 2. HFMA2 menjalankan 2 perkalian per instruksi di pipe FP16 (T4: 65 TFLOPS
+//    vs 8,1 TFLOPS FP32) — I2F hilang sama sekali.
+// Hasilnya ~2,5 instruksi per bobot, turun dari ~6.
+//
+// =============== NUMERIK ===================================================
+// Akumulator half2 dibuang ke FP32 tiap 8 bobot. FP16 hanya 11 bit mantisa:
+// menumpuk 128 penjumlahan di FP16 akan menggandakan galat dibanding
+// pembulatan keluaran FP16 itu sendiri, sedangkan tiap 8 bobot galatnya
+// jauh di bawah satu ULP keluaran.
+// Bobotnya {-1, 0, +1} eksak di FP16, x sudah FP16 -> perkalian HFMA2 TIDAK
+// menambah galat; hanya penjumlahannya yang dibulatkan.
+//
+// =============== PERANGKAP YANG SUDAH TERCATAT =============================
+// * q=0 adalah kode SAH (bobot -1), BUKAN "tidak ada bobot". Baris di luar
+//   rentang tetap dijaga oleh row_valid, jangan pernah mengandaikan word=0
+//   berarti nol.
+// * Byte rendah tiap half selalu 0x00 (karena -1/0/+1/+2 eksak: 0xBC00,
+//   0x0000, 0x3C00, 0x4000) — itulah sebabnya tabel cukup byte TINGGI-nya
+//   saja dan nol disisipkan lewat PRMT terhadap register nol.
+// * GRP_PAD = 136 half (= 272 B): habis dibagi 8 supaya simpanan uint4 ke
+//   SMEM tetap 16-B aligned, dan 272 B % 4 = 0 supaya baca half2 aligned.
+//   Beda bank antar lane = 68 word -> 8 bank berbeda, bebas konflik.
+// ----------------------------------------------------------------------------
+
+// Tabel byte-tinggi half(q-1), diindeks LANGSUNG oleh q:
+//   q=0 -> 0xBC ; q=1 -> 0x00 ; q=2 -> 0x3C ; q=3 -> 0x40 (+2, tak terpakai).
+// U32 little-endian: byte0 = 0xBC -> 0x403C00BC.
+// Dideklarasi DI DALAM fungsi (bukan di scope namespace) mengikuti pola
+// `TAB` di qmm_b2_s8_expand_word dan `tab_a/tab_b` di qmm_b2_half_bits:
+// konstanta scope-namespace yang dipakai di kode device pernah
+// menghasilkan perilaku tak terduga, sedangkan pola ini sudah terbukti
+// dikompilasi dan bit-exact.
+__device__ __forceinline__ void q2t_expand_word_h2(unsigned word, unsigned out[8]) {
+    const unsigned TAB_H2 = 0x403C00BCu;
+    const unsigned pe0 = __byte_perm(TAB_H2, TAB_H2,  word        & 0x33333333u);
+    const unsigned po0 = __byte_perm(TAB_H2, TAB_H2, (word >>  2) & 0x33333333u);
+    const unsigned pe1 = __byte_perm(TAB_H2, TAB_H2, (word >> 16) & 0x33333333u);
+    const unsigned po1 = __byte_perm(TAB_H2, TAB_H2, (word >> 18) & 0x33333333u);
+    // d0..d3 mengurutkan byte tinggi jadi H(q0),H(q1),H(q2),H(q3), ...
+    const unsigned d0 = __byte_perm(pe0, po0, 0x5140u);
+    const unsigned d1 = __byte_perm(pe0, po0, 0x7362u);
+    const unsigned d2 = __byte_perm(pe1, po1, 0x5140u);
+    const unsigned d3 = __byte_perm(pe1, po1, 0x7362u);
+    // Sisipkan byte nol pada posisi 0 dan 2 -> [0x00, H_genap, 0x00, H_ganjil]
+    // = satu half2 {h(q_genap), h(q_ganjil)}. Pemilih 0x1404 mengambil
+    // (nol, d.b0, nol, d.b1); 0x3424 mengambil (nol, d.b2, nol, d.b3).
+    const unsigned z = 0u;
+    out[0] = __byte_perm(d0, z, 0x1404u);
+    out[1] = __byte_perm(d0, z, 0x3424u);
+    out[2] = __byte_perm(d1, z, 0x1404u);
+    out[3] = __byte_perm(d1, z, 0x3424u);
+    out[4] = __byte_perm(d2, z, 0x1404u);
+    out[5] = __byte_perm(d2, z, 0x3424u);
+    out[6] = __byte_perm(d3, z, 0x1404u);
+    out[7] = __byte_perm(d3, z, 0x3424u);
+}
+
+template <typename T>
+__global__ void qmv_vec_q2t_h2_kernel(
+    const T* __restrict__ x,           // [L, K] (M=1)
+    const uint8_t* __restrict__ w,     // [L*N, K/4] uint8 (2-bit packed)
+    const T* __restrict__ scales,      // [L*N, K/128] __half
+    T* __restrict__ out,
+    float* __restrict__ ws,            // nullptr => tulis langsung ke out
+    int slice_idx,
+    int m, int n, int k, int l,
+    bool broadcast_w,
+    int g_begin,
+    int g_count
+) {
+    constexpr int GS      = 8;                     // grup per tile K
+    constexpr int LPR     = 8;                     // lane per baris output
+    constexpr int RPW     = 32 / LPR;              // 4 baris per warp
+    constexpr int RPB     = 32;                    // baris per block
+    constexpr int GRP_PAD = 136;                   // lihat catatan di atas
+    constexpr int K_TILE  = GS * 128;              // 1024
+
+    __shared__ __align__(16) __half x_s[GS * GRP_PAD];
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int r    = lane / LPR;   // baris output warp (0..3)
+    const int grp  = lane % LPR;   // grup dalam tile (0..7)
+
+    const int row     = static_cast<int>(blockIdx.x) * RPB + (tid >> 5) * RPW + r;
+    const int l_idx   = static_cast<int>(blockIdx.z);
+    const int w_batch = broadcast_w ? 0 : l_idx;
+
+    const int64_t  row_base = static_cast<int64_t>(row) + static_cast<int64_t>(n) * w_batch;
+    const uint8_t* w_row    = w + row_base * (k / 4);   // 2-bit: K/4 byte per baris
+
+    const int  groups_per_row = k / 128;
+    const bool row_valid      = row < n;
+
+    const int64_t out_batch = static_cast<int64_t>(l_idx) * m * n;
+    const int64_t ws_batch  = (ws != nullptr)
+        ? static_cast<int64_t>(slice_idx) * l * m * n + static_cast<int64_t>(l_idx) * m * n
+        : 0;
+
+    const __half hz = __float2half(0.0f);
+
+    float acc = 0.0f;
+    int   g0  = g_begin;
+    const int g_end = g_begin + g_count;
+
+    while (g0 < g_end) {
+        // ---- 1. Stage tile x (1024 half = 8 grup) ke SMEM, MENTAH ----
+        // Tidak ada konversi ke float seperti kernel skalar: x sudah FP16 dan
+        // HFMA2 memakainya langsung.
+        const int kc = g0 * 128;
+        for (int e = tid * 8; e < K_TILE; e += QMV_LUT_BLOCK_THREADS * 8) {
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (e + kc < k) {
+                v = *reinterpret_cast<const uint4*>(
+                    x + static_cast<int64_t>(l_idx) * k + kc + e);
+            }
+            *reinterpret_cast<uint4*>(&x_s[(e / 128) * GRP_PAD + (e % 128)]) = v;
+        }
+        __syncthreads(); // x_s siap
+
+        // ---- 2. Dot product grup (g0 + grp): 32 byte = 128 bobot ternary ----
+        const int gg = g0 + grp;
+        if (row_valid && gg < g_end && gg < groups_per_row) {
+            const float s_val = QmvTraits<T>::to_float(
+                scales[row_base * groups_per_row + gg]);
+
+            const __half2* xg2 = reinterpret_cast<const __half2*>(
+                &x_s[grp * GRP_PAD]);
+            // 32 byte bobot = 2x uint4 (16 byte). g128 => k/4 kelipatan 32.
+            const uint4* wptr = reinterpret_cast<const uint4*>(
+                w_row + static_cast<int64_t>(gg) * 32);
+            const uint4 wvec[2] = { wptr[0], wptr[1] };
+
+            float local = 0.0f;
+            #pragma unroll
+            for (int half = 0; half < 2; ++half) {        // 2x16 byte
+                const unsigned* ww = reinterpret_cast<const unsigned*>(&wvec[half]);
+                #pragma unroll
+                for (int wi = 0; wi < 4; ++wi) {          // 4 word U32 = 64 bobot
+                    unsigned h2[8];
+                    q2t_expand_word_h2(ww[wi], h2);
+                    __half2 a2 = __halves2half2(hz, hz);
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {         // 8 half2 = 16 bobot
+                        a2 = __hfma2(
+                            *reinterpret_cast<const __half2*>(&h2[j]),
+                            xg2[half * 32 + wi * 8 + j],
+                            a2);
+                        if ((j & 3) == 3) {   // buang ke FP32 tiap 8 bobot
+                            local += __low2float(a2) + __high2float(a2);
+                            a2 = __halves2half2(hz, hz);
+                        }
+                    }
+                }
+            }
+            acc += s_val * local;
+        }
+
+        g0 += GS;
+        __syncthreads(); // sebelum x_s ditimpa tile berikutnya
+    }
+
+    // ---- 3. Reduksi per-warp (8 lane) — identik dengan kernel skalar ----
+    float v = acc;
+    #pragma unroll
+    for (int off = LPR / 2; off > 0; off >>= 1) {
+        v += __shfl_down_sync(0xffffffffu, v, off, LPR);
+    }
+
+    const int64_t flat_base = (ws != nullptr ? ws_batch : out_batch);
+    if (row_valid && grp == 0) {
+        if (ws != nullptr) {
+            ws[flat_base + static_cast<int64_t>(row)] = v;
+        } else {
+            out[flat_base + static_cast<int64_t>(row)] = QmvTraits<T>::from_float(v);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// GEMV decode 2-bit — VARIAN "lebar": 2 grup per lane per tile, 4x uint4
+// diterbitkan DULU sebelum satu pun dihitung (64 B in flight per thread,
+// bukan 32 B).
+//
+// Mengapa varian ini diuji: setelah h2, GEMV decode kira-kira mencapai
+// ~145 GB/s (hitungan byte; banding: puncak T4 320 GB/s). Dua penjelasan
+// yang mungkin: (a) DRAM sudah mentok, (b) byte yang melayang terlalu
+// sedikit untuk menutupi latensi memori. Metrik perangkat keras TIDAK
+// tersedia di container ini (ncu exit 1; nvprof --metrics menolak CC>=7.5),
+// jadi satu-satunya cara membedakan (a) dan (b) adalah mengubah (b) dan
+// mengukur ujung-ke-ujung: kalau ini tidak lebih cepat, berarti (a).
+// ============================================================================
+// Dot product 64 bobot (2x uint4 = 32 byte) lawan 32 half2 di SMEM.
+// Dipisah jadi fungsi agar kernel di bawah bisa menerbitkan keempat
+// pemuatan bobot lebih dulu, baru menghitung — urutan itulah intinya.
+__device__ __forceinline__ float q2t_h2_dot64(
+    const uint4 wa, const uint4 wb,
+    const __half2* __restrict__ xg2, const __half hz)
+{
+    const unsigned* w0 = reinterpret_cast<const unsigned*>(&wa);
+    const unsigned* w1 = reinterpret_cast<const unsigned*>(&wb);
+    float local = 0.0f;
+    #pragma unroll
+    for (int t = 0; t < 2; ++t) {                 // 2x16 byte = 64 bobot
+        const unsigned* ww = (t == 0) ? w0 : w1;
+        #pragma unroll
+        for (int wi = 0; wi < 4; ++wi) {          // 4 word U32 = 64 bobot
+            unsigned h2[8];
+            q2t_expand_word_h2(ww[wi], h2);
+            __half2 a2 = __halves2half2(hz, hz);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {         // 8 half2 = 16 bobot
+                a2 = __hfma2(*reinterpret_cast<const __half2*>(&h2[j]),
+                             xg2[t * 32 + wi * 8 + j], a2);
+                if ((j & 3) == 3) {   // buang ke FP32 tiap 8 bobot
+                    local += __low2float(a2) + __high2float(a2);
+                    a2 = __halves2half2(hz, hz);
+                }
+            }
+        }
+    }
+    return local;
+}
+
+template <typename T>
+__global__ void qmv_vec_q2t_h2b_kernel(
+    const T* __restrict__ x,           // [L, K] (M=1)
+    const uint8_t* __restrict__ w,     // [L*N, K/4] uint8 (2-bit packed)
+    const T* __restrict__ scales,      // [L*N, K/128] __half
+    T* __restrict__ out,
+    float* __restrict__ ws,            // nullptr => tulis langsung ke out
+    int slice_idx,
+    int m, int n, int k, int l,
+    bool broadcast_w,
+    int g_begin,
+    int g_count
+) {
+    constexpr int GS      = 16;                    // grup per tile K (2x h2)
+    constexpr int LPR     = 8;                     // lane per baris output
+    constexpr int RPW     = 32 / LPR;              // 4 baris per warp
+    constexpr int RPB     = 32;                    // baris per block
+    constexpr int GRP_PAD = 136;                   // lihat catatan h2
+    constexpr int K_TILE  = GS * 128;              // 2048
+
+    __shared__ __align__(16) __half x_s[GS * GRP_PAD];   // 4352 B
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int r    = lane / LPR;   // baris output warp (0..3)
+    const int grp  = lane % LPR;   // grup dalam tile (0..7)
+
+    const int row     = static_cast<int>(blockIdx.x) * RPB + (tid >> 5) * RPW + r;
+    const int l_idx   = static_cast<int>(blockIdx.z);
+    const int w_batch = broadcast_w ? 0 : l_idx;
+
+    const int  groups_per_row = k / 128;
+    const bool row_valid      = row < n;
+
+    // Baris aman untuk ALAMAT saja (bukan untuk akumulasi): baris di luar
+    // jangkauan dipetakan ke baris 0 supaya keempat pemuatan bobot bisa
+    // diterbitkan TANPA syarat — predikasi pada pemuatan bersyarat
+    // menghalangi compiler mengelompokkan keempatnya.
+    const int64_t row_base_a =
+        static_cast<int64_t>(row_valid ? row : 0) + static_cast<int64_t>(n) * w_batch;
+    const uint8_t* w_row_a = w + row_base_a * (k / 4);
+    const int64_t row_base = static_cast<int64_t>(row) + static_cast<int64_t>(n) * w_batch;
+
+    const int64_t out_batch = static_cast<int64_t>(l_idx) * m * n;
+    const int64_t ws_batch  = (ws != nullptr)
+        ? static_cast<int64_t>(slice_idx) * l * m * n + static_cast<int64_t>(l_idx) * m * n
+        : 0;
+
+    const __half hz = __float2half(0.0f);
+
+    float acc = 0.0f;
+    int   g0  = g_begin;
+    const int g_end = g_begin + g_count;
+
+    while (g0 < g_end) {
+        // ---- 1. Stage tile x (2048 half = 16 grup) ke SMEM, MENTAH ----
+        const int kc = g0 * 128;
+        for (int e = tid * 8; e < K_TILE; e += QMV_LUT_BLOCK_THREADS * 8) {
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (e + kc < k) {
+                v = *reinterpret_cast<const uint4*>(
+                    x + static_cast<int64_t>(l_idx) * k + kc + e);
+            }
+            *reinterpret_cast<uint4*>(&x_s[(e / 128) * GRP_PAD + (e % 128)]) = v;
+        }
+        __syncthreads(); // x_s siap
+
+        // ---- 2. DUA grup per lane: gg0 = g0+grp, gg1 = g0+grp+8 ----
+        const int  gg0 = g0 + grp;
+        const int  gg1 = g0 + grp + LPR;
+        const bool v0  = row_valid && gg0 < g_end && gg0 < groups_per_row;
+        const bool v1  = row_valid && gg1 < g_end && gg1 < groups_per_row;
+
+        // Empat pemuatan 16 byte DITERBITKAN DULU semuanya (64 B in flight).
+        // Alamat dijepit ke grup 0 bila di luar jangkauan, jadi selalu sah.
+        const uint4* pA = reinterpret_cast<const uint4*>(
+            w_row_a + static_cast<int64_t>(gg0 < groups_per_row ? gg0 : 0) * 32);
+        const uint4* pB = reinterpret_cast<const uint4*>(
+            w_row_a + static_cast<int64_t>(gg1 < groups_per_row ? gg1 : 0) * 32);
+        const uint4 wa0 = pA[0];
+        const uint4 wa1 = pA[1];
+        const uint4 wb0 = pB[0];
+        const uint4 wb1 = pB[1];
+
+        // ---- 3. Baru hitung. x grup gg ada di x_s[(gg-g0)*GRP_PAD]. ----
+        if (v0) {
+            const float s0 = QmvTraits<T>::to_float(
+                scales[row_base * groups_per_row + gg0]);
+            acc += s0 * q2t_h2_dot64(
+                wa0, wa1, reinterpret_cast<const __half2*>(&x_s[grp * GRP_PAD]), hz);
+        }
+        if (v1) {
+            const float s1 = QmvTraits<T>::to_float(
+                scales[row_base * groups_per_row + gg1]);
+            acc += s1 * q2t_h2_dot64(
+                wb0, wb1, reinterpret_cast<const __half2*>(&x_s[(grp + LPR) * GRP_PAD]), hz);
+        }
+
+        g0 += GS;
+        __syncthreads(); // sebelum x_s ditimpa tile berikutnya
+    }
+
+    // ---- 4. Reduksi per-warp (8 lane) — identik dengan kernel skalar ----
+    float v = acc;
+    #pragma unroll
+    for (int off = LPR / 2; off > 0; off >>= 1) {
+        v += __shfl_down_sync(0xffffffffu, v, off, LPR);
+    }
+
+    const int64_t flat_base = (ws != nullptr ? ws_batch : out_batch);
+    if (row_valid && grp == 0) {
+        if (ws != nullptr) {
+            ws[flat_base + static_cast<int64_t>(row)] = v;
+        } else {
+            out[flat_base + static_cast<int64_t>(row)] = QmvTraits<T>::from_float(v);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Kernel FWHT blok-B dengan tanda eksplisit (port ggml fwht.cu + runtime.fwht).
+// Satu block CUDA per (baris, blok-B sepanjang dimensi terakhir K).
+//   forward : x <- H_B @ (signs * x) / sqrt(B)
+//   inverse : x <- signs * (H_B @ x) / sqrt(B)
+// Butterfly in-place: "elemen rendah pasangan = x+y, elemen tinggi = x-y"
+// (terverifikasi numerik == Sylvester H_B/sqrt(B), termasuk round-trip).
+// ----------------------------------------------------------------------------
+template <int B, typename T>
+__global__ void fwht_sm75_kernel(
+    const T* __restrict__ x_in,      // [total_rows, K] row-major (bisa == x_out)
+    T* __restrict__ x_out,           // [total_rows, K] row-major
+    const T* __restrict__ signs,     // [K] ±1
+    int total_rows,
+    int k,
+    bool inverse
+) {
+    extern __shared__ float smem[];              // B float
+    float* s = smem;
+
+    const int row = static_cast<int>(blockIdx.y);
+    const int blk = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    if (row >= total_rows || tid >= B) return;
+
+    const int base = blk * B;
+    const int idx  = base + tid;
+    if (idx >= k) return;
+
+    const int64_t xr = static_cast<int64_t>(row) * k + idx;
+    float v  = QmvTraits<T>::to_float(x_in[xr]);
+    float sg = QmvTraits<T>::to_float(signs[idx]);
+    if (!inverse) v = v * sg;                    // forward: kali tanda DULU
+    s[tid] = v;
+    __syncthreads();
+
+    // Butterfly: pasangan (tid, tid^h), stride berlipat ganda.
+    // AMAN in-place (x_in == x_out): global hanya dibaca 1x di awal dan
+    // ditulis 1x di akhir; seluruh butterfly terjadi di shared memory.
+    // low (bit h=0)  -> a + b
+    // high (bit h=1) -> b - a   [b = elemen rendah = pasangan]
+    #pragma unroll
+    for (int h = 1; h < B; h <<= 1) {
+        float a = s[tid];
+        float b = s[tid ^ h];
+        __syncthreads();
+        s[tid] = ((tid & h) == 0) ? (a + b) : (b - a);
+        __syncthreads();
+    }
+
+    v = s[tid] * (1.0f / sqrtf(static_cast<float>(B)));
+    if (inverse) v = v * sg;                     // inverse: kali tanda SETELAH
+    x_out[xr] = QmvTraits<T>::from_float(v);
+}
+
+// ----------------------------------------------------------------------------
+// Kernel GEMV DENSE FP16 murni (tidak terkuantisasi) untuk modul yang TIDAK
+// terfold dan tidak terkuantisasi di pack Bonsai-2 — yaitu linear_attn.
+// in_proj_b / in_proj_a (F32 [48, 5120] di checkpoint, diunggah sebagai F16).
+// Satu block CUDA per (baris input L, baris output n); 256 thread membagi K.
+// y[L, N] = x[L, K] @ w[N, K]^T   (w row-major; tanpa bias — bias nol).
+// ----------------------------------------------------------------------------
+template <typename T>
+__global__ void qmv_dense_kernel(
+    const T* __restrict__ x,           // [L, K]
+    const T* __restrict__ w,           // [N_tail, K] row-major
+    T* __restrict__ out,               // [L, N_total] row-major
+    int n_total,                       // stride baris output (= N_total)
+    int n_packed,                      // offset kolom awal bagian dense
+    int n_tail,                        // jumlah baris output bagian dense ini
+    int k
+) {
+    const int row = static_cast<int>(blockIdx.y);   // indeks baris input L
+    const int on  = static_cast<int>(blockIdx.x);   // indeks baris output N_tail
+    const int tid = static_cast<int>(threadIdx.x);
+    const int nt  = static_cast<int>(blockDim.x);
+    if (on >= n_tail) return;
+
+    const T* __restrict__ xrow = x + static_cast<int64_t>(row) * k;
+    const T* __restrict__ wrow = w + static_cast<int64_t>(on)  * k;
+
+    float acc = 0.0f;
+    for (int i = tid; i < k; i += nt) {
+        acc += QmvTraits<T>::to_float(xrow[i]) * QmvTraits<T>::to_float(wrow[i]);
+    }
+
+    // Reduksi block penuh via shared memory (256 thread).
+    __shared__ float sm[256];
+    sm[tid] = acc;
+    __syncthreads();
+    #pragma unroll
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sm[tid] += sm[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[static_cast<int64_t>(row) * n_total + n_packed + on]
+            = QmvTraits<T>::from_float(sm[0]);
+    }
+}
+
+} // namespace bonsai::sm75::q2t
+
+// ============================================================================
 // C ABI Export Functions (Dipanggil via Mojo FFI)
 // ============================================================================
 extern "C" {
@@ -2897,6 +4121,100 @@ int launch_qmm_sm75_b1_prefill_fp16(
                dim3(128), 0, stream>>>(
                 xp, wp, sp, bp, op, m, n, k, l, bw_arg);
     }
+
+    cudaError_t err = cudaGetLastError();
+    return (err == cudaSuccess) ? 0 : static_cast<int>(err);
+}
+
+// Prefill batched 2-bit ternary W2A16 (WMMA v2 tensor core). Sama kontrak
+// dengan versi 1-bit, kecuali: bobot K/4 byte per baris (2 bit per bobot) dan
+// parameter n_total = stride baris output, yang boleh lebih besar dari n bila
+// modul memiliki ekor dense (kolom [n, n_total) diisi kernel dense terpisah).
+int launch_qmm_sm75_b2_prefill_fp16(
+    const void* x,          // [L, M, K] __half
+    const void* w,          // [n, K/4] uint8 (2-bit packed)
+    const void* scales,     // [n, K/128] __half (s_ckpt mentah)
+    void* out,              // [L, M, n_total] __half
+    int m, int n, int n_total, int k, int l,
+    int broadcast_w,
+    cudaStream_t stream
+) {
+    using namespace bonsai::sm75::wmma_b2;
+
+    if (k % 128 != 0) return -100; // kontrak g128 dilanggar
+    if (m <= 0 || n <= 0 || l <= 0) return 0;
+    if (n_total < n) return -101;  // stride output tak mungkin lebih kecil
+
+    const __half* xp = reinterpret_cast<const __half*>(x);
+    const uint8_t* wp = reinterpret_cast<const uint8_t*>(w);
+    const __half* sp = reinterpret_cast<const __half*>(scales);
+    __half* op = reinterpret_cast<__half*>(out);
+    bool bw_arg = broadcast_w != 0;
+
+    // Pilih tinggi ubin M: makin besar BM, makin sedikit PASS dekuantisasi
+    // bobot (dekuantisasi diulang per ubin M). Untuk M=129: BM=64 butuh 3
+    // pass (192 baris), BM=128 cukup 2 pass (256 baris) — penghematan
+    // dekuantisasi 33% jauh lebih berharga daripada tambahan MMA bantalan,
+    // karena MMA jalan di tensor core sedangkan dekuantisasi di CUDA core.
+    if (m <= 32) {
+        qmm_sm75_b2_kernel<__half, 32, 64, 64>
+            <<<dim3((n + QMM_B2_BN - 1) / QMM_B2_BN, (m + 31) / 32, l),
+               dim3(128), 0, stream>>>(
+                xp, wp, sp, op, m, n, n_total, k, l, bw_arg);
+    } else if (m <= 64) {
+        qmm_sm75_b2_kernel<__half, 64, 64, 64>
+            <<<dim3((n + QMM_B2_BN - 1) / QMM_B2_BN, (m + 63) / 64, l),
+               dim3(128), 0, stream>>>(
+                xp, wp, sp, op, m, n, n_total, k, l, bw_arg);
+    } else {
+        qmm_sm75_b2_kernel<__half, 128, 64, 64>
+            <<<dim3((n + QMM_B2_BN - 1) / QMM_B2_BN, (m + 127) / 128, l),
+               dim3(128), 0, stream>>>(
+                xp, wp, sp, op, m, n, n_total, k, l, bw_arg);
+    }
+
+    cudaError_t err = cudaGetLastError();
+    return (err == cudaSuccess) ? 0 : static_cast<int>(err);
+}
+
+// Prefill batched 2-bit ternary — INT8 tensor core (W2A8). Jalur TAMBAHAN:
+// kontrak I/O identik dengan launch_qmm_sm75_b2_prefill_fp16, tapi komputasi
+// memakai mma int8 Turing (2x throughput tensor core vs fp16 di T4).
+// Opt-in dari sisi Mojo (BONSAI_PREFILL_INT8=1); bila simulator memanggil
+// ini padahal .so tak punya simbolnya, get_function melempar dan pemanggil
+// mundur ke jalur fp16. Ret != 0 (mis. kontrak K dilanggar) juga mundur.
+int launch_qmm_sm75_b2_prefill_int8(
+    const void* x,          // [L, M, K] __half
+    const void* w,          // [n, K/4] uint8 (2-bit packed)
+    const void* scales,     // [n, K/128] __half (s_ckpt mentah)
+    void* out,              // [L, M, n_total] __half
+    int m, int n, int n_total, int k, int l,
+    int broadcast_w,
+    cudaStream_t stream
+) {
+    using namespace bonsai::sm75::imma_b2;
+
+    if (k % 128 != 0) return -100; // kontrak g128 dilanggar
+    if (m <= 0 || n <= 0 || l <= 0) return 0;
+    if (n_total < n) return -101;  // stride output tak mungkin lebih kecil
+
+    const __half* xp = reinterpret_cast<const __half*>(x);
+    const uint8_t* wp = reinterpret_cast<const uint8_t*>(w);
+    const __half* sp = reinterpret_cast<const __half*>(scales);
+    __half* op = reinterpret_cast<__half*>(out);
+    bool bw_arg = broadcast_w != 0;
+
+    // BM/BN/BK tetap 64/64/64: selalu utuh mengisi satu blok dan grid
+    // blockIdx.y menyerap sisa M (berbeda dari jalur fp16 yang memilih
+    // BM=32/64/128; di sini register accumulator int8+fp32 membuat
+    // BM>64 tidak menguntungkan).
+    dim3 grid((n + QMM_B2_BN - 1) / QMM_B2_BN,
+              (m + QMM_B2_BM - 1) / QMM_B2_BM,
+              l);
+    dim3 block(128);
+
+    qmm_sm75_b2_int8_kernel<<<grid, block, 0, stream>>>(
+        xp, wp, sp, op, m, n, n_total, k, l, bw_arg);
 
     cudaError_t err = cudaGetLastError();
     return (err == cudaSuccess) ? 0 : static_cast<int>(err);
@@ -3485,6 +4803,287 @@ int launch_cal_op(
         return 0;
     }
     return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Bonsai-2 (2-bit ternary g128) GEMV decode. Bobot [N, K/4] uint8, 2 bit per
+// bobot, w_eff = (q-1)*s. Sama persis kontrak split-K + reduce dengan
+// launch_qmv_sm75_b1_decode_fp16 sehingga wrapper Mojo dapat memakai
+// decode_split_plan dan workspace ws yang sama.
+// ---------------------------------------------------------------------------
+int launch_qmv_sm75_b2_decode_fp16(
+    const void* x,          // [L, M, K] __half (M=1)
+    const void* w,          // [N, K/4] uint8 (2-bit packed)
+    const void* scales,     // [N, K/128] __half (s_ckpt MENTAH, tanpa /2)
+    void* out,              // [L, M, N] __half
+    float* ws,              // [splits, L*M*N] float workspace (or nullptr)
+    int m, int n, int k, int l,
+    int broadcast_w,
+    int splits,
+    cudaStream_t stream
+) {
+    using namespace bonsai::sm75;                 // konstanta + helper (sama dgn launcher b1)
+
+    if (k % 128 != 0) return -100;               // kontrak g128 dilanggar
+    // 2-bit: K/4 byte per baris; k%128==0 => k/4 kelipatan 32 => uint4 aligned
+    if ((k / 4) % 16 != 0) return -101;          // alignment bobot tak terjamin
+
+    const __half* xp = reinterpret_cast<const __half*>(x);
+    const uint8_t* wp = reinterpret_cast<const uint8_t*>(w);
+    const __half* sp = reinterpret_cast<const __half*>(scales);
+    __half* op = reinterpret_cast<__half*>(out);
+
+    const int groups_per_row = k / 128;
+    const int blocks_x = (n + QMV_VEC_ROWS_PER_BLOCK - 1) / QMV_VEC_ROWS_PER_BLOCK;
+
+    dim3 grid(blocks_x, 1, l);
+    dim3 block(QMV_LUT_BLOCK_THREADS, 1, 1);
+
+    if (splits <= 1) {
+        q2t::qmv_vec_q2t_kernel<__half><<<grid, block, 0, stream>>>(
+            xp, wp, sp, op, nullptr, 0,
+            m, n, k, l, broadcast_w != 0,
+            0, groups_per_row
+        );
+    } else {
+        const int base = groups_per_row / splits;
+        const int rem  = groups_per_row % splits;
+
+        for (int s = 0; s < splits; ++s) {
+            int g_begin = s * base + (s < rem ? s : rem);
+            int g_count = base + (s < rem ? 1 : 0);
+
+            q2t::qmv_vec_q2t_kernel<__half><<<grid, block, 0, stream>>>(
+                xp, wp, sp, op, ws, s,
+                m, n, k, l, broadcast_w != 0,
+                g_begin, g_count
+            );
+        }
+
+        const long long total = static_cast<long long>(l) * m * n;
+        const unsigned reduce_blocks = (total + QMV_LUT_BLOCK_THREADS - 1) / QMV_LUT_BLOCK_THREADS;
+        qmv_split_reduce_kernel<__half><<<dim3(reduce_blocks, 1, 1), block, 0, stream>>>(
+            ws, op, total, splits
+        );
+    }
+
+    cudaError_t err = cudaGetLastError();
+    return (err == cudaSuccess) ? 0 : static_cast<int>(err);
+}
+
+// ---------------------------------------------------------------------------
+// Peluncur jalur CEPAT decode 2-bit (qmv_vec_q2t_h2_kernel: PRMT + HFMA2).
+// Tanda tangan IDENTIK dengan launch_qmv_sm75_b2_decode_fp16 supaya alias
+// FFI di sisi Mojo bisa dipakai bergantian tanpa menyentuh pemanggil.
+// Terpisah (bukan mengganti isi peluncur lama) agar jalur lama tetap utuh:
+// bila numerik jalur half2 ternyata melenceng, cukup tidak memanggil simbol
+// ini — tidak ada satu baris pun di jalur proven yang berubah.
+// Dipilih dari Mojo lewat env BONSAI_DECODE_H2=1.
+// ---------------------------------------------------------------------------
+// (Sudah berada di dalam blok extern "C" yang dibuka di baris 3791 — jangan
+//  menulis extern "C" lagi di sini; cukup mengikuti gaya peluncur lainnya.)
+int launch_qmv_sm75_b2_decode_h2(
+    const void* x,          // [L, M, K] __half (M=1)
+    const void* w,          // [N, K/4] uint8 (2-bit packed)
+    const void* scales,     // [N, K/128] __half (s_ckpt MENTAH, tanpa /2)
+    void* out,              // [L, M, N] __half
+    float* ws,              // [splits, L*M*N] float workspace (or nullptr)
+    int m, int n, int k, int l,
+    int broadcast_w,
+    int splits,
+    cudaStream_t stream
+) {
+    using namespace bonsai::sm75;                 // konstanta + helper
+
+    if (k % 128 != 0) return -100;               // kontrak g128 dilanggar
+    if ((k / 4) % 16 != 0) return -101;          // alignment bobot tak terjamin
+
+    const __half* xp = reinterpret_cast<const __half*>(x);
+    const uint8_t* wp = reinterpret_cast<const uint8_t*>(w);
+    const __half* sp = reinterpret_cast<const __half*>(scales);
+    __half* op = reinterpret_cast<__half*>(out);
+
+    const int groups_per_row = k / 128;
+    const int blocks_x = (n + QMV_VEC_ROWS_PER_BLOCK - 1) / QMV_VEC_ROWS_PER_BLOCK;
+
+    dim3 grid(blocks_x, 1, l);
+    dim3 block(QMV_LUT_BLOCK_THREADS, 1, 1);
+
+    if (splits <= 1) {
+        q2t::qmv_vec_q2t_h2_kernel<__half><<<grid, block, 0, stream>>>(
+            xp, wp, sp, op, nullptr, 0,
+            m, n, k, l, broadcast_w != 0,
+            0, groups_per_row
+        );
+    } else {
+        const int base = groups_per_row / splits;
+        const int rem  = groups_per_row % splits;
+
+        for (int s = 0; s < splits; ++s) {
+            int g_begin = s * base + (s < rem ? s : rem);
+            int g_count = base + (s < rem ? 1 : 0);
+
+            q2t::qmv_vec_q2t_h2_kernel<__half><<<grid, block, 0, stream>>>(
+                xp, wp, sp, op, ws, s,
+                m, n, k, l, broadcast_w != 0,
+                g_begin, g_count
+            );
+        }
+
+        const long long total = static_cast<long long>(l) * m * n;
+        const unsigned reduce_blocks = (total + QMV_LUT_BLOCK_THREADS - 1) / QMV_LUT_BLOCK_THREADS;
+        qmv_split_reduce_kernel<__half><<<dim3(reduce_blocks, 1, 1), block, 0, stream>>>(
+            ws, op, total, splits
+        );
+    }
+
+    cudaError_t err = cudaGetLastError();
+    return (err == cudaSuccess) ? 0 : static_cast<int>(err);
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Peluncur varian "lebar" (qmv_vec_q2t_h2b_kernel: 2 grup per lane, 4x uint4
+// in flight). Tanda tangan IDENTIK dengan kedua peluncur decode lainnya.
+// Dipilih dari Mojo lewat BONSAI_DECODE_H2=2 supaya varian h2 dan h2b bisa
+// di-A/B dalam satu build yang sama — tanpa ini kita cuma bisa menebak
+// apakah ~145 GB/s itu mentok DRAM atau kekurangan byte melayang.
+// ---------------------------------------------------------------------------
+int launch_qmv_sm75_b2_decode_h2b(
+    const void* x,          // [L, M, K] __half (M=1)
+    const void* w,          // [N, K/4] uint8 (2-bit packed)
+    const void* scales,     // [N, K/128] __half (s_ckpt MENTAH, tanpa /2)
+    void* out,              // [L, M, N] __half
+    float* ws,              // [splits, L*M*N] float workspace (or nullptr)
+    int m, int n, int k, int l,
+    int broadcast_w,
+    int splits,
+    cudaStream_t stream
+) {
+    using namespace bonsai::sm75;
+
+    if (k % 128 != 0) return -100;
+    if ((k / 4) % 16 != 0) return -101;
+
+    const __half* xp = reinterpret_cast<const __half*>(x);
+    const uint8_t* wp = reinterpret_cast<const uint8_t*>(w);
+    const __half* sp = reinterpret_cast<const __half*>(scales);
+    __half* op = reinterpret_cast<__half*>(out);
+
+    const int groups_per_row = k / 128;
+    const int blocks_x = (n + QMV_VEC_ROWS_PER_BLOCK - 1) / QMV_VEC_ROWS_PER_BLOCK;
+
+    dim3 grid(blocks_x, 1, l);
+    dim3 block(QMV_LUT_BLOCK_THREADS, 1, 1);
+
+    if (splits <= 1) {
+        q2t::qmv_vec_q2t_h2b_kernel<__half><<<grid, block, 0, stream>>>(
+            xp, wp, sp, op, nullptr, 0,
+            m, n, k, l, broadcast_w != 0,
+            0, groups_per_row
+        );
+    } else {
+        const int base = groups_per_row / splits;
+        const int rem  = groups_per_row % splits;
+
+        for (int s = 0; s < splits; ++s) {
+            int g_begin = s * base + (s < rem ? s : rem);
+            int g_count = base + (s < rem ? 1 : 0);
+
+            q2t::qmv_vec_q2t_h2b_kernel<__half><<<grid, block, 0, stream>>>(
+                xp, wp, sp, op, ws, s,
+                m, n, k, l, broadcast_w != 0,
+                g_begin, g_count
+            );
+        }
+
+        const long long total = static_cast<long long>(l) * m * n;
+        const unsigned reduce_blocks = (total + QMV_LUT_BLOCK_THREADS - 1) / QMV_LUT_BLOCK_THREADS;
+        qmv_split_reduce_kernel<__half><<<dim3(reduce_blocks, 1, 1), block, 0, stream>>>(
+            ws, op, total, splits
+        );
+    }
+
+    cudaError_t err = cudaGetLastError();
+    return (err == cudaSuccess) ? 0 : static_cast<int>(err);
+}
+
+// ---------------------------------------------------------------------------
+// FWHT blok-1024 dengan tanda eksplisit (Hadamard activation transform).
+// x_in/x_out [total_rows, K] row-major, K harus kelipatan 1024. signs [K] ±1.
+// x_in == x_out diizinkan (in-place aman: butterfly di shared memory).
+// inverse=false: transformasi forward (sebelum proyeksi terfold).
+// inverse=true : transformasi inverse (keluaran tabel embedding terfold).
+// ---------------------------------------------------------------------------
+int launch_fwht_sm75_fp16(
+    const void* x_in,      // [total_rows, K] __half
+    void* x_out,           // [total_rows, K] __half (boleh == x_in)
+    const void* signs,     // [K] __half (±1)
+    int total_rows,
+    int k,
+    int inverse,
+    cudaStream_t stream
+) {
+    using namespace bonsai::sm75;
+
+    constexpr int B = 1024;                      // blok Hadamard Bonsai-2
+    if (k % B != 0) return -102;                 // blok tidak membagi K
+    if (total_rows <= 0) return 0;
+
+    const __half* xp = reinterpret_cast<const __half*>(x_in);
+    __half* op = reinterpret_cast<__half*>(x_out);
+    const __half* sp = reinterpret_cast<const __half*>(signs);
+
+    const int n_blocks = k / B;
+    dim3 grid(n_blocks, total_rows, 1);
+    dim3 block(B, 1, 1);                          // 1 thread per elemen blok
+
+    q2t::fwht_sm75_kernel<B, __half><<<grid, block, B * sizeof(float), stream>>>(
+        xp, op, sp, total_rows, k, inverse != 0
+    );
+
+    cudaError_t err = cudaGetLastError();
+    return (err == cudaSuccess) ? 0 : static_cast<int>(err);
+}
+
+// ---------------------------------------------------------------------------
+// GEMV dense FP16 untuk modul tidak-terkuantisasi pack Bonsai-2 (in_proj_b /
+// in_proj_a: F32 [48, 5120] -> diunggah sebagai F16). Menulis baris output
+// tambahan setelah bagian terkuantisasi (out + n_packed).
+//   y[L, n_tail] = x[L, K] @ w[n_tail, K]^T
+// Dipanggil DENGAN input asli x (belum ter-transform Hadamard) karena modul
+// dense TIDAK terfold (kontrak runtime.py: "Unimplemented transformed float
+// matrix" untuk F32 di weight_names).
+// ---------------------------------------------------------------------------
+int launch_qmv_sm75_dense_fp16(
+    const void* x,          // [L, K] __half (input ASLI, tak tertransform)
+    const void* w,          // [n_tail, K] __half row-major
+    void* out,              // [L, N_total] __half; tulis mulai kolom n_packed
+    int n_packed,           // offset kolom awal bagian dense
+    int n_total,            // stride baris output (= N_total)
+    int n_tail,             // jumlah baris output bagian dense ini
+    int k,
+    int l,                  // jumlah baris input (L; M=1 per baris)
+    cudaStream_t stream
+) {
+    using namespace bonsai::sm75;
+    if (n_tail <= 0 || k <= 0 || l <= 0) return 0;
+    if (n_packed < 0) return -110;
+
+    const __half* xp = reinterpret_cast<const __half*>(x);
+    const __half* wp = reinterpret_cast<const __half*>(w);
+    __half* op = reinterpret_cast<__half*>(out);
+
+    constexpr int THREADS = 256;
+    dim3 grid(n_tail, l, 1);
+    dim3 block(THREADS, 1, 1);
+
+    q2t::qmv_dense_kernel<__half><<<grid, block, 0, stream>>>(
+        xp, wp, op, n_total, n_packed, n_tail, k
+    );
+
+    cudaError_t err = cudaGetLastError();
+    return (err == cudaSuccess) ? 0 : static_cast<int>(err);
 }
 
 } // extern "C"

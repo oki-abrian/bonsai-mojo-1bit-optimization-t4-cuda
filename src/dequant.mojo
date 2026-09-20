@@ -84,3 +84,66 @@ fn bit_to_half_sign_flip(bit: UInt32) -> UInt16:
     var mask: UInt16 = 0xBC00
     var flip: UInt16 = UInt16((bit & 1) << 15)
     return mask ^ flip
+
+# ============================================================================
+# 6. Ekstraksi 2-Bit Ternary (Bonsai-2 / Ternary-Bonsai-2-27B, Qwen3.8)
+# ============================================================================
+# Kontrak pack MLX "prism_hadamard_qwen35" (diverifikasi numerik terhadap
+# runtime/codec.py referensi, lihat CATATAN_IMPLEMENTASI_BONSAI2.md):
+#   - bobot U32 [N, K/16], 16 bobot per word little-endian, lane i di bit 2i
+#   - 1 byte = 4 bobot, sub-lane j (0..3) di bit 2j
+#   - scales F16 [N, K/128] = s_ckpt MENTAH; biases == -scales
+#   - dequant: w = q*s + b = (q-1)*s, q di {0,1,2} -> w di {-s, 0, +s}
+#   - TIDAK ada pembagian skala (berbeda dari 1-bit yg memakai (2q-1)*(s/2)).
+# ----------------------------------------------------------------------------
+
+@always_inline
+fn extract_2bit_lane(byte_val: UInt8, lane_idx: Int) -> Float32:
+    """
+    Mengekstrak kode 2-bit ke-j (0..3) dari 1 byte bobot terpaket.
+    Konvensi LSB-first: sub-lane 0 = bit 0-1 (elemen ke-0), sub-lane 3 = bit 6-7.
+    Mengembalikan kode mentah q di {0, 1, 2} (BUKAN nilai ternary).
+    """
+    var q = (Int(byte_val) >> ((lane_idx & 3) * 2)) & 3
+    return Float32(q)
+
+@always_inline
+fn dequant_ternary_bonsai(q: Float32, scale: Float32) -> Float32:
+    """
+    Kontrak Affine Ternary Bonsai-2:
+    w = q * s + b, dengan b = -s dan q di {0,1,2}.
+    Maka w = q*s - s = s * (q - 1):
+      - q == 0 -> w = -s
+      - q == 1 -> w =  0
+      - q == 2 -> w = +s
+    Bias terserap sempurna tanpa operasi penjumlahan terpisah.
+    """
+    return (q - 1.0) * scale
+
+@always_inline
+fn fma_2bit(
+    acc: Float32, byte_val: UInt8, lane_idx: Int, scale: Float32, x_val: Float32
+) -> Float32:
+    """
+    Ekstraksi 2-bit + dekuantisasi affine ternary + FMA akumulasi dalam satu
+    langkah: acc = acc + w_eff * x_val, w_eff = (q-1)*s.
+    """
+    var q = extract_2bit_lane(byte_val, lane_idx)
+    var w_eff = dequant_ternary_bonsai(q, scale)
+    return acc + w_eff * x_val
+
+@always_inline
+fn unpack_byte_to_simd4_ternary(
+    byte_val: UInt8, scale: Float32
+) -> SIMD[DType.float32, 4]:
+    """
+    Mendekode 1 byte uint8 (4 bobot ternary 2-bit) langsung ke SIMD[Float32, 4].
+    Sub-lane j menempati bit 2j..2j+1 (LSB-first), persis seperti layout U32
+    pack MLX saat diperlakukan sebagai deretan byte.
+    """
+    var res = SIMD[DType.float32, 4](0.0)
+    var b_int = Int(byte_val)
+    for j in range(4):
+        var q = Float32((b_int >> (j * 2)) & 3)
+        res[j] = (q - 1.0) * scale
+    return res

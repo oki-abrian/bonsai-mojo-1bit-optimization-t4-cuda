@@ -31,7 +31,7 @@ from .kernels.prefill_wmma import (
 from .kernels.elementwise_sm75 import (
     rmsnorm_sm75_gpu, add_rmsnorm_sm75_gpu, swiglu_sm75_gpu, vec_add_sm75_gpu, copy_vec_sm75_gpu,
     causal_conv1d_sm75_gpu, head_rmsnorm_sm75_gpu,
-    gdn_recurrence_sm75_gpu, gdn_norm_gate_sm75_gpu,
+    gdn_recurrence_sm75_gpu, gdn_recurrence_sm75_gpu_wide, gdn_norm_gate_sm75_gpu,
     argmax_sm75_stage1_gpu, argmax_sm75_stage2_gpu,
     partial_rope_sm75_gpu, kv_cache_append_sm75_gpu,
     gqa_attention_sm75_gpu, embed_lookup_1bit_sm75_gpu,
@@ -457,6 +457,62 @@ fn dummy_cuda_qmm_prefill_fp16(
     return -1
 
 
+# Prefill batched 2-bit ternary (WMMA v2). Bentuknya sama dengan versi 1-bit
+# tetapi ada parameter n_total: stride baris output. Stride itu boleh lebih
+# besar dari n karena ekor dense pack Bonsai-2 menempati kolom [n, n_total)
+# dan diisi oleh launch_qmv_sm75_dense_fp16, bukan oleh kernel ini.
+# Lihat src/csrc/qmv_sm75_kernel.cu launch_qmm_sm75_b2_prefill_fp16.
+alias CudaQmmPrefillB2FnFP16 = fn(
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin], # x [L,M,K]
+    UnsafePointer[UInt8, MutAnyOrigin],                 # w [n,K/4]
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin], # scales [n,K/128]
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin], # out [L,M,n_total]
+    Int32, Int32, Int32, Int32, Int32,                  # m, n, n_total, k, l
+    Int32,                                              # broadcast_w
+    UnsafePointer[Float32, MutAnyOrigin]                # stream
+) -> Int32
+
+
+fn dummy_cuda_qmm_prefill_b2_fp16(
+    x: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    scales: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    out_ptr: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    m: Int32, n: Int32, n_total: Int32, k: Int32, l: Int32,
+    broadcast_w: Int32,
+    stream: UnsafePointer[Float32, MutAnyOrigin]
+) -> Int32:
+    return -1
+
+
+# Prefill batched 2-bit ternary — INT8 tensor core (W2A8). Tanda tangan FFI
+# identik dengan CudaQmmPrefillB2FnFP16 (launcher launch_qmm_sm75_b2_prefill_int8
+# di src/csrc/qmv_sm75_kernel.cu), tapi dideklarasikan terpisah agar simbol
+# yang di-resolve jelas: bila simbol int8 tak ada di .so, get_function
+# meleputar dan pemanggil mundur ke jalur WMMA fp16.
+alias CudaQmmPrefillB2FnINT8 = fn(
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin], # x [L,M,K]
+    UnsafePointer[UInt8, MutAnyOrigin],                 # w [n,K/4]
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin], # scales [n,K/128]
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin], # out [L,M,n_total]
+    Int32, Int32, Int32, Int32, Int32,                  # m, n, n_total, k, l
+    Int32,                                              # broadcast_w
+    UnsafePointer[Float32, MutAnyOrigin]                # stream
+) -> Int32
+
+
+fn dummy_cuda_qmm_prefill_b2_int8(
+    x: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    scales: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    out_ptr: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    m: Int32, n: Int32, n_total: Int32, k: Int32, l: Int32,
+    broadcast_w: Int32,
+    stream: UnsafePointer[Float32, MutAnyOrigin]
+) -> Int32:
+    return -1
+
+
 fn dummy_cuda_decode_fp16(
     x: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],
@@ -474,6 +530,55 @@ fn dummy_cuda_decode_fp16(
 alias CudaSyncDeviceFn = fn() -> Int32
 
 fn dummy_cuda_sync_device() -> Int32:
+    return -1
+
+
+# FWHT blok-1024 Hadamard activation transform (Bonsai-2). Lihat
+# src/csrc/qmv_sm75_kernel.cu launch_fwht_sm75_fp16.
+alias CudaFwhtFnFP16 = fn(
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # x_in  [rows, K]
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # x_out [rows, K]
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # signs [K] ±1
+    Int32,                                               # total_rows
+    Int32,                                               # k (kelipatan 1024)
+    Int32,                                               # inverse (0=forward, 1=inverse)
+    UnsafePointer[Float32, MutAnyOrigin]                 # stream
+) -> Int32
+
+
+fn dummy_cuda_fwht_fp16(
+    x_in: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    x_out: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    signs: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    total_rows: Int32, k: Int32, inverse: Int32,
+    stream: UnsafePointer[Float32, MutAnyOrigin]
+) -> Int32:
+    return -1
+
+
+# GEMV dense FP16 untuk modul TIDAK terkuantisasi pack Bonsai-2 (linear_attn.
+# in_proj_b / in_proj_a, F32 [48, 5120]). Lihat src/csrc/qmv_sm75_kernel.cu
+# launch_qmv_sm75_dense_fp16. Menulis kolom [n_packed, n_total) dari output.
+alias CudaQmvDenseFnFP16 = fn(
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # x     [L, K] asli
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # w     [n_tail, K]
+    UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # out   [L, N_total]
+    Int32,                                               # n_packed (offset kolom)
+    Int32,                                               # n_total  (stride baris)
+    Int32,                                               # n_tail
+    Int32,                                               # k
+    Int32,                                               # l (baris input)
+    UnsafePointer[Float32, MutAnyOrigin]                 # stream
+) -> Int32
+
+
+fn dummy_cuda_qmv_dense_fp16(
+    x: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    w: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    dst: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    n_packed: Int32, n_total: Int32, n_tail: Int32, k: Int32, l: Int32,
+    stream: UnsafePointer[Float32, MutAnyOrigin]
+) -> Int32:
     return -1
 
 
@@ -1305,7 +1410,32 @@ fn gdn_recurrence_sm75_launch_on[
     H_v = 48, D_v = D_k = 128, H_k = 16 -> grid (48,1,1) x block (128,1,1).
     Angka lama yang pernah ditulis di sini (64x128, lalu "H_v=32 D_v=256")
     keduanya SALAH untuk model ini; memakai salah satunya meluap melewati
-    buffer state atau mematikan separuh dimensi."""
+    buffer state atau mematikan separuh dimensi.
+
+    BONSAI_GDN_WIDE=1 memakai varian lebar (8 thread/baris, 32 baris/blok,
+    1,51x lebih cepat di pengukuran terpisah). Ia TIDAK bit-exact terhadap
+    jalur lama, maka default-nya MATI dan harus lulus uji token dulu."""
+    var want_wide = getenv("BONSAI_GDN_WIDE")
+    # Varian lebar mengasumsikan 32 baris per blok dan 16 float per thread,
+    # jadi hanya berlaku untuk D_v = 128 dan D_k = 128 (bentuk model ini).
+    var use_wide = want_wide == "1" and D_v == 128 and D_k == 128
+    if use_wide:
+        if has_params and a_log != UnsafePointer[Float32, MutAnyOrigin]() and dt_bias != UnsafePointer[Float32, MutAnyOrigin]():
+            ctx.enqueue_function[gdn_recurrence_sm75_gpu_wide[T, True]](
+                state_s, q_normed, k_normed, v, a, b, a_log, dt_bias,
+                out_ptr, repeat_factor, D_v, D_k,
+                grid_dim=(H_v, D_v // 32, 1),
+                block_dim=(256, 1, 1)
+            )
+        else:
+            var null_f = UnsafePointer[Float32, MutAnyOrigin]()
+            ctx.enqueue_function[gdn_recurrence_sm75_gpu_wide[T, False]](
+                state_s, q_normed, k_normed, v, a, b, null_f, null_f,
+                out_ptr, repeat_factor, D_v, D_k,
+                grid_dim=(H_v, D_v // 32, 1),
+                block_dim=(256, 1, 1)
+            )
+        return
     if has_params and a_log != UnsafePointer[Float32, MutAnyOrigin]() and dt_bias != UnsafePointer[Float32, MutAnyOrigin]():
         ctx.enqueue_function[gdn_recurrence_sm75_gpu[T, True]](
             state_s, q_normed, k_normed, v, a, b, a_log, dt_bias,
@@ -1349,7 +1479,20 @@ fn gdn_norm_gate_sm75_launch_on[
     `legacy_override`: -1 = ikuti env (perilaku normal). 0/1 = PAKSA mode,
     dipakai tes diferensial supaya bisa menguji kedua urutan tanpa menyentuh
     environment proses.
+
+    Batas geometri (lihat gdn_norm_gate_sm75_gpu di elementwise_sm75.mojo):
+    SMEM reduksi berukuran 128 float dan cabang cepatnya hanya absah untuk
+    D_v == 128 (kelipatan 32 DAN tepat 4 warp). D_v > 128 akan meluap SMEM
+    dan menulis nilai sampah TANPA error. D_v lain (<= 127) tetap benar lewat
+    jalur umum, hanya lebih lambat.
     """
+    if D_v > 128:
+        raise Error(
+            "FATAL: gdn_norm_gate_sm75_gpu hanya mendukung D_v <= 128 "
+            "(SMEM reduksi 128 float; cabang cepat reduksi warp hanya absah "
+            "untuk D_v == 128). D_v=" + String(D_v)
+            + " akan meluap shared memory dan menulis nilai sampah tanpa error."
+        )
     var legacy_flag = 0
     if legacy_override >= 0:
         legacy_flag = legacy_override

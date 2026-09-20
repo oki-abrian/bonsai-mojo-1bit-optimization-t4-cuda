@@ -1,0 +1,19 @@
+{
+  "id": "okiabrian/bonsai-build-cpu",
+  "title": "bonsai-build-cpu",
+  "code_file": "run_deploy.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "okiabrian/bonsai-mojo-source"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [
+    "okiabrian/bonsai-build-cpu"
+  ],
+  "model_sources": []
+}

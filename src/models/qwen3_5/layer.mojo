@@ -441,7 +441,8 @@ struct QwenDecoderLayer:
         mut gdn_state: GatedDeltaNetState,
         mut kv_cache: AttentionKVCache,
         pos_base: Int,
-        M: Int
+        M: Int,
+        fwht_scratch_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin] = UnsafePointer[Scalar[DType.float16], MutAnyOrigin]()
     ) raises:
         """
         Prefill BATCHED M-token 100% VRAM (paritas jalur MLX qmm WMMA v2):
@@ -477,7 +478,9 @@ struct QwenDecoderLayer:
             )
 
             # 2. in_proj GEMM batched (bobot 16480x5120 dibaca SEKALI)
-            self.gdn_in_proj_all.forward_prefill_device(x_norm_m_dev, proj_m_dev, M)
+            self.gdn_in_proj_all.forward_prefill_device(
+                x_norm_m_dev, proj_m_dev, M, fwht_scratch_dev
+            )
 
             # WAJIB sebelum conv: alokasi + zeroing buffer state device.
             if not gdn_state.dev_ready:
@@ -562,7 +565,9 @@ struct QwenDecoderLayer:
                 )
 
             # 4. out_proj GEMM batched
-            self.gdn_out_proj.forward_prefill_device(gdn_m_dev, sublayer_m_dev, M)
+            self.gdn_out_proj.forward_prefill_device(
+                gdn_m_dev, sublayer_m_dev, M, fwht_scratch_dev
+            )
         else:
             # ---------- Attention layer ----------
             var H_q = self.config.num_attention_heads
@@ -584,10 +589,16 @@ struct QwenDecoderLayer:
             )
 
             # 2. q/k/v GEMM batched (3 bobot masing-masing dibaca SEKALI)
-            self.attn_q_proj.forward_prefill_device(x_norm_m_dev, proj_m_dev, M)
-            self.attn_k_proj.forward_prefill_device(x_norm_m_dev, conv_m_dev, M)
+            self.attn_q_proj.forward_prefill_device(
+                x_norm_m_dev, proj_m_dev, M, fwht_scratch_dev
+            )
+            self.attn_k_proj.forward_prefill_device(
+                x_norm_m_dev, conv_m_dev, M, fwht_scratch_dev
+            )
             # v staging di kn_m_dev [M, kv_dim] (qn/kn tidak dipakai layer attention)
-            self.attn_v_proj.forward_prefill_device(x_norm_m_dev, kn_m_dev, M)
+            self.attn_v_proj.forward_prefill_device(
+                x_norm_m_dev, kn_m_dev, M, fwht_scratch_dev
+            )
 
             # 3. Per-token stateful: q/k norm -> RoPE(pos) -> append KV -> GQA
             #    attn out ditulis ke gdn_m_dev rows (stride H_q*Dh = 6144)
@@ -605,7 +616,9 @@ struct QwenDecoderLayer:
                 )
 
             # 4. o_proj GEMM batched: attn out (gdn_m rows, [M,6144]) -> sublayer_m
-            self.attn_o_proj.forward_prefill_device(gdn_m_dev, sublayer_m_dev, M)
+            self.attn_o_proj.forward_prefill_device(
+                gdn_m_dev, sublayer_m_dev, M, fwht_scratch_dev
+            )
 
         # 5. Residual 1 batched (1 launch, grid.y = M)
         vec_add_sm75_launch_on[T](ctx, hidden_m_dev, sublayer_m_dev, D, M)
@@ -619,12 +632,16 @@ struct QwenDecoderLayer:
         )
 
         # 7. SwiGLU MLP batched: gate_up GEMM -> swiglu (1 launch) -> down GEMM
-        self.mlp_gate_up_proj.forward_prefill_device(x_norm_m_dev, gate_up_m_dev, M)
+        self.mlp_gate_up_proj.forward_prefill_device(
+            x_norm_m_dev, gate_up_m_dev, M, fwht_scratch_dev
+        )
         swiglu_sm75_launch_on[T](
             ctx, gate_up_m_dev, swiglu_m_dev,
             self.config.intermediate_size, M
         )
-        self.mlp_down_proj.forward_prefill_device(swiglu_m_dev, mlp_m_dev, M)
+        self.mlp_down_proj.forward_prefill_device(
+            swiglu_m_dev, mlp_m_dev, M, fwht_scratch_dev
+        )
 
         # 8. Residual 2 batched (1 launch, grid.y = M)
         vec_add_sm75_launch_on[T](ctx, hidden_m_dev, mlp_m_dev, D, M)

@@ -21,7 +21,7 @@ from src import (
     khq_active, khq_activate, khq_prof_report
 )
 from time import monotonic
-from math import exp
+from math import exp, sqrt
 from src.jsonlite import JsonDoc
 from src.safetensors import SafeTensorsIndex, fuse_u8, fuse_f32, load_qlinear
 from src.models.qwen3_5.linear import use_gpu_matmul, DeviceContextGPU
@@ -76,8 +76,11 @@ fn find_flex(index: SafeTensorsIndex, name: String) -> Int:
         return e
     return index.find("language_model." + name)
 
-fn read_scales_eff(index: SafeTensorsIndex, e_s: Int, numel: Int) raises -> UnsafePointer[Float32, MutAnyOrigin]:
-    """Scales efektif = s_checkpoint / 2 (untuk kernel (2q-1)*s_eff).
+fn read_scales_eff(index: SafeTensorsIndex, e_s: Int, numel: Int, bits: Int = 1) raises -> UnsafePointer[Float32, MutAnyOrigin]:
+    """Scales efektif untuk kernel.
+
+    bits=1: s_eff = s_checkpoint / 2 (kernel menghitung (2q-1)*s_eff).
+    bits=2: scales dipakai MENTAH — kontrak (q-1)*s (biases == -s penuh).
 
     GAGAL KERAS bila tensor scales tidak ada. Sebelumnya `e_s == -1` hanya
     menghasilkan buffer `alloc` yang TAK-TERINISIALISASI: kernel QMV/QMM lalu
@@ -88,7 +91,7 @@ fn read_scales_eff(index: SafeTensorsIndex, e_s: Int, numel: Int) raises -> Unsa
     if e_s == -1 and numel > 0:
         raise Error(
             "FATAL: tensor scales tidak ditemukan (numel=" + String(numel)
-            + "). Tanpa skala, kernel 1-bit membaca memori tak-terinisialisasi "
+            + "). Tanpa skala, kernel membaca memori tak-terinisialisasi "
             + "dan hasilnya salah tanpa error."
         )
     var p = alloc[Float32](numel if numel > 0 else 1)
@@ -98,8 +101,9 @@ fn read_scales_eff(index: SafeTensorsIndex, e_s: Int, numel: Int) raises -> Unsa
                 "FATAL: gagal baca scales (numel=" + String(numel)
                 + ") — dtype/jumlah elemen tidak cocok dgn header safetensors."
             )
-        for i in range(numel):
-            p[i] *= Float32(0.5)
+        if bits == 1:
+            for i in range(numel):
+                p[i] *= Float32(0.5)
     return p
 
 fn read_biases_f32(index: SafeTensorsIndex, e_b: Int, numel: Int) raises -> UnsafePointer[Float32, MutAnyOrigin]:
@@ -161,17 +165,21 @@ fn verify_affine_zero_bias(
     biases: UnsafePointer[Float32, MutAnyOrigin],
     numel: Int,
     s_is_eff: Bool,
-    what: String
+    what: String,
+    bits: Int = 1
 ) raises:
-    """Verifikasi kontrak affine checkpoint: `biases == -scales_ckpt / 2`.
+    """Verifikasi kontrak affine checkpoint.
 
-    Dua konvensi pemakaian skala hidup berdampingan, dan KEDUANYA bergantung
-    pada kontrak yang sama:
+    bits=1: `biases == -scales_ckpt / 2`. Dua konvensi pemakaian skala hidup
+    berdampingan, dan KEDUANYA bergantung pada kontrak yang sama:
       * `s_is_eff=True`  -> `s` sudah s_eff = s_ckpt/2 (loader membagi 2).
         Dipakai QwenLinear1Bit -> kernel QMV/QMM yang MENDERIVASI bias sebagai
         `-s_eff` dan tidak pernah membaca tensor biases. Harapan: b == -s.
       * `s_is_eff=False` -> `s` masih s_ckpt mentah. Dipakai kernel embed
         (`bit*s + b`, affine penuh). Harapan: b == -s/2.
+
+    bits=2 (Bonsai-2): kontrak berbeda — `biases == -scales` penuh pada skala
+    mentah, sehingga w = q*s + b = (q-1)*s. k=1.0 dipakai pada s mentah.
 
     INI ADALAH SATU-SATUNYA alasan `GDN_AFFINE_ZERO_CORRECTION=True` boleh
     melewati loop koreksi affine per grup (src/models/qwen3_5/linear.mojo:40-45).
@@ -190,8 +198,10 @@ fn verify_affine_zero_bias(
     var step = numel // n_chk
     if step < 1:
         step = 1
-    # Harapan bias utk skala s: -s bila s sudah s_eff, -s/2 bila s masih mentah.
-    var k = Float32(1.0) if s_is_eff else Float32(0.5)
+    # Harapan bias utk skala s:
+    #   bits=2 atau s_is_eff -> b == -s      (k = 1.0)
+    #   bits=1 s mentah       -> b == -s/2   (k = 0.5)
+    var k = Float32(1.0) if (s_is_eff or bits == 2) else Float32(0.5)
     var worst: Float32 = 0.0
     var worst_i = 0
     var i = 0
@@ -275,6 +285,394 @@ fn env_int(name: String, dflt: Int) -> Int:
         return Int(v)
     except:
         return dflt
+
+
+fn bonsai_bits() -> Int:
+    """Bit-width bobot pack: 1 (Bonsai-27B lama, default) atau
+    2 (Bonsai-2 / Ternary-Bonsai-2-27B, prism_hadamard_qwen35)."""
+    return env_int("BONSAI_BITS", 1)
+
+
+# =============================================================================
+# Bonsai-2: kontrak Hadamard pack (prism_hadamard_qwen35)
+#
+# runtime/runtime.py referensi memetakan SIGNS BUKAN per modul, melainkan
+# per LEBAR INPUT (K): signs[width] untuk seluruh modul dengan K = width.
+# hadamard.json berisi sign_widths [5120, 6144, 17408] + sign_values
+# (28672 nilai ±1, concat sesuai urutan widths). Karena qkv/z dan
+# gate/up semuanya K=5120, fusion baris tetap EKSAK (sama signs).
+# =============================================================================
+
+struct HadamardSigns:
+    var block: Int
+    var buf: UnsafePointer[Float32, MutAnyOrigin]      # [total] ±1
+    var widths: UnsafePointer[Int, MutAnyOrigin]       # [n_widths]
+    var n_widths: Int
+    var total: Int
+
+    # Mojo 25.x tidak membuatkan konstruktor anggota otomatis — harus ditulis.
+    fn __init__(
+        out self,
+        block: Int,
+        buf: UnsafePointer[Float32, MutAnyOrigin],
+        widths: UnsafePointer[Int, MutAnyOrigin],
+        n_widths: Int,
+        total: Int
+    ):
+        self.block = block
+        self.buf = buf
+        self.widths = widths
+        self.n_widths = n_widths
+        self.total = total
+
+
+fn hadamard_signs_none() -> HadamardSigns:
+    """Pack 1-bit: tidak ada transformasi — for_k mengembalikan pointer nol."""
+    return HadamardSigns(
+        1024,
+        UnsafePointer[Float32, MutAnyOrigin](),
+        UnsafePointer[Int, MutAnyOrigin](),
+        0,
+        0,
+    )
+
+
+fn _hd_find_value(
+    buf: UnsafePointer[UInt8, MutAnyOrigin], n: Int, key: String
+) -> Int:
+    """Cari `"key"` dalam JSON datar; kembalikan offset nilai setelah ':'
+    (spasi dilewati), atau -1 bila tidak ketemu."""
+    var kb = key.as_bytes()
+    var klen = len(kb)
+    if klen < 2:
+        return -1
+    var i = 0
+    var found = -1
+    while i + klen <= n:
+        var ok = True
+        for j in range(klen):
+            if buf[i + j] != kb[j]:
+                ok = False
+                break
+        if ok:
+            found = i
+            break
+        i += 1
+    if found < 0:
+        return -1
+    var p = found + klen
+    while p < n and (
+        buf[p] == UInt8(ord(" ")) or buf[p] == UInt8(ord("\n"))
+        or buf[p] == UInt8(ord("\t")) or buf[p] == UInt8(ord("\r"))
+    ):
+        p += 1
+    if p >= n:
+        return -1
+    if buf[p] != UInt8(ord(":")):
+        return -1
+    p += 1
+    while p < n and (
+        buf[p] == UInt8(ord(" ")) or buf[p] == UInt8(ord("\n"))
+        or buf[p] == UInt8(ord("\t")) or buf[p] == UInt8(ord("\r"))
+    ):
+        p += 1
+    return p
+
+
+fn _hd_skip_ws(buf: UnsafePointer[UInt8, MutAnyOrigin], p: Int, n: Int) -> Int:
+    var q = p
+    while q < n and (
+        buf[q] == UInt8(ord(" ")) or buf[q] == UInt8(ord("\n"))
+        or buf[q] == UInt8(ord("\t")) or buf[q] == UInt8(ord("\r"))
+    ):
+        q += 1
+    return q
+
+
+# Mojo (rilis 25.x yang dipakai proyek ini) tidak mendukung kembalian tuple,
+# jadi offset akhir dikembalikan lewat pointer `end` (1 elemen).
+fn _hd_scan_int(
+    buf: UnsafePointer[UInt8, MutAnyOrigin], p: Int, n: Int,
+    end: UnsafePointer[Int, MutAnyOrigin]
+) -> Int:
+    """Pindai integer bertanda di p. Mengembalikan nilainya; offset setelah
+    angka ditulis ke end[]. Gagal -> end[] == p dan hasil 0."""
+    var q = p
+    var neg = False
+    if q < n and (buf[q] == UInt8(ord("-")) or buf[q] == UInt8(ord("+"))):
+        neg = (buf[q] == UInt8(ord("-")))
+        q += 1
+    var v = 0
+    var any = False
+    while q < n and buf[q] >= UInt8(ord("0")) and buf[q] <= UInt8(ord("9")):
+        v = v * 10 + (Int(buf[q]) - Int(ord("0")))
+        any = True
+        q += 1
+    if not any:
+        end[] = p
+        return 0
+    end[] = q
+    return Int(-1) * v if neg else v
+
+
+fn _hd_scan_sign(
+    buf: UnsafePointer[UInt8, MutAnyOrigin], p: Int, n: Int,
+    end: UnsafePointer[Int, MutAnyOrigin]
+) -> Float32:
+    """Pindai satu elemen sign_values (hanya ±1 diperbolehkan: format
+    "-1.0" / "1.0"). Mengembalikan nilainya; offset setelahnya ke end[].
+    Gagal -> end[] == p dan hasil 0.0."""
+    var q = p
+    var neg = False
+    if q < n and buf[q] == UInt8(ord("-")):
+        neg = True
+        q += 1
+    else:
+        if q < n and buf[q] == UInt8(ord("+")):
+            q += 1
+    # Harus dimulai dengan '1' (satu-satunya magnitudo yang valid).
+    if q >= n or buf[q] != UInt8(ord("1")):
+        end[] = p
+        return Float32(0.0)
+    q += 1
+    # Lewati bagian pecahan/eksponen (.0, e0, dsb.) sampai ',' atau ']'.
+    while q < n and buf[q] != UInt8(ord(",")) and buf[q] != UInt8(ord("]")):
+        q += 1
+    end[] = q
+    return Float32(-1.0) if neg else Float32(1.0)
+
+
+fn load_hadamard_signs(model_dir: String) raises -> HadamardSigns:
+    """Parse hadamard.json pack Bonsai-2 -> vektor signs per lebar input K.
+
+    Kontrak (prism.hadamard.*):
+      block_size     : ukuran blok Hadamard (512/1024/2048/4096)
+      sign_widths    : [w0, w1, ...]
+      sign_values    : concat dari vektor signs [w0]+[w1]+..., semua ±1
+    """
+    var path = model_dir + "/hadamard.json"
+    var cap = 1 << 20
+    var buf = alloc[UInt8](cap)
+    var n = read_small_file(path, buf, cap)
+    # Offset akhir pemindaian dikembalikan lewat pointer (Mojo 25.x tanpa tuple).
+    var hd_end = alloc[Int](1)
+    if n <= 0:
+        buf.free()
+        hd_end.free()
+        raise Error("FATAL: tidak dapat membaca hadamard.json di " + path)
+    var p_block = _hd_find_value(buf, n, "\"prism.hadamard.block_size\"")
+    if p_block < 0:
+        buf.free()
+        hd_end.free()
+        raise Error("FATAL: hadamard.json: prism.hadamard.block_size tidak ada")
+    var block = _hd_scan_int(buf, p_block, n, hd_end)
+    if block != 512 and block != 1024 and block != 2048 and block != 4096:
+        buf.free()
+        hd_end.free()
+        raise Error(
+            "FATAL: hadamard.json: block_size=" + String(block)
+            + " tidak divalidasi (harus 512/1024/2048/4096)"
+        )
+    var p_w = _hd_find_value(buf, n, "\"prism.hadamard.sign_widths\"")
+    if p_w < 0 or p_w >= n or buf[p_w] != UInt8(ord("[")):
+        buf.free()
+        hd_end.free()
+        raise Error("FATAL: hadamard.json: sign_widths tidak ada/bukan array")
+    var widths = alloc[Int](16)
+    var n_widths = 0
+    var q = p_w + 1
+    q = _hd_skip_ws(buf, q, n)
+    while q < n and buf[q] != UInt8(ord("]")):
+        var w = _hd_scan_int(buf, q, n, hd_end)
+        var q2 = hd_end[]
+        if q2 == q:
+            buf.free()
+            widths.free()
+            raise Error("FATAL: hadamard.json: sign_widths elemen tidak valid")
+        if n_widths >= 16:
+            buf.free()
+            widths.free()
+            raise Error("FATAL: hadamard.json: terlalu banyak sign_widths (>16)")
+        widths[n_widths] = w
+        n_widths += 1
+        q = _hd_skip_ws(buf, q2, n)
+        if q < n and buf[q] == UInt8(ord(",")):
+            q += 1
+            q = _hd_skip_ws(buf, q, n)
+    q += 1  # lewati ']'
+    # Vektor signs.
+    var p_v = _hd_find_value(buf, n, "\"prism.hadamard.sign_values\"")
+    if p_v < 0 or p_v >= n or buf[p_v] != UInt8(ord("[")):
+        buf.free()
+        widths.free()
+        hd_end.free()
+        raise Error("FATAL: hadamard.json: sign_values tidak ada/bukan array")
+    var total = 0
+    for i in range(n_widths):
+        total += widths[i]
+    var sbuf = alloc[Float32](total if total > 0 else 1)
+    q = p_v + 1
+    q = _hd_skip_ws(buf, q, n)
+    var idx = 0
+    while q < n and buf[q] != UInt8(ord("]")):
+        var sv = _hd_scan_sign(buf, q, n, hd_end)
+        var q2 = hd_end[]
+        if q2 == q:
+            buf.free()
+            widths.free()
+            sbuf.free()
+            raise Error("FATAL: hadamard.json: sign_values elemen tidak valid")
+        if idx >= total:
+            buf.free()
+            widths.free()
+            sbuf.free()
+            raise Error(
+                "FATAL: hadamard.json: sign_values lebih panjang dari "
+                + "jumlah sign_widths (" + String(total) + ")"
+            )
+        if sv != Float32(1.0) and sv != Float32(-1.0):
+            buf.free()
+            widths.free()
+            sbuf.free()
+            raise Error("FATAL: hadamard.json: sign_values bukan ±1")
+        sbuf[idx] = sv
+        idx += 1
+        q = _hd_skip_ws(buf, q2, n)
+        if q < n and buf[q] == UInt8(ord(",")):
+            q += 1
+            q = _hd_skip_ws(buf, q, n)
+    if idx != total:
+        buf.free()
+        widths.free()
+        sbuf.free()
+        raise Error(
+            "FATAL: hadamard.json: sign_values [" + String(idx)
+            + "] != jumlah sign_widths [" + String(total) + "]"
+        )
+    buf.free()
+    hd_end.free()
+    print(">> [HADAMARD] block=", block, " widths=",
+          widths[0] if n_widths > 0 else 0,
+          widths[1] if n_widths > 1 else 0,
+          widths[2] if n_widths > 2 else 0,
+          " total_signs=", total)
+    # Konstruktor struct Mojo bersifat posisional (tanpa argumen kata kunci).
+    return HadamardSigns(block, sbuf, widths, n_widths, total)
+
+
+fn hadamard_signs_for_k(
+    hd: HadamardSigns, k: Int
+) -> UnsafePointer[Float32, MutAnyOrigin]:
+    """Vektor signs untuk modul dengan lebar input k (pointer nol = modul
+    tidak terfold). Semua modul dengan K yang sama berbagi vektor yang
+    sama (kontrak runtime.py)."""
+    var off = 0
+    for i in range(hd.n_widths):
+        if hd.widths[i] == k:
+            return hd.buf + off
+        off += hd.widths[i]
+    return UnsafePointer[Float32, MutAnyOrigin]()
+
+
+fn fwht_blocks_host(
+    x: UnsafePointer[Float32, MutAnyOrigin],
+    signs: UnsafePointer[Float32, MutAnyOrigin],
+    k: Int, block: Int, inverse: Bool
+) raises:
+    """FWHT blok-blok Sylvester ternormalisasi √B pada host; paritas eksak
+    runtime/runtime.py:fwht — signs dikalikan SEBELUM butterfly (forward)
+    atau SESUDAHNYA (inverse). In-place; paritas numerik butterfly
+    "rendah=x+y, tinggi=x-y" == H_B/√B."""
+    if k % block != 0:
+        raise Error(
+            "FWHT host: k=" + String(k) + " tidak habis dibagi block="
+            + String(block)
+        )
+    # Uji null pointer memakai perbandingan eksplisit (idiom codebase);
+    # `if ptr:` saja tidak lazim dipakai di Mojo 25.x.
+    if signs != UnsafePointer[Float32, MutAnyOrigin]():
+        if not inverse:
+            for i in range(k):
+                x[i] = x[i] * signs[i]
+    var inv_sqrt = Float32(1.0) / sqrt(Float32(block))
+    var nblocks = k // block
+    for b in range(nblocks):
+        var base = b * block
+        var h = 1
+        while h < block:
+            var i = 0
+            while i < block:
+                var j = i
+                while j < i + h:
+                    var a = x[base + j]
+                    var bb = x[base + j + h]
+                    x[base + j] = a + bb
+                    x[base + j + h] = a - bb
+                    j += 1
+                i += 2 * h
+            h = h * 2
+        for i2 in range(block):
+            x[base + i2] = x[base + i2] * inv_sqrt
+    if signs != UnsafePointer[Float32, MutAnyOrigin]():
+        if inverse:
+            for i in range(k):
+                x[i] = x[i] * signs[i]
+
+
+fn embed_lookup_2bit_host(
+    embed_w: UnsafePointer[UInt8, MutAnyOrigin],   # U32 [V, K/16] (LE, 16 bobot/word)
+    embed_s: UnsafePointer[Float32, MutAnyOrigin], # [V, K/128]
+    embed_b: UnsafePointer[Float32, MutAnyOrigin], # [V, K/128]
+    signs: UnsafePointer[Float32, MutAnyOrigin],   # [K] ±1 (inverse) atau null
+    tok: Int, k: Int, block: Int,
+    row32: UnsafePointer[Float32, MutAnyOrigin],   # scratch [K]
+    row16: UnsafePointer[Scalar[DType.float16], MutAnyOrigin]  # scratch [K]
+) raises:
+    """Lookup embedding 2-bit + inverse FWHT (model.embed_tokens adalah
+    satu-satunya modul inverse_weight_names). w = q*s + b (affine penuh,
+    b == -s untuk pack ini -> ekuivalen (q-1)*s)."""
+    var words_per_row = k // 16
+    var groups_per_row = k // 128
+    var off = tok * words_per_row * 4
+    for g in range(groups_per_row):
+        var s_val = embed_s[tok * groups_per_row + g]
+        var b_val = embed_b[tok * groups_per_row + g]
+        for j in range(8):   # 8 word U32 per grup 128 bobot
+            var wb = off + (g * 8 + j) * 4
+            var w = UInt32(embed_w[wb]) | (UInt32(embed_w[wb + 1]) << 8) | (
+                UInt32(embed_w[wb + 2]) << 16
+            ) | (UInt32(embed_w[wb + 3]) << 24)
+            for lane in range(16):   # lane i di bit 2i
+                var q = Float32(Int((w >> UInt32(lane * 2)) & UInt32(3)))
+                row32[g * 128 + j * 16 + lane] = q * s_val + b_val
+    if signs != UnsafePointer[Float32, MutAnyOrigin]():
+        fwht_blocks_host(row32, signs, k, block, True)
+    for i in range(k):
+        row16[i] = row32[i].cast[DType.float16]()
+
+
+fn embed_lookup_2bit_to_dev(
+    gpu_ctx_ptr: UnsafePointer[DeviceContextGPU, MutAnyOrigin],
+    embed_w: UnsafePointer[UInt8, MutAnyOrigin],
+    embed_s: UnsafePointer[Float32, MutAnyOrigin],
+    embed_b: UnsafePointer[Float32, MutAnyOrigin],
+    signs: UnsafePointer[Float32, MutAnyOrigin],
+    tok: Int, k: Int, block: Int,
+    dst_dev: UnsafePointer[Scalar[DType.float16], MutAnyOrigin],
+    scratch_buf: DeviceBuffer[DType.float16],
+    row32: UnsafePointer[Float32, MutAnyOrigin],
+    row16: UnsafePointer[Scalar[DType.float16], MutAnyOrigin]
+) raises:
+    """Lookup embedding 2-bit di host lalu salin ke device (H2D + D2D kecil;
+    embed hanya 1 baris K elemen per token)."""
+    embed_lookup_2bit_host(
+        embed_w, embed_s, embed_b, signs, tok, k, block, row32, row16
+    )
+    var ctx = gpu_ctx_ptr[]
+    ctx.enqueue_copy(scratch_buf, row16)
+    copy_vec_sm75_launch_on[DType.float16](
+        ctx, dst_dev, scratch_buf.unsafe_ptr(), k
+    )
 
 
 fn rng_next(state: UnsafePointer[UInt64, MutAnyOrigin]) -> UInt64:
@@ -554,7 +952,17 @@ fn main() raises:
 
     var D = cfg.hidden_size
     var V = cfg.vocab_size
-    print(">> Config: layers=", cfg.num_hidden_layers, " hidden=", D, " vocab=", V)
+    var bits = bonsai_bits()
+    print(">> Config: layers=", cfg.num_hidden_layers, " hidden=", D, " vocab=", V,
+          " bits=", bits)
+
+    # ---------------- 1b. Hadamard manifest (Bonsai-2) ----------------
+    # signs ±1 untuk modul terfold diambil dari hadamard.json, BUKAN dari
+    # tensor .signs di safetensors (kontrak runtime/runtime.py: signs dipetakan
+    # per LEBAR INPUT K, dibagikan semua modul dgn K sama).
+    var hd = hadamard_signs_none()
+    if bits == 2:
+        hd = load_hadamard_signs(model_dir)
 
     # ---------------- 2. Buka safetensors ----------------
     print(">> [STEP] open_dir...")
@@ -564,10 +972,9 @@ fn main() raises:
         raise Error("FATAL: tidak ada tensor safetensors ditemukan di " + model_dir)
     print(">> [STEP] indeks:", index.n_entries, "tensor /", index.n_shards, "shard")
 
-    # ---------------- 3. Muat bobot global (TETAP 1-BIT TERPAKET) ----------------
-    # Mekanisme MLX/llama.cpp Q1_0_g128: bobot hidup di memori terpaket;
-    # dequant (2q-1)*s terjadi DI DALAM komputasi (per baris embed, per
-    # elemen di loop/kernel matmul) — TIDAK ada tabel FP32 raksasa.
+    # ---------------- 3. Muat bobot global ----------------
+    # 1-bit: bobot U8 terpaket 8/byte (Q1_0_g128). 2-bit: U32 [N, K/16],
+    # 16 bobot/word LE, lane i di bit 2i (prism_hadamard_qwen35).
     print(">> [STEP] cari embed...")
     var e_emb = find_flex(index, "model.embed_tokens.weight")
     var e_emb_s = find_flex(index, "model.embed_tokens.scales")
@@ -577,19 +984,35 @@ fn main() raises:
     if e_emb == -1 or e_emb_s == -1:
         raise Error("FATAL: embed_tokens/scales tidak ditemukan (kedua prefix).")
     var V_emb = index.entries[e_emb].d0
-    var D_real = index.entries[e_emb].d1 * 32 # kata U32 -> elemen (bits=1)
+    # 1-bit: 32 bobot/kata U32; 2-bit: 16 bobot/kata U32.
+    var D_real = index.entries[e_emb].d1 * (32 // bits)
     var embed_w = alloc[UInt8](index.entries[e_emb].nbytes)
     must_read_raw(index, e_emb, embed_w, index.entries[e_emb].nbytes, "model.embed_tokens.weight")
     var embed_s = alloc[Float32](V_emb * (D_real // 128))
     must_read_f32(index, e_emb_s, embed_s, V_emb * (D_real // 128), "model.embed_tokens.scales")
     var e_emb_b = find_flex(index, "model.embed_tokens.biases")
     var embed_b = alloc[Float32](V_emb * (D_real // 128))
+    # Skala embed selalu MENTAH (kernel embed affine penuh q*s+b untuk 1-bit;
+    # lookup 2-bit juga q*s+b dgn b == -s). Bagi 2 hanya untuk path 1-bit
+    # proyeksi — tidak berlaku embed.
     if e_emb_b != -1:
         must_read_f32(index, e_emb_b, embed_b, V_emb * (D_real // 128), "embed_tokens.biases")
-        # Skala embed masih MENTAH (kernel embed memakai affine penuh q*s+b).
         verify_affine_zero_bias(
-            embed_s, embed_b, V_emb * (D_real // 128), False, "model.embed_tokens"
+            embed_s, embed_b, V_emb * (D_real // 128), False, "model.embed_tokens", bits
         )
+    else:
+        for i in range(V_emb * (D_real // 128)):
+            embed_b[i] = 0.0
+    # Bonsai-2: embed adalah satu-satunya modul inverse_weight_names —
+    # keluarannya harus di-inverse-FWHT. signs[K] wajib ada.
+    var embed_signs = UnsafePointer[Float32, MutAnyOrigin]()
+    if bits == 2:
+        embed_signs = hadamard_signs_for_k(hd, D_real)
+        if embed_signs == UnsafePointer[Float32, MutAnyOrigin]():
+            raise Error(
+                "FATAL: pack Bonsai-2 tidak memiliki vektor signs untuk K="
+                + String(D_real) + " (hadamard.json) — modul embed terfold."
+            )
     D = D_real
     V = V_emb
     cfg.hidden_size = D
@@ -613,18 +1036,25 @@ fn main() raises:
     var lm_b = alloc[Float32](V_lm * (D // 128))
     if e_lm_b != -1:
         must_read_f32(index, e_lm_b, lm_b, V_lm * (D // 128), "lm_head.biases")
-    # Kontrak kernel: scales_eff = s_ckpt / 2 (kernel menghitung (2q-1)*s_eff).
-    for i in range(V_lm * (D // 128)):
-        lm_s[i] = lm_s[i] * 0.5
+    # bits=1: scales_eff = s_ckpt/2 (kernel (2q-1)*s_eff).
+    # bits=2: scales mentah (kernel (q-1)*s); lm_head terfold -> FWHT forward.
+    if bits == 1:
+        for i in range(V_lm * (D // 128)):
+            lm_s[i] = lm_s[i] * 0.5
     if e_lm_b != -1:
-        # Skala sudah s_eff (dibagi 2) -> kernel MENDERIVASI bias = -s_eff.
-        verify_affine_zero_bias(lm_s, lm_b, V_lm * (D // 128), True, "lm_head")
+        # bits=1: skala sudah s_eff -> kernel MENDERIVASI bias = -s_eff.
+        # bits=2: skala mentah, harapan b == -s.
+        verify_affine_zero_bias(
+            lm_s, lm_b, V_lm * (D // 128), bits == 1, "lm_head", bits
+        )
     else:
         print(">> [AFFINE-WARN] lm_head.biases tidak ada — kontrak affine "
-              "TIDAK dapat diverifikasi (kernel tetap mengasumsikan b=-s_eff).")
-    var lm_proj = QwenLinear1Bit(lm_w, lm_s, lm_b, V_lm, D)
+              "TIDAK dapat diverifikasi.")
+    var lm_signs = hadamard_signs_for_k(hd, D)
+    var lm_proj = QwenLinear1Bit(lm_w, lm_s, lm_b, V_lm, D, bits, lm_signs)
     V = V_lm
-    print(">> [STEP] bobot global siap (packed 1-bit, V=", V, " D=", D, ")")
+    print(">> [STEP] bobot global siap (packed", bits, "bit, V=", V, " D=", D,
+          " lm_signs=", lm_signs != UnsafePointer[Float32, MutAnyOrigin](), ")")
 
     # ---------------- 4. Muat bobot per layer (dengan fusion Paket C) ----------------
     var n_layers = cfg.num_hidden_layers
@@ -667,50 +1097,109 @@ fn main() raises:
 
         if is_linear:
             # GDN: in_proj_all (fused) atau fusion manual qkv+z+b+a
+            # Bonsai-2: in_proj_b / in_proj_a adalah F32 [H_v, D] TIDAK
+            # terkuantisasi dan TIDAK terfold (satu-satunya modul LM dense di
+            # pack ini). Mereka menjadi EKOR DENSE [n_tail, K] pada
+            # QwenLinear1Bit — layout output GDN tetap [qkv | z | b | a].
             var w_all = UnsafePointer[UInt8, MutAnyOrigin]()
             var s_all = UnsafePointer[Float32, MutAnyOrigin]()
             var b_all = UnsafePointer[Float32, MutAnyOrigin]()
             var n_all = 0
             var k_all = 0
+            var tail_w = UnsafePointer[Float32, MutAnyOrigin]()
+            var n_tail = 0
+            # b/a dense (F32) — ada di pack Bonsai-2 maupun 1-bit lama TIDAK
+            # memilikinya (semua 4 sub-modul terkuantisasi).
+            var e_ib = find_flex(index, prefix + "linear_attn.in_proj_b.weight")
+            var e_ia = find_flex(index, prefix + "linear_attn.in_proj_a.weight")
+            if bits == 2 and e_ib != -1 and e_ia != -1:
+                var n_b = index.dim0(e_ib)
+                var k_b = index.entries[e_ib].d1
+                var n_a = index.dim0(e_ia)
+                var k_a = index.entries[e_ia].d1
+                if k_b != k_a or n_b != n_a:
+                    raise Error(
+                        "FATAL: in_proj_b/a shape tidak konsisten pada layer "
+                        + String(li)
+                    )
+                var bb = alloc[Float32](n_b * k_b)
+                must_read_f32(index, e_ib, bb, n_b * k_b, prefix + "in_proj_b")
+                var aa = alloc[Float32](n_a * k_a)
+                must_read_f32(index, e_ia, aa, n_a * k_a, prefix + "in_proj_a")
+                tail_w = fuse_f32(bb, n_b * k_b, aa, n_a * k_a)
+                n_tail = n_b + n_a
+                bb.free()
+                aa.free()
+            elif bits == 2 and (e_ib != -1 or e_ia != -1):
+                raise Error(
+                    "FATAL: hanya salah satu in_proj_b/a ditemukan layer "
+                    + String(li)
+                )
             var e_fused_w = find_flex(index, prefix + "linear_attn.in_proj_all.weight")
             if e_fused_w != -1:
                 var nb = index.entries[e_fused_w].nbytes
                 w_all = alloc[UInt8](nb)
                 must_read_raw(index, e_fused_w, w_all, nb, prefix + "linear_attn.in_proj_all.weight")
                 n_all = index.dim0(e_fused_w)
-                k_all = nb * 8 // n_all
+                k_all = nb * 8 // bits // n_all
                 var e_fused_s = find_flex(index, prefix + "linear_attn.in_proj_all.scales")
-                s_all = read_scales_eff(index, e_fused_s, n_all * (k_all // 128))
+                s_all = read_scales_eff(index, e_fused_s, n_all * (k_all // 128), bits)
                 var e_fused_b = find_flex(index, prefix + "linear_attn.in_proj_all.biases")
                 b_all = read_biases_f32(index, e_fused_b, n_all * (k_all // 128))
                 if e_fused_b != -1:
                     verify_affine_zero_bias(
-                        s_all, b_all, n_all * (k_all // 128), True,
-                        prefix + "linear_attn.in_proj_all"
+                        s_all, b_all, n_all * (k_all // 128), bits == 1,
+                        prefix + "linear_attn.in_proj_all", bits
                     )
             else:
-                # fusion manual 4 proyeksi (paritas loader.py)
-                var pq = load_qlinear(index, prefix + "linear_attn.in_proj_qkv.weight", prefix + "linear_attn.in_proj_qkv.scales", prefix + "linear_attn.in_proj_qkv.biases")
-                var pz = load_qlinear(index, prefix + "linear_attn.in_proj_z.weight", prefix + "linear_attn.in_proj_z.scales", prefix + "linear_attn.in_proj_z.biases")
-                var pb = load_qlinear(index, prefix + "linear_attn.in_proj_b.weight", prefix + "linear_attn.in_proj_b.scales", prefix + "linear_attn.in_proj_b.biases")
-                var pa = load_qlinear(index, prefix + "linear_attn.in_proj_a.weight", prefix + "linear_attn.in_proj_a.scales", prefix + "linear_attn.in_proj_a.biases")
-                if not (pq.ok and pz.ok and pb.ok and pa.ok):
+                # fusion manual (paritas loader.py).
+                # 1-bit: qkv+z+b+a semua terkuantisasi -> fuse 4.
+                # 2-bit : qkv+z terkuantisasi -> fuse 2 (b/a jadi ekor dense).
+                var pq = load_qlinear(index, prefix + "linear_attn.in_proj_qkv.weight", prefix + "linear_attn.in_proj_qkv.scales", prefix + "linear_attn.in_proj_qkv.biases", bits)
+                var pz = load_qlinear(index, prefix + "linear_attn.in_proj_z.weight", prefix + "linear_attn.in_proj_z.scales", prefix + "linear_attn.in_proj_z.biases", bits)
+                if not (pq.ok and pz.ok):
                     raise Error(
                         "FATAL: bobot GDN tidak lengkap pada layer " + String(li)
-                        + " (in_proj_qkv/z/b/a)."
+                        + " (in_proj_qkv/z)."
                     )
                 var w01 = fuse_u8(pq.w, pq.nbytes, pz.w, pz.nbytes)
-                var w23 = fuse_u8(pb.w, pb.nbytes, pa.w, pa.nbytes)
-                w_all = fuse_u8(w01, pq.nbytes + pz.nbytes, w23, pb.nbytes + pa.nbytes)
                 var s01 = fuse_f32(pq.scales, pq.n_rows * (pq.k_dim // 128), pz.scales, pz.n_rows * (pz.k_dim // 128))
-                var s23 = fuse_f32(pb.scales, pb.n_rows * (pb.k_dim // 128), pa.scales, pa.n_rows * (pa.k_dim // 128))
-                s_all = fuse_f32(s01, (pq.n_rows + pz.n_rows) * (pq.k_dim // 128), s23, (pb.n_rows + pa.n_rows) * (pb.k_dim // 128))
                 var b01 = fuse_f32(pq.biases, pq.n_rows * (pq.k_dim // 128), pz.biases, pz.n_rows * (pz.k_dim // 128))
-                var b23 = fuse_f32(pb.biases, pb.n_rows * (pb.k_dim // 128), pa.biases, pa.n_rows * (pa.k_dim // 128))
-                b_all = fuse_f32(b01, (pq.n_rows + pz.n_rows) * (pq.k_dim // 128), b23, (pb.n_rows + pa.n_rows) * (pb.k_dim // 128))
-                n_all = pq.n_rows + pz.n_rows + pb.n_rows + pa.n_rows
+                if n_tail == 0:
+                    # 1-bit: b/a juga terkuantisasi -> masukkan ke bagian packed.
+                    var pb = load_qlinear(index, prefix + "linear_attn.in_proj_b.weight", prefix + "linear_attn.in_proj_b.scales", prefix + "linear_attn.in_proj_b.biases", bits)
+                    var pa = load_qlinear(index, prefix + "linear_attn.in_proj_a.weight", prefix + "linear_attn.in_proj_a.scales", prefix + "linear_attn.in_proj_a.biases", bits)
+                    if not (pb.ok and pa.ok):
+                        raise Error(
+                            "FATAL: bobot GDN tidak lengkap pada layer "
+                            + String(li) + " (in_proj_b/a 1-bit)."
+                        )
+                    var w23 = fuse_u8(pb.w, pb.nbytes, pa.w, pa.nbytes)
+                    w_all = fuse_u8(w01, pq.nbytes + pz.nbytes, w23, pb.nbytes + pa.nbytes)
+                    var s23 = fuse_f32(pb.scales, pb.n_rows * (pb.k_dim // 128), pa.scales, pa.n_rows * (pa.k_dim // 128))
+                    s_all = fuse_f32(s01, (pq.n_rows + pz.n_rows) * (pq.k_dim // 128), s23, (pb.n_rows + pa.n_rows) * (pb.k_dim // 128))
+                    var b23 = fuse_f32(pb.biases, pb.n_rows * (pb.k_dim // 128), pa.biases, pa.n_rows * (pa.k_dim // 128))
+                    b_all = fuse_f32(b01, (pq.n_rows + pz.n_rows) * (pq.k_dim // 128), b23, (pb.n_rows + pa.n_rows) * (pb.k_dim // 128))
+                    n_all = pq.n_rows + pz.n_rows + pb.n_rows + pa.n_rows
+                    w01.free()
+                    s01.free()
+                    b01.free()
+                    w23.free()
+                    s23.free()
+                    b23.free()
+                else:
+                    # 2-bit: qkv+z saja yang packed; b/a sudah jadi ekor dense.
+                    # w01/s01/b01 diambil alih (jangan di-free — ownership
+                    # berpindah ke w_all/s_all/b_all, bukan salinan).
+                    w_all = w01
+                    s_all = s01
+                    b_all = b01
+                    n_all = pq.n_rows + pz.n_rows
                 k_all = pq.k_dim
-            layers[li].gdn_in_proj_all = QwenLinear1Bit(w_all, s_all, b_all, n_all, k_all)
+            layers[li].gdn_in_proj_all = QwenLinear1Bit(
+                w_all, s_all, b_all, n_all + n_tail, k_all, bits,
+                hadamard_signs_for_k(hd, k_all), tail_w, n_tail
+            )
 
             # conv1d weight -> FP32
             var cw = alloc[Float32](cfg.gdn_conv_dim * cfg.gdn_conv_kernel)
@@ -734,17 +1223,19 @@ fn main() raises:
                 ow = alloc[UInt8](nb)
                 must_read_raw(index, e_ow, ow, nb, prefix + "linear_attn.out_proj.weight")
                 on = index.dim0(e_ow)
-                ok_ = nb * 8 // on
+                ok_ = nb * 8 // bits // on
                 var e_os = find_flex(index, prefix + "linear_attn.out_proj.scales")
-                os_ = read_scales_eff(index, e_os, on * (ok_ // 128))
+                os_ = read_scales_eff(index, e_os, on * (ok_ // 128), bits)
                 var e_ob = find_flex(index, prefix + "linear_attn.out_proj.biases")
                 ob_ = read_biases_f32(index, e_ob, on * (ok_ // 128))
                 if e_ob != -1:
                     verify_affine_zero_bias(
-                        os_, ob_, on * (ok_ // 128), True,
-                        prefix + "linear_attn.out_proj"
+                        os_, ob_, on * (ok_ // 128), bits == 1,
+                        prefix + "linear_attn.out_proj", bits
                     )
-            layers[li].gdn_out_proj = QwenLinear1Bit(ow, os_, ob_, on, ok_)
+            layers[li].gdn_out_proj = QwenLinear1Bit(
+                ow, os_, ob_, on, ok_, bits, hadamard_signs_for_k(hd, ok_)
+            )
 
             # Parameter riil Qwen3-Next: A_log, dt_bias, norm GDN
             var e_al = find_flex(index, prefix + "linear_attn.A_log")
@@ -778,19 +1269,19 @@ fn main() raises:
             kv_idx[li] = -1
         else:
             # Gated Full Attention: q/k/v/o (eksplisit, paritas loader.py)
-            var pq = load_qlinear(index, prefix + "self_attn.q_proj.weight", prefix + "self_attn.q_proj.scales", prefix + "self_attn.q_proj.biases")
-            var pk = load_qlinear(index, prefix + "self_attn.k_proj.weight", prefix + "self_attn.k_proj.scales", prefix + "self_attn.k_proj.biases")
-            var pv = load_qlinear(index, prefix + "self_attn.v_proj.weight", prefix + "self_attn.v_proj.scales", prefix + "self_attn.v_proj.biases")
-            var po = load_qlinear(index, prefix + "self_attn.o_proj.weight", prefix + "self_attn.o_proj.scales", prefix + "self_attn.o_proj.biases")
+            var pq = load_qlinear(index, prefix + "self_attn.q_proj.weight", prefix + "self_attn.q_proj.scales", prefix + "self_attn.q_proj.biases", bits)
+            var pk = load_qlinear(index, prefix + "self_attn.k_proj.weight", prefix + "self_attn.k_proj.scales", prefix + "self_attn.k_proj.biases", bits)
+            var pv = load_qlinear(index, prefix + "self_attn.v_proj.weight", prefix + "self_attn.v_proj.scales", prefix + "self_attn.v_proj.biases", bits)
+            var po = load_qlinear(index, prefix + "self_attn.o_proj.weight", prefix + "self_attn.o_proj.scales", prefix + "self_attn.o_proj.biases", bits)
             if not (pq.ok and pk.ok and pv.ok and po.ok):
                 raise Error(
                     "FATAL: bobot attention tidak lengkap pada layer " + String(li)
                     + " (q/k/v/o_proj)."
                 )
-            layers[li].attn_q_proj = QwenLinear1Bit(pq.w, pq.scales, pq.biases, pq.n_rows, pq.k_dim)
-            layers[li].attn_k_proj = QwenLinear1Bit(pk.w, pk.scales, pk.biases, pk.n_rows, pk.k_dim)
-            layers[li].attn_v_proj = QwenLinear1Bit(pv.w, pv.scales, pv.biases, pv.n_rows, pv.k_dim)
-            layers[li].attn_o_proj = QwenLinear1Bit(po.w, po.scales, po.biases, po.n_rows, po.k_dim)
+            layers[li].attn_q_proj = QwenLinear1Bit(pq.w, pq.scales, pq.biases, pq.n_rows, pq.k_dim, bits, hadamard_signs_for_k(hd, pq.k_dim))
+            layers[li].attn_k_proj = QwenLinear1Bit(pk.w, pk.scales, pk.biases, pk.n_rows, pk.k_dim, bits, hadamard_signs_for_k(hd, pk.k_dim))
+            layers[li].attn_v_proj = QwenLinear1Bit(pv.w, pv.scales, pv.biases, pv.n_rows, pv.k_dim, bits, hadamard_signs_for_k(hd, pv.k_dim))
+            layers[li].attn_o_proj = QwenLinear1Bit(po.w, po.scales, po.biases, po.n_rows, po.k_dim, bits, hadamard_signs_for_k(hd, po.k_dim))
 
             # Bobot Q-Norm & K-Norm per head (paritas mlx-lm qwen3_next)
             var e_qn = find_flex(index, prefix + "self_attn.q_norm.weight")
@@ -826,20 +1317,23 @@ fn main() raises:
             var wb = alloc[UInt8](nb)
             must_read_raw(index, e_guw, wb, nb, prefix + "mlp.gate_up_proj.weight")
             var nn = index.dim0(e_guw)
-            var kk = nb * 8 // nn
+            var kk = nb * 8 // bits // nn
             var e_gus = find_flex(index, prefix + "mlp.gate_up_proj.scales")
-            var sb = read_scales_eff(index, e_gus, nn * (kk // 128))
+            var sb = read_scales_eff(index, e_gus, nn * (kk // 128), bits)
             var e_gub = find_flex(index, prefix + "mlp.gate_up_proj.biases")
             var gb = read_biases_f32(index, e_gub, nn * (kk // 128))
             if e_gub != -1:
                 verify_affine_zero_bias(
-                    sb, gb, nn * (kk // 128), True, prefix + "mlp.gate_up_proj"
+                    sb, gb, nn * (kk // 128), bits == 1, prefix + "mlp.gate_up_proj", bits
                 )
-            layers[li].mlp_gate_up_proj = QwenLinear1Bit(wb, sb, gb, nn, kk)
+            layers[li].mlp_gate_up_proj = QwenLinear1Bit(
+                wb, sb, gb, nn, kk, bits, hadamard_signs_for_k(hd, kk)
+            )
         else:
-            # MLP: fusion gate+up (paritas loader.py)
-            var pg = load_qlinear(index, prefix + "mlp.gate_proj.weight", prefix + "mlp.gate_proj.scales", prefix + "mlp.gate_proj.biases")
-            var pu = load_qlinear(index, prefix + "mlp.up_proj.weight", prefix + "mlp.up_proj.scales", prefix + "mlp.up_proj.biases")
+            # MLP: fusion gate+up (paritas loader.py). gate & up sama-sama
+            # K=D -> berbagi vektor signs yang sama -> fusion EKSAK.
+            var pg = load_qlinear(index, prefix + "mlp.gate_proj.weight", prefix + "mlp.gate_proj.scales", prefix + "mlp.gate_proj.biases", bits)
+            var pu = load_qlinear(index, prefix + "mlp.up_proj.weight", prefix + "mlp.up_proj.scales", prefix + "mlp.up_proj.biases", bits)
             if not (pg.ok and pu.ok):
                 raise Error(
                     "FATAL: bobot MLP tidak lengkap pada layer " + String(li)
@@ -849,7 +1343,8 @@ fn main() raises:
                 fuse_u8(pg.w, pg.nbytes, pu.w, pu.nbytes),
                 fuse_f32(pg.scales, pg.n_rows * (pg.k_dim // 128), pu.scales, pu.n_rows * (pu.k_dim // 128)),
                 fuse_f32(pg.biases, pg.n_rows * (pg.k_dim // 128), pu.biases, pu.n_rows * (pu.k_dim // 128)),
-                pg.n_rows + pu.n_rows, pg.k_dim
+                pg.n_rows + pu.n_rows, pg.k_dim, bits,
+                hadamard_signs_for_k(hd, pg.k_dim)
             )
         var e_dw = find_flex(index, prefix + "mlp.down_proj.weight")
         var e_ds = find_flex(index, prefix + "mlp.down_proj.scales")
@@ -859,14 +1354,16 @@ fn main() raises:
             var wb = alloc[UInt8](nb)
             must_read_raw(index, e_dw, wb, nb, prefix + "mlp.down_proj.weight")
             var nn = index.dim0(e_dw)
-            var kk = nb * 8 // nn
-            var sb = read_scales_eff(index, e_ds, nn * (kk // 128))
+            var kk = nb * 8 // bits // nn
+            var sb = read_scales_eff(index, e_ds, nn * (kk // 128), bits)
             var db = read_biases_f32(index, e_db, nn * (kk // 128))
             if e_db != -1:
                 verify_affine_zero_bias(
-                    sb, db, nn * (kk // 128), True, prefix + "mlp.down_proj"
+                    sb, db, nn * (kk // 128), bits == 1, prefix + "mlp.down_proj", bits
                 )
-            layers[li].mlp_down_proj = QwenLinear1Bit(wb, sb, db, nn, kk)
+            layers[li].mlp_down_proj = QwenLinear1Bit(
+                wb, sb, db, nn, kk, bits, hadamard_signs_for_k(hd, kk)
+            )
 
     print(">> Bobot termuat:", n_layers, "layer (", n_gdn, "GDN,", n_kv, "attention )")
     print(">> [AFFINE] kontrak biases == -scales_ckpt/2 terverifikasi utk "
@@ -1086,27 +1583,47 @@ fn main() raises:
         else:
             print(">> [SAMPLE] mati — decoding greedy (argmax)")
 
-        # Upload embedding 1-bit ke VRAM SEKALI (packed + skala + bias):
+        # Upload embedding ke VRAM SEKALI (packed + skala + bias):
         # lookup per token jalan di GPU (embed_lookup_1bit_sm75) — menghapus
         # dequant CPU + cast skalar + H2D PCIe pada SETIAP token.
+        # Bonsai-2 (bits=2): embed U32 [V, K/16] + inverse FWHT — lookup
+        # dikerjakan di HOST (1 baris K elemen per token; biaya ~puluhan µs)
+        # sehingga upload 318 MB ke VRAM TIDAK diperlukan; hanya buffer
+        # scratch F16 [K] + 2 buffer host [K] yang dibuat sekali.
+        var embed_w_dev = UnsafePointer[UInt8, MutAnyOrigin]()
+        var embed_s_dev = UnsafePointer[Float32, MutAnyOrigin]()
+        var embed_b_dev = UnsafePointer[Float32, MutAnyOrigin]()
+        # Slot DeviceBuffer di scope luar agar buffer bertahan seumur hidup
+        # loop decode (RAII di dalam if-branch akan membebaskannya terlalu
+        # dini sedangkan raw pointer masih dipakai).
         var embed_w_dev_buf = alloc[DeviceBuffer[DType.uint8]](1)
-        embed_w_dev_buf.init_pointee_move(
-            gpu_ctx_ptr[].enqueue_create_buffer[DType.uint8](index.entries[e_emb].nbytes)
-        )
-        gpu_ctx_ptr[].enqueue_copy(embed_w_dev_buf[], embed_w)
         var embed_s_dev_buf = alloc[DeviceBuffer[DType.float32]](1)
-        embed_s_dev_buf.init_pointee_move(
-            gpu_ctx_ptr[].enqueue_create_buffer[DType.float32](V_emb * (D_real // 128))
-        )
-        gpu_ctx_ptr[].enqueue_copy(embed_s_dev_buf[], embed_s)
         var embed_b_dev_buf = alloc[DeviceBuffer[DType.float32]](1)
-        embed_b_dev_buf.init_pointee_move(
-            gpu_ctx_ptr[].enqueue_create_buffer[DType.float32](V_emb * (D_real // 128))
-        )
-        gpu_ctx_ptr[].enqueue_copy(embed_b_dev_buf[], embed_b)
-        var embed_w_dev = embed_w_dev_buf[].unsafe_ptr()
-        var embed_s_dev = embed_s_dev_buf[].unsafe_ptr()
-        var embed_b_dev = embed_b_dev_buf[].unsafe_ptr()
+        var embed_b2_scratch = alloc[DeviceBuffer[T]](1)
+        var embed_row32 = UnsafePointer[Float32, MutAnyOrigin]()
+        var embed_row16 = UnsafePointer[Scalar[T], MutAnyOrigin]()
+        if bits == 1:
+            embed_w_dev_buf.init_pointee_move(
+                gpu_ctx_ptr[].enqueue_create_buffer[DType.uint8](index.entries[e_emb].nbytes)
+            )
+            gpu_ctx_ptr[].enqueue_copy(embed_w_dev_buf[], embed_w)
+            embed_s_dev_buf.init_pointee_move(
+                gpu_ctx_ptr[].enqueue_create_buffer[DType.float32](V_emb * (D_real // 128))
+            )
+            gpu_ctx_ptr[].enqueue_copy(embed_s_dev_buf[], embed_s)
+            embed_b_dev_buf.init_pointee_move(
+                gpu_ctx_ptr[].enqueue_create_buffer[DType.float32](V_emb * (D_real // 128))
+            )
+            gpu_ctx_ptr[].enqueue_copy(embed_b_dev_buf[], embed_b)
+            embed_w_dev = embed_w_dev_buf[].unsafe_ptr()
+            embed_s_dev = embed_s_dev_buf[].unsafe_ptr()
+            embed_b_dev = embed_b_dev_buf[].unsafe_ptr()
+        else:
+            embed_b2_scratch.init_pointee_move(
+                gpu_ctx_ptr[].enqueue_create_buffer[T](D_real)
+            )
+            embed_row32 = alloc[Float32](D_real)
+            embed_row16 = alloc[Scalar[T]](D_real)
 
         # Timer prefill mulai SETELAH upload embedding (~238 MB via PCIe) —
         # itu biaya setup one-time, bukan beban latensi prompt.
@@ -1161,30 +1678,47 @@ fn main() raises:
             var h_pf_sw = alloc[DeviceBuffer[T]](1)
             h_pf_sw.init_pointee_move(gpu_ctx_ptr[].enqueue_create_buffer[T](chunk_len * cfg.intermediate_size))
             var pf_sw = h_pf_sw[].unsafe_ptr()
+            # Scratch FWHT 2-bit: SATU buffer bersama untuk seluruh modul.
+            # Ukurannya mengikuti K terbesar (down_proj = cfg.intermediate_size).
+            # Aman dipakai bergantian karena setiap modul meng-enqueue
+            # FWHT -> GEMM secara berurutan pada stream yang sama.
+            var h_pf_fwht = alloc[DeviceBuffer[T]](1)
+            h_pf_fwht.init_pointee_move(gpu_ctx_ptr[].enqueue_create_buffer[T](chunk_len * cfg.intermediate_size))
+            var pf_fwht = h_pf_fwht[].unsafe_ptr()
 
             var pos_pf = 0
             while pos_pf < prompt_len:
                 var m = min(PF_CHUNK, prompt_len - pos_pf)
                 # Embed lookup per baris (M row di pf_hidden)
                 for t in range(m):
-                    embed_lookup_1bit_sm75_launch_on[T](
-                        gpu_ctx_ptr[], embed_w_dev, embed_s_dev, embed_b_dev,
-                        pf_hidden.offset(t * D), ptoks[pos_pf + t + 1], D
-                    )
+                    if bits == 1:
+                        embed_lookup_1bit_sm75_launch_on[T](
+                            gpu_ctx_ptr[], embed_w_dev, embed_s_dev, embed_b_dev,
+                            pf_hidden.offset(t * D), ptoks[pos_pf + t + 1], D
+                        )
+                    else:
+                        embed_lookup_2bit_to_dev(
+                            gpu_ctx_ptr, embed_w, embed_s, embed_b, embed_signs,
+                            ptoks[pos_pf + t + 1], D, hd.block,
+                            pf_hidden.offset(t * D), embed_b2_scratch[],
+                            embed_row32, embed_row16
+                        )
                 for li in range(n_layers):
                     if layers[li].is_linear:
                         layers[li].forward_prefill_gpu(
                             pf_hidden, pf_xn, pf_sub, pf_mlp,
                             pf_proj, pf_conv, pf_qn, pf_kn, pf_gdn,
                             pf_gu, pf_sw, act_attn_scores_dev,
-                            gdn_states[gdn_idx[li]], kv_caches[0], pos_pf, m
+                            gdn_states[gdn_idx[li]], kv_caches[0], pos_pf, m,
+                            pf_fwht
                         )
                     else:
                         layers[li].forward_prefill_gpu(
                             pf_hidden, pf_xn, pf_sub, pf_mlp,
                             pf_proj, pf_conv, pf_qn, pf_kn, pf_gdn,
                             pf_gu, pf_sw, act_attn_scores_dev,
-                            gdn_states[0], kv_caches[kv_idx[li]], pos_pf, m
+                            gdn_states[0], kv_caches[kv_idx[li]], pos_pf, m,
+                            pf_fwht
                         )
                 pos_pf += m
             pos = pos_pf
@@ -1220,10 +1754,18 @@ fn main() raises:
             # Fallback per-token (GEMV decode per baris; hasil identik)
             for t in range(prompt_len):
                 var cur_tok = ptoks[t + 1]
-                embed_lookup_1bit_sm75_launch_on[T](
-                    gpu_ctx_ptr[], embed_w_dev, embed_s_dev, embed_b_dev,
-                    h_hidden_holder[].unsafe_ptr(), cur_tok, D
-                )
+                if bits == 1:
+                    embed_lookup_1bit_sm75_launch_on[T](
+                        gpu_ctx_ptr[], embed_w_dev, embed_s_dev, embed_b_dev,
+                        h_hidden_holder[].unsafe_ptr(), cur_tok, D
+                    )
+                else:
+                    embed_lookup_2bit_to_dev(
+                        gpu_ctx_ptr, embed_w, embed_s, embed_b, embed_signs,
+                        cur_tok, D, hd.block,
+                        h_hidden_holder[].unsafe_ptr(), embed_b2_scratch[],
+                        embed_row32, embed_row16
+                    )
 
                 for li in range(n_layers):
                     if layers[li].is_linear:
@@ -1299,10 +1841,18 @@ fn main() raises:
 
         for step in range(max_tokens - 1):
             var t0 = monotonic()
-            embed_lookup_1bit_sm75_launch_on[T](
-                gpu_ctx_ptr[], embed_w_dev, embed_s_dev, embed_b_dev,
-                h_hidden_holder[].unsafe_ptr(), next_tok, D
-            )
+            if bits == 1:
+                embed_lookup_1bit_sm75_launch_on[T](
+                    gpu_ctx_ptr[], embed_w_dev, embed_s_dev, embed_b_dev,
+                    h_hidden_holder[].unsafe_ptr(), next_tok, D
+                )
+            else:
+                embed_lookup_2bit_to_dev(
+                    gpu_ctx_ptr, embed_w, embed_s, embed_b, embed_signs,
+                    next_tok, D, hd.block,
+                    h_hidden_holder[].unsafe_ptr(), embed_b2_scratch[],
+                    embed_row32, embed_row16
+                )
 
             for li in range(n_layers):
                 var tl = monotonic()

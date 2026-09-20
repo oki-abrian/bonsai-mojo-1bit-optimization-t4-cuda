@@ -469,6 +469,14 @@ fn main() raises:
     all_ok = run_norm_gate_test(ctx, "normgate_h4_dv128_ok", 4, 128, 0, tol_ng) and all_ok
     # Bentuk kecil tambahan (latensi tes rendah, cakupan head > 1).
     all_ok = run_norm_gate_test(ctx, "normgate_h2_dv16_ok", 2, 16, 0, tol_ng) and all_ok
+    # Reduksi warp non-trivial (regresi 2026-09-20): jalur umum harus benar untuk
+    # D_v yang BUKAN 128. D_v=64/96 = warp penuh tapi < 4 warp (tahap antar-warp
+    # lama membaca smem yang tak pernah ditulis); D_v=48 = warp terakhir parsial
+    # (ladder shuffle lama membaca lane mati). Sebelum perbaikan ketiganya
+    # menghasilkan RMS yang salah besar tanpa crash.
+    all_ok = run_norm_gate_test(ctx, "normgate_h2_dv48_ok", 2, 48, 0, tol_ng) and all_ok
+    all_ok = run_norm_gate_test(ctx, "normgate_h2_dv64_ok", 2, 64, 0, tol_ng) and all_ok
+    all_ok = run_norm_gate_test(ctx, "normgate_h2_dv96_ok", 2, 96, 0, tol_ng) and all_ok
 
     # Urutan LAMA: diharapkan GAGAL. Kalau justru lolos, tes ini tidak punya
     # daya-beda dan regresi BUG-1 tidak akan pernah tertangkap.

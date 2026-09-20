@@ -123,12 +123,7 @@ export PATH="$PIXI_HOME/bin:$HOME/.pixi/bin:$MAGIC_HOME/bin:$PATH"
 CCACHE_BIN=""
 if command -v ccache >/dev/null 2>&1; then
     CCACHE_BIN="$(command -v ccache)"
-elif [ -x "$CACHE_DIR/bin/ccache" ] && "$CACHE_DIR/bin/ccache" --version >/dev/null 2>&1; then
-    # Biner cache WAJIB diuji dulu. Cache kini bisa berasal dari kernel LAIN
-    # (kernel CPU) yang lingkungan paketnya berbeda: biner ccache paket apt
-    # Ubuntu butuh libhiredis.so.0.14, dan lib itu tidak ikut terarsipkan.
-    # Tanpa uji ini, biner rusak dipakai apa adanya -> `nvcc` gagal dengan
-    # exit 127 -> `set -e` membunuh skrip sebelum fallback sempat jalan.
+elif [ -x "$CACHE_DIR/bin/ccache" ]; then
     CCACHE_BIN="$CACHE_DIR/bin/ccache"
 else
     echo ">> [CCACHE] Belum tersedia — mencoba memasang sekali (biner disimpan ke cache)..."
@@ -203,219 +198,6 @@ export PATH="/usr/local/cuda/bin:$PATH"
 export BONSAI_CUDA_LIB="$WORKING/libbonsai_qmv_sm75.so"
 export LD_LIBRARY_PATH="$WORKING:$REPO_DIR:$REPO_DIR/build:$WORKING/build:${LD_LIBRARY_PATH:-}"
 
-# -------------------------------------------------------------------------
-# nvcc TIDAK memerlukan GPU. Ia cross-compiler: menghasilkan kode sm_75 dari
-# sumber .cu tanpa pernah menyentuh device. Karena itu instance CPU-only pun
-# sanggup membangun libbonsai_qmv_sm75.so — asal toolchain-nya ada.
-# Tanpa blok ini, cabang `else` di bawah SELALU terambil di instance CPU,
-# sehingga artefak .so tidak pernah terbentuk.
-#
-# TOOLCHAIN-NYA DI-CACHE: seluruh isi $CACHE_DIR diarsipkan §6 ke
-# mojo_build_cache.tar.gz, jadi prefix CUDA ditaruh DI DALAM $CACHE_DIR
-# (bukan di /usr). Akibatnya run berikutnya cukup memakai hasil ekstrak run
-# sebelumnya — tanpa unduh, tanpa apt, tanpa instal ulang.
-#
-# Yang diambil hanya paket yang benar-benar diperlukan untuk mengompilasi
-# qmv_sm75_kernel.cu (~51 MB unduhan). Isi tiap paket diperiksa langsung dari
-# berkas .deb-nya, bukan diasumsikan:
-#   cuda-nvcc-*       : bin/nvcc, nvcc.profile, ptxas, cudafe++, fatbinary,
-#                       nvlink, bin2c, crt/{link,prelink}.stub
-#   cuda-nvvm-*       : nvvm/bin/cicc + nvvm/libdevice/libdevice.10.bc
-#   cuda-cudart-dev-* : include/mma.h, cuda_runtime.h, cuda_fp16.h, cuda_bf16.h
-#   cuda-crt-*        : include/crt/*.h — termasuk crt/mma.h yang di-include
-#                       oleh mma.h; qmv_sm75_kernel.cu memakainya tanpa guard
-#                       (jalur WMMA prefill), jadi wajib ada.
-#   cuda-cccl-*       : include/nv/target, yang di-include oleh cuda_fp16.h
-#                       (baris 4100). TANPA paket ini nvcc tetap berjalan normal
-#                       dan `nvcc --version` sukses, tetapi kompilasi kernel
-#                       gagal: "fatal error: nv/target: No such file or
-#                       directory". Inilah sebabnya validasi prefix tidak cukup
-#                       dengan `nvcc --version` (lihat nvcc_ok di bawah).
-#   cuda-cuobjdump-*  : cuobjdump, dipakai verifikasi SASS di bawah.
-# Prefix ini RELATIF dan aman dipindah: nvcc.profile memakai TOP=$(_HERE_)/..,
-# sehingga nvcc menemukan include/ nvvm/ ptxas dari lokasinya sendiri. Satu
-# hal yang tidak relatif: cicc tidak punya RPATH, jadi nvvm/lib64 harus
-# disebut eksplisit di LD_LIBRARY_PATH (lihat cuda_activate).
-# Lewati dengan BONSAI_SKIP_NVCC_INSTALL=1.
-# -------------------------------------------------------------------------
-CUDA_PREFIX="$CACHE_DIR/cuda"
-# Nama PAKET memakai tanda hubung (cuda-nvcc-12-4) tetapi DIREKTORI pemasangan
-# memakai titik (usr/local/cuda-12.4). Menyamakan keduanya membuat CUDA_HOME
-# menunjuk direktori yang tidak ada, dan kegagalannya SENYAP: nvcc dianggap
-# "tidak tersedia" lalu jatuh ke fallback Mojo native tanpa sebab yang jelas.
-CUDA_KIT="${BONSAI_CUDA_KIT:-12-4}"
-CUDA_HOME="$CUDA_PREFIX/usr/local/cuda-${CUDA_KIT//-/.}"
-CUDA_REPO="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64"
-# Daftar ini harus sepadan dengan CUDA_KIT di atas (12-4).
-CUDA_DEBS=(
-    "cuda-nvcc-12-4_12.4.131-1_amd64.deb"
-    "cuda-nvvm-12-4_12.4.131-1_amd64.deb"
-    "cuda-cudart-dev-12-4_12.4.127-1_amd64.deb"
-    "cuda-crt-12-4_12.4.131-1_amd64.deb"
-    "cuda-cccl-12-4_12.4.127-1_amd64.deb"
-    "cuda-cuobjdump-12-4_12.4.127-1_amd64.deb"
-    "cuda-nvdisasm-12-4_12.4.127-1_amd64.deb"
-)
-
-# Penanda daftar paket. Bila CUDA_DEBS berubah, prefix yang sudah ter-cache
-# HARUS dibangun ulang — nvcc_ok hanya menguji "sanggup mengompilasi probe",
-# bukan "berisi semua paket dalam daftar". Tanpa penanda ini, menambah paket
-# tidak pernah berlaku: prefix lama tetap lolos uji dan paket baru tak terpasang.
-CUDA_STAMP="$CUDA_PREFIX/.cuda_debs"
-cuda_stamp_now() { printf '%s\n' "${CUDA_DEBS[@]}" | sort; }
-
-cuda_activate() {
-    export PATH="$CUDA_HOME/bin:$CUDA_HOME/nvvm/bin:$PATH"
-    # cicc TIDAK punya DT_RPATH/DT_RUNPATH (diperiksa langsung pada binernya),
-    # jadi libnvvm harus ditemukan lewat LD_LIBRARY_PATH — bukan diasumsikan
-    # ketemu sendiri.
-    export LD_LIBRARY_PATH="$CUDA_HOME/nvvm/lib64:$CUDA_HOME/lib64:$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
-    export CUDA_HOME
-    export CUDA_PATH="$CUDA_HOME"
-}
-
-# URUTAN PRIORITAS — sengaja begini agar instance yang SUDAH punya CUDA sendiri
-# (kernel GPU) tidak berubah perilakunya: prefix cache hanya dipakai bila
-# instance tidak menyediakan nvcc, yaitu kasus instance CPU-only.
-#   1. nvcc sudah ada di PATH            -> pakai apa adanya
-#   2. pemasangan standar belum di PATH  -> tambahkan ke PATH
-#   3. prefix cache persisten            -> tanpa unduh, tanpa instal
-#   4. unduh + ekstrak ke prefix cache   -> hasilnya ikut terarsip §6
-#   5. paket distro (apt)                -> TIDAK ter-cache, jaring terakhir
-#
-# Setiap anak tangga diuji dengan `nvcc_ok`, BUKAN dengan `nvcc --version`.
-# Alasannya konkret, bukan teori: sebuah prefix yang headernya tidak lengkap
-# (pernah terjadi — paket cuda-cccl belum masuk daftar, padahal cuda_fp16.h
-# menyertakan <nv/target>) tetap menjawab `nvcc --version` dengan sukses, lalu
-# gagal hanya saat mengompilasi kernel. Lebih buruk lagi, prefix yang rusak itu
-# IKUT TERARSIP di §6, sehingga run berikutnya memulihkannya dan gagal dengan
-# cara yang sama persis. Tanpa uji kompilasi, kegagalannya menetap.
-
-# Uji nyata: kompilasi probe yang menyertakan header yang SAMA dengan
-# qmv_sm75_kernel.cu (cuda_runtime.h, cuda_fp16.h, cuda_bf16.h, mma.h) dan
-# memanggil __expf supaya libdevice ikut teruji, bukan hanya headernya.
-nvcc_ok() {
-    command -v nvcc >/dev/null 2>&1 || return 1
-    nvcc --version >/dev/null 2>&1 || return 1
-    local _probe="${TMPDIR:-/tmp}/bonsai_cuda_probe.cu"
-    local _probeo="${TMPDIR:-/tmp}/bonsai_cuda_probe.o"
-    local _rc
-    cat > "$_probe" <<'PROBE'
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-#include <mma.h>
-__global__ void bonsai_probe_kernel(const __half2 *a, float *b) {
-    b[threadIdx.x] = __expf(__half2float(a[threadIdx.x].x));
-}
-PROBE
-    nvcc -arch=sm_75 -c "$_probe" -o "$_probeo" >/dev/null 2>&1
-    _rc=$?
-    rm -f "$_probe" "$_probeo"
-    return $_rc
-}
-
-# (1) Hormati nvcc bawaan instance.
-if nvcc_ok; then
-    echo ">> [NVCC] Memakai nvcc bawaan instance: $(nvcc --version | grep 'release' || true)"
-fi
-
-# (2) Pemasangan yang sudah ada tetapi belum masuk PATH. PATH dikembalikan bila
-#     kandidatnya ternyata tidak sanggup mengompilasi, supaya tidak membayangi
-#     prefix cache di anak tangga berikutnya.
-if ! nvcc_ok; then
-    for _cand in /usr/local/cuda*/bin/nvcc /usr/bin/nvcc /opt/cuda*/bin/nvcc; do
-        if [ -x "$_cand" ]; then
-            _saved_path="$PATH"
-            export PATH="$(dirname "$_cand"):$PATH"
-            if nvcc_ok; then
-                echo ">> [NVCC] Ditemukan tanpa pemasangan baru: $_cand"
-                break
-            fi
-            export PATH="$_saved_path"
-        fi
-    done
-fi
-
-# (3) Prefix cache persisten.
-if ! nvcc_ok && [ -x "$CUDA_HOME/bin/nvcc" ]; then
-    cuda_activate
-    if nvcc_ok && [ -f "$CUDA_STAMP" ] && [ "$(cuda_stamp_now)" = "$(cat "$CUDA_STAMP")" ]; then
-        echo ">> [NVCC] Dari cache persisten (tanpa unduh/instal): $(nvcc --version | grep 'release' || true)"
-    else
-        echo ">> [NVCC] Prefix cache ada tetapi TIDAK LENGKAP (probe gagal, atau daftar paket berubah) — dibangun ulang."
-        rm -rf "$CUDA_PREFIX"
-    fi
-fi
-
-# (4) Bangun prefix cache bila belum ada, tidak lengkap, atau tidak bisa jalan.
-if [ -z "${BONSAI_SKIP_NVCC_INSTALL:-}" ] && ! nvcc_ok; then
-    echo ">> [NVCC] Toolchain belum ada di cache — mengunduh paket CUDA (tanpa GPU)..."
-    mkdir -p "$CUDA_PREFIX"
-    _cuda_dl=1
-    for _deb in "${CUDA_DEBS[@]}"; do
-        if curl -fsSL --retry 3 -o "/tmp/$_deb" "$CUDA_REPO/$_deb"; then
-            echo ">> [NVCC]   terunduh: $_deb ($(du -h "/tmp/$_deb" 2>/dev/null | cut -f1))"
-        else
-            echo ">> [NVCC]   GAGAL unduh: $_deb"
-            _cuda_dl=0
-            break
-        fi
-    done
-
-    if [ "$_cuda_dl" = "1" ]; then
-        for _deb in "${CUDA_DEBS[@]}"; do
-            if command -v dpkg-deb >/dev/null 2>&1; then
-                dpkg-deb -x "/tmp/$_deb" "$CUDA_PREFIX" 2>/dev/null || _cuda_dl=0
-            else
-                # Tanpa dpkg-deb: .deb = ar berisi data.tar.xz.
-                ar p "/tmp/$_deb" data.tar.xz 2>/dev/null | tar -xJ -C "$CUDA_PREFIX" 2>/dev/null || _cuda_dl=0
-            fi
-            rm -f "/tmp/$_deb"
-        done
-        if [ "$_cuda_dl" = "1" ] && [ -x "$CUDA_HOME/bin/nvcc" ]; then
-            cuda_activate
-            # Catat daftar paket yang membentuk prefix ini, supaya run berikutnya
-            # tahu kapan prefix-nya sudah usang dan harus dibangun ulang.
-            cuda_stamp_now > "$CUDA_STAMP"
-            echo ">> [NVCC] Toolchain diekstrak ke cache: $CUDA_HOME ($(du -sh "$CUDA_HOME" 2>/dev/null | cut -f1))"
-            if ! nvcc_ok; then
-                echo ">> [WARN] Probe kompilasi GAGAL meski prefix baru saja dibuat —"
-                echo ">>        kesalahan nvcc yang sesungguhnya akan terlihat saat kompilasi kernel di bawah."
-            fi
-        else
-            echo ">> [NVCC] Ekstraksi paket GAGAL — prefix tidak lengkap, dihapus."
-            rm -rf "$CUDA_PREFIX"
-        fi
-    fi
-fi
-
-# (5) Cadangan terakhir: paket distro. TIDAK ikut ter-cache (letaknya tersebar
-#     di /usr, di luar $CACHE_DIR) — hanya agar build tetap jalan.
-if [ -z "${BONSAI_SKIP_NVCC_INSTALL:-}" ] && ! nvcc_ok \
-   && command -v apt-get >/dev/null 2>&1; then
-    echo ">> [NVCC] Prefix cache tidak tersedia — mencoba paket distro (TIDAK ter-cache)..."
-    apt-get update -qq >/dev/null 2>&1 || echo ">> [NVCC] apt-get update gagal — dilanjutkan"
-    if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nvidia-cuda-toolkit >/dev/null 2>&1; then
-        echo ">> [NVCC] nvidia-cuda-toolkit terpasang (tanpa cache)."
-    else
-        echo ">> [NVCC] nvidia-cuda-toolkit GAGAL dipasang."
-    fi
-    for _cand in /usr/local/cuda*/bin/nvcc /usr/bin/nvcc; do
-        if [ -x "$_cand" ]; then
-            export PATH="$(dirname "$_cand"):$PATH"
-            break
-        fi
-    done
-fi
-
-if nvcc_ok; then
-    echo ">> [NVCC] Siap dipakai: $(nvcc --version | grep 'release' || true)"
-    echo ">> [NVCC] Lokasi: $(command -v nvcc)"
-else
-    echo ">> [NVCC] nvcc TETAP tidak tersedia (atau tidak sanggup mengompilasi probe) — fallback ke Mojo native."
-fi
-
 if command -v nvcc >/dev/null 2>&1 && [ -f "$REPO_DIR/src/csrc/qmv_sm75_kernel.cu" ]; then
     echo ">> [NVCC] Ditemukan: $(nvcc --version | grep 'release' || true)"
     mkdir -p "$WORKING/build" "$REPO_DIR/build"
@@ -428,37 +210,29 @@ if command -v nvcc >/dev/null 2>&1 && [ -f "$REPO_DIR/src/csrc/qmv_sm75_kernel.c
         NVCC_CMD=("$CCACHE_BIN" nvcc)
         echo ">> [NVCC] Dijalankan lewat ccache: ${CCACHE_BIN} nvcc"
     fi
-    # `set -e` aktif (baris 8). Tanpa pembungkus `if` ini, kegagalan nvcc
-    # membunuh SELURUH skrip, sehingga cabang `else` di bawah — yang justru
-    # berniat fallback ke Mojo native — tidak pernah tercapai. Fallback itu
-    # dulu hanya berlaku saat nvcc TIDAK ADA, bukan saat nvcc GAGAL.
-    if "${NVCC_CMD[@]}" -O3 -arch=sm_75 --shared -Xcompiler -fPIC -Xptxas -v \
+    "${NVCC_CMD[@]}" -O3 -arch=sm_75 --shared -Xcompiler -fPIC -Xptxas -v \
         "$REPO_DIR/src/csrc/qmv_sm75_kernel.cu" \
-        -o "$WORKING/libbonsai_qmv_sm75.so"; then
-        echo ">> [OK] libbonsai_qmv_sm75.so berhasil dibuat ($(du -h "$WORKING/libbonsai_qmv_sm75.so" | cut -f1))"
-        if [ -n "$CCACHE_BIN" ]; then
-            # Statistik ini yang membuktikan cache benar-benar HIT/MISS — jangan
-            # diasumsikan dari konfigurasi saja.
-            echo ">> [CCACHE] Statistik setelah kompilasi nvcc:"
-            "$CCACHE_BIN" -s 2>/dev/null | head -6 || true
-        fi
-        cp "$WORKING/libbonsai_qmv_sm75.so" "$REPO_DIR/libbonsai_qmv_sm75.so" 2>/dev/null || true
-        cp "$WORKING/libbonsai_qmv_sm75.so" "$REPO_DIR/build/libbonsai_qmv_sm75.so" 2>/dev/null || true
-        cp "$WORKING/libbonsai_qmv_sm75.so" "$DIST_DIR/libbonsai_qmv_sm75.so" 2>/dev/null || true
+        -o "$WORKING/libbonsai_qmv_sm75.so"
+    echo ">> [OK] libbonsai_qmv_sm75.so berhasil dibuat ($(du -h "$WORKING/libbonsai_qmv_sm75.so" | cut -f1))"
+    if [ -n "$CCACHE_BIN" ]; then
+        # Statistik ini yang membuktikan cache benar-benar HIT/MISS — jangan
+        # diasumsikan dari konfigurasi saja.
+        echo ">> [CCACHE] Statistik setelah kompilasi nvcc:"
+        "$CCACHE_BIN" -s 2>/dev/null | head -6 || true
+    fi
+    cp "$WORKING/libbonsai_qmv_sm75.so" "$REPO_DIR/libbonsai_qmv_sm75.so" 2>/dev/null || true
+    cp "$WORKING/libbonsai_qmv_sm75.so" "$REPO_DIR/build/libbonsai_qmv_sm75.so" 2>/dev/null || true
+    cp "$WORKING/libbonsai_qmv_sm75.so" "$DIST_DIR/libbonsai_qmv_sm75.so" 2>/dev/null || true
 
-        if command -v cuobjdump >/dev/null 2>&1; then
-            echo ">> [SASS] Verifikasi instruksi SM75 LDG pada libbonsai_qmv_sm75.so:"
-            cuobjdump -sass "$WORKING/libbonsai_qmv_sm75.so" | grep -m 5 "LDG" || true
-        fi
+    if command -v cuobjdump >/dev/null 2>&1; then
+        echo ">> [SASS] Verifikasi instruksi SM75 LDG pada libbonsai_qmv_sm75.so:"
+        cuobjdump -sass "$WORKING/libbonsai_qmv_sm75.so" | grep -m 5 "LDG" || true
+    fi
 
-        # Gerbang verifikasi: smoke-test FFI & primary context sharing
-        if command -v pixi >/dev/null 2>&1 && [ -f "$REPO_DIR/tests/test_cuda_ffi_smoketest.mojo" ]; then
-            echo ">> [SMOKE-TEST] Menjalankan smoke test primary context & FFI..."
-            pixi run mojo run --target-accelerator=sm_75 -I . "$REPO_DIR/tests/test_cuda_ffi_smoketest.mojo" || echo ">> [WARN] Smoke test gagal — fallback aktif"
-        fi
-    else
-        echo ">> [WARN] nvcc GAGAL mengompilasi qmv_sm75_kernel.cu — fallback ke Mojo native"
-        rm -f "$WORKING/libbonsai_qmv_sm75.so"
+    # Gerbang verifikasi: smoke-test FFI & primary context sharing
+    if command -v pixi >/dev/null 2>&1 && [ -f "$REPO_DIR/tests/test_cuda_ffi_smoketest.mojo" ]; then
+        echo ">> [SMOKE-TEST] Menjalankan smoke test primary context & FFI..."
+        pixi run mojo run -I . "$REPO_DIR/tests/test_cuda_ffi_smoketest.mojo" || echo ">> [WARN] Smoke test gagal — fallback aktif"
     fi
 else
     echo ">> [WARN] nvcc tidak tersedia atau qmv_sm75_kernel.cu tidak ditemukan — fallback ke Mojo native"
@@ -489,69 +263,15 @@ fi
 #     menambah satu kompilasi penuh lagi.
 # -------------------------------------------------------------------------
 BONSAI_BIN=""
-
-# Sidik jari ISI sumber — BUKAN mtime. src.tar diunggah ulang pada setiap run,
-# sehingga mtime selalu baru walaupun isinya identik; hash isi mendeteksi
-# "sumber tidak berubah" dengan benar. Bila sha256sum tidak ada SRC_FP kosong,
-# dan itu FATAL di kedua cabang (tanpa sidik jari, pemakaian ulang biner tidak
-# bisa dipertanggungjawabkan).
-SRC_FP="$( { cat main.mojo 2>/dev/null
-             find src -type f -name '*.mojo' 2>/dev/null | sort \
-               | while IFS= read -r f; do cat "$f" 2>/dev/null; done
-           } | sha256sum 2>/dev/null | cut -d' ' -f1 )"
-
-# ATURAN KERAS — TANPA FALLBACK.
-#   * ADA nvidia-smi = run T4. Kompilasi WAJIB sudah selesai di build CPU.
-#     Instance GPU DILARANG mengompilasi: itu kerja CPU yang menghabiskan kuota
-#     GPU. Biner HARUS datang dari arsip cache dengan sidik jari yang cocok.
-#     Bila tidak ada atau tidak cocok -> GAGALKAN run. Tidak ada jalan
-#     belakang: jangan kompilasi ulang secara diam-diam.
-#   * TANPA nvidia-smi = build CPU. Wajib mengompilasi lalu menyimpan biner +
-#     sidik jari ke cache. Gagal kompilasi = gagalkan build.
-if command -v nvidia-smi >/dev/null 2>&1; then
-    if [ -z "$SRC_FP" ]; then
-        echo ">> [FATAL] sidik jari sumber gagal dihitung (sha256sum tidak ada?)"
-        exit 1
-    fi
-    if [ ! -s "$CACHE_DIR/bonsai_infer" ]; then
-        echo ">> [FATAL] arsip cache TIDAK memuat bonsai_infer."
-        echo ">> [FATAL] Kompilasi wajib dilakukan di build CPU (push_cpu_build.sh),"
-        echo ">> [FATAL] bukan di sini. Tidak ada fallback kompilasi di instance GPU."
-        exit 1
-    fi
-    if [ "$(cat "$CACHE_DIR/bonsai_infer.fp" 2>/dev/null)" != "$SRC_FP" ]; then
-        echo ">> [FATAL] isi sumber BERUBAH sejak biner dalam cache dibuat."
-        echo ">> [FATAL] Jalankan build CPU dulu supaya biner + sidik jari diperbarui."
-        echo ">> [FATAL] Tidak ada fallback kompilasi di instance GPU."
-        exit 1
-    fi
-    cp "$CACHE_DIR/bonsai_infer" "$WORKING/bonsai_infer" \
-        || { echo ">> [FATAL] gagal menyalin bonsai_infer dari cache"; exit 1; }
-    echo ">> [BUILD-CACHE] bonsai_infer dipakai ulang dari cache (sidik jari cocok,"
-    echo ">> [BUILD-CACHE]   $(wc -c < "$WORKING/bonsai_infer" 2>/dev/null) byte)."
-    echo ">> [BUILD-CACHE] Kompilasi DILEWATI — wajibnya sudah di build CPU."
-    BONSAI_BIN="$WORKING/bonsai_infer"
-else
-    echo ">> [BUILD] Kompilasi main.mojo (CLI inferensi native) — WAJIB di build CPU..."
+if command -v pixi >/dev/null 2>&1; then
+    echo ">> [BUILD] Kompilasi main.mojo (CLI inferensi native)..."
     rm -f "$WORKING/bonsai_infer"
-    # `--target-accelerator=sm_75` WAJIB di instance tanpa GPU: tanpa flag ini
-    # target arch di-resolve dari device -> '' -> stdlib GPU gagal dengan
-    # "the target architecture '' is invalid or not currently supported".
-    # Flag ini HIDDEN (lihat `mojo build --help-hidden`); nilai = arch telanjang.
-    if ! pixi run mojo build --target-accelerator=sm_75 -I . main.mojo -o "$WORKING/bonsai_infer"; then
-        echo ">> [FATAL] main.mojo gagal dikompilasi di build CPU."
-        exit 1
+    if pixi run mojo build -I . main.mojo -o "$WORKING/bonsai_infer"; then
+        echo ">> [OK] main.mojo terkompilasi: $WORKING/bonsai_infer"
+        BONSAI_BIN="$WORKING/bonsai_infer"
+    else
+        echo ">> [WARN] main.mojo gagal dikompilasi — wheel terbit tanpa binary"
     fi
-    echo ">> [OK] main.mojo terkompilasi: $WORKING/bonsai_infer"
-    BONSAI_BIN="$WORKING/bonsai_infer"
-    if [ -z "$SRC_FP" ] || [ ! -s "$WORKING/bonsai_infer" ]; then
-        echo ">> [FATAL] sidik jari/biner tidak valid — cache tidak bisa ditulis."
-        exit 1
-    fi
-    cp "$WORKING/bonsai_infer" "$CACHE_DIR/bonsai_infer" \
-        || { echo ">> [FATAL] gagal menyimpan bonsai_infer ke cache"; exit 1; }
-    echo "$SRC_FP" > "$CACHE_DIR/bonsai_infer.fp"
-    echo ">> [BUILD-CACHE] bonsai_infer + sidik jari disimpan ke cache."
 fi
 
 # -------------------------------------------------------------------------
@@ -661,12 +381,12 @@ fi
 echo ">> [TEST] Differential kernel GPU decode vs FP64 CPU..."
 export BONSAI_CUDA_LIB="$WORKING/libbonsai_qmv_sm75.so"
 export LD_LIBRARY_PATH="$WORKING:$REPO_DIR:$REPO_DIR/build:$WORKING/build:$DIST_DIR:$REPO_DIR/.pixi/envs/default/lib:${LD_LIBRARY_PATH:-}"
-pixi run mojo run --target-accelerator=sm_75 -I . tests/selftest_decode_gpu.mojo || echo ">> [WARN] selftest_decode_gpu GAGAL — LIHAT HASIL DI ATAS"
-pixi run mojo run --target-accelerator=sm_75 -I . tests/test_qmm_gpu.mojo || echo ">> [WARN] test_qmm_gpu GAGAL — LIHAT HASIL DI ATAS"
+pixi run mojo run -I . tests/selftest_decode_gpu.mojo || echo ">> [WARN] selftest_decode_gpu GAGAL — LIHAT HASIL DI ATAS"
+pixi run mojo run -I . tests/test_qmm_gpu.mojo || echo ">> [WARN] test_qmm_gpu GAGAL — LIHAT HASIL DI ATAS"
 # Gerbang korektness RoPE (paritas MLX traditional=False half-split) + Argmax
 # GPU: RoPE salah pairing dulu lolos semua tes matmul tanpa pernah terdeteksi.
-pixi run mojo run --target-accelerator=sm_75 -I . tests/test_rope_gpu.mojo || echo ">> [WARN] test_rope_gpu GAGAL — LIHAT HASIL DI ATAS"
-pixi run mojo run --target-accelerator=sm_75 -I . tests/test_argmax_gpu.mojo || echo ">> [WARN] test_argmax_gpu GAGAL — LIHAT HASIL DI ATAS"
+pixi run mojo run -I . tests/test_rope_gpu.mojo || echo ">> [WARN] test_rope_gpu GAGAL — LIHAT HASIL DI ATAS"
+pixi run mojo run -I . tests/test_argmax_gpu.mojo || echo ">> [WARN] test_argmax_gpu GAGAL — LIHAT HASIL DI ATAS"
 
 # Gerbang korektness PRESISI STATE GDN (fix fp16 -> fp32).
 # Kernel delta-rule sebelumnya sama sekali tidak punya test numerik. Test ini
@@ -674,7 +394,7 @@ pixi run mojo run --target-accelerator=sm_75 -I . tests/test_argmax_gpu.mojo || 
 # langkah. State FP32 harus ~1e-6; kalau kembali ke FP16 melonjak ~1000x.
 # Ini penjaga langsung terhadap regresi yang kita perbaiki.
 echo ">> [TEST] Presisi state rekurensi GDN (fp32) vs FP64..."
-if ! pixi run mojo run --target-accelerator=sm_75 -I . tests/test_gdn_state_precision.mojo; then
+if ! pixi run mojo run -I . tests/test_gdn_state_precision.mojo; then
     echo ">> [WARN] test_gdn_state_precision GAGAL — state GDN mungkin kembali FP16!"
     if [ "$BONSAI_GDN_STATE_FATAL" = "1" ]; then
         echo ">> [FATAL] BONSAI_GDN_STATE_FATAL=1 -> hentikan deploy."
@@ -687,7 +407,7 @@ fi
 # t>=1 (layer.mojo baris 484 & 523) -> kandidat kuat akar degenerasi.
 # Non-fatal; tujuannya MELAPORKAN verdict di T4. Ini penentu, bukan opsional.
 echo ">> [TEST] Diagnostik offset pointer device (enqueue_function)..."
-pixi run mojo run --target-accelerator=sm_75 -I . tests/test_enqueue_offset.mojo || echo ">> [WARN] test_enqueue_offset gagal — lihat verdict di atas"
+pixi run mojo run -I . tests/test_enqueue_offset.mojo || echo ">> [WARN] test_enqueue_offset gagal — lihat verdict di atas"
 
 # Self-test lainnya dimatikan secara default di Kaggle: setiap `mojo run`
 # mengompilasi ulang seluruh paket dari nol (3 file = 3 kompilasi penuh).
@@ -1254,58 +974,12 @@ PYEOF
     KHQ_DIR="$WORKING/khq_real"
     KHQ_TOKENS="${KHQ_DUMP_TOKENS:-512}"
     rm -rf "$KHQ_DIR"; mkdir -p "$KHQ_DIR"
-    # ---------------------------------------------------------------
-    # CACHE kv_dump.bin + khq_dump.log — run dump ini adalah biaya TERBESAR
-    # dalam satu run GPU (terukur, bukan dugaan):
-    #     dengan mode dump : 511 token x 1613 ms = 824,4 s (13,7 menit)
-    #     tanpa mode dump  : 511 token x   70 ms =  35,8 s  (run kembar,
-    #                        prompt & bentuk sama, di run yang sama)
-    # -> mode dump 23x lebih lambat karena BONSAI_DUMP_KV_DIR menulis 74 MB
-    #    K/V ke disk dan BONSAI_DUMP_TOP2=1 memaksa sinkronisasi
-    #    perangkat->host tiap token.
-    # Isi keduanya DETERMINISTIK (prompt tetap + decoding greedy + bobot
-    # tetap), jadi aman dipakai ulang antar run. Perhatikan khq_dump.log juga
-    # wajib ikut: gerbang di langkah 5b.7 membaca [GEN]/[TOP2] dari berkas itu
-    # dan keluar dengan [KHQ-FAIL] bila kosong.
-    # KHQ_DUMP_FORCE=1 memaksa pembuatan ulang dari model.
-    # ---------------------------------------------------------------
-    # RANTAI CACHE: kernel GPU ini memakai output kernel CPU sbg input, dan
-    # output run GPU TIDAK pernah dipakai lagi — jadi cache yang ditulis di
-    # sini akan hilang. Supaya ada gunanya, kernel ini menyatakan dirinya sbg
-    # kernel_sources (lihat kernel-metadata.json), sehingga output run
-    # sebelumnya termount di /kaggle/input/bonsai-mojo-t4-build dan bisa
-    # diimpor. Bila mount itu tidak ada, impor dilewati tanpa error.
-    if [ ! -f "$CACHE_DIR/kv_dump.bin" ] \
-       && [ -f "/kaggle/input/bonsai-mojo-t4-build/khq_real/kv_dump.bin" ]; then
-        cp "/kaggle/input/bonsai-mojo-t4-build/khq_real/kv_dump.bin" \
-           "$CACHE_DIR/kv_dump.bin" || true
-        echo ">> [KHQ-CACHE] kv_dump.bin diimpor dari output GPU run sebelumnya."
-    fi
-    if [ ! -f "$CACHE_DIR/khq_dump.log" ] \
-       && [ -f "/kaggle/input/bonsai-mojo-t4-build/dist/khq_dump.log" ]; then
-        cp "/kaggle/input/bonsai-mojo-t4-build/dist/khq_dump.log" \
-           "$CACHE_DIR/khq_dump.log" || true
-        echo ">> [KHQ-CACHE] khq_dump.log diimpor dari output GPU run sebelumnya."
-    fi
-    if [ -f "$CACHE_DIR/kv_dump.bin" ] && [ -f "$CACHE_DIR/khq_dump.log" ] \
-       && [ "${KHQ_DUMP_FORCE:-0}" != "1" ]; then
-        cp "$CACHE_DIR/kv_dump.bin" "$KHQ_DIR/kv_dump.bin" || true
-        cp "$CACHE_DIR/khq_dump.log" "$DIST_DIR/khq_dump.log" || true
-        echo ">> [KHQ-CACHE] kv_dump.bin + khq_dump.log dipakai ulang dari cache."
-        echo ">> [KHQ-CACHE] run dump $KHQ_TOKENS token DILEWATI (hemat ~13 menit kuota GPU)."
-    else
-        echo ""
-        echo ">> [KHQ] 5b.1 dump K/V asli dari model ($KHQ_TOKENS token, prompt panjang)"
-        BONSAI_DUMP_TOP2=1 BONSAI_DUMP_KV_DIR="$KHQ_DIR" timeout 3600 "$WORKING/bonsai_infer" --model-dir "$KMODEL" \
-            --prompt-tokens "$PROMPT_TOKENS_LONG" --max-tokens "$KHQ_TOKENS" --gpu \
-            2>&1 | tee "$DIST_DIR/khq_dump.log" \
-            || echo ">> [KHQ-FAIL] run dump gagal — periksa $DIST_DIR/khq_dump.log"
-        if [ -f "$KHQ_DIR/kv_dump.bin" ] && [ -s "$DIST_DIR/khq_dump.log" ]; then
-            cp "$KHQ_DIR/kv_dump.bin" "$CACHE_DIR/kv_dump.bin" || true
-            cp "$DIST_DIR/khq_dump.log" "$CACHE_DIR/khq_dump.log" || true
-            echo ">> [KHQ-CACHE] kv_dump.bin + khq_dump.log disimpan ke cache utk run berikutnya."
-        fi
-    fi
+    echo ""
+    echo ">> [KHQ] 5b.1 dump K/V asli dari model ($KHQ_TOKENS token, prompt panjang)"
+    BONSAI_DUMP_TOP2=1 BONSAI_DUMP_KV_DIR="$KHQ_DIR" timeout 3600 "$WORKING/bonsai_infer" --model-dir "$KMODEL" \
+        --prompt-tokens "$PROMPT_TOKENS_LONG" --max-tokens "$KHQ_TOKENS" --gpu \
+        2>&1 | tee "$DIST_DIR/khq_dump.log" \
+        || echo ">> [KHQ-FAIL] run dump gagal — periksa $DIST_DIR/khq_dump.log"
 
     echo ">> [KHQ] 5b.2 verifikasi dump (harus dari bobot asli, bukan placeholder)"
     if python3 - "$KMODEL" "$KHQ_DIR" <<'PYEOF'

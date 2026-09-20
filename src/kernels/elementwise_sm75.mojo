@@ -172,8 +172,30 @@ fn add_rmsnorm_sm75_gpu[
     var res_row = res_ptr.offset(row * D)
     var o_row = out_norm_ptr.offset(row * D)
 
+    # Loop-loop di bawah dibuka 4x supaya BANYAK pemuatan melayang bersamaan.
+    # Alasannya diukur, bukan dugaan: saat decode grid=(1,1,1) block=(256,1,1),
+    # jadi kernel ini berjalan di SATU SM dengan cuma 8 warp. Dengan satu
+    # pemuatan melayang per warp, latensi tiap pemuatan terekspos penuh dan
+    # satu peluncuran memakan 21,3 us (2,723 ms/token, 128 peluncuran/token)
+    # untuk cuma 20 KB trafik — itu 0,9 GB/s. URUTAN operasi sengaja TIDAK
+    # diubah (akumulasi tetap 0,1,2,3 per kelompok) supaya bit-exact.
+    #
     # 1. Residual in-place — persis dgn vec_add_sm75_gpu (f16(f32+f32))
     var i = tid
+    while i + 768 < D:
+        var a0 = Float32(x_row[i])
+        var a1 = Float32(x_row[i + 256])
+        var a2 = Float32(x_row[i + 512])
+        var a3 = Float32(x_row[i + 768])
+        var b0 = Float32(res_row[i])
+        var b1 = Float32(res_row[i + 256])
+        var b2 = Float32(res_row[i + 512])
+        var b3 = Float32(res_row[i + 768])
+        x_row[i] = Scalar[T](a0 + b0)
+        x_row[i + 256] = Scalar[T](a1 + b1)
+        x_row[i + 512] = Scalar[T](a2 + b2)
+        x_row[i + 768] = Scalar[T](a3 + b3)
+        i += 1024
     while i < D:
         x_row[i] = Scalar[T](Float32(x_row[i]) + Float32(res_row[i]))
         i += 256
@@ -183,6 +205,16 @@ fn add_rmsnorm_sm75_gpu[
     # 2. Sum-of-squares — persis dgn rmsnorm_sm75_gpu pada hidden baru
     var sum_sq: Float32 = 0.0
     var j = tid
+    while j + 768 < D:
+        var v0 = Float32(x_row[j])
+        var v1 = Float32(x_row[j + 256])
+        var v2 = Float32(x_row[j + 512])
+        var v3 = Float32(x_row[j + 768])
+        sum_sq += v0 * v0
+        sum_sq += v1 * v1
+        sum_sq += v2 * v2
+        sum_sq += v3 * v3
+        j += 1024
     while j < D:
         var val = Float32(x_row[j])
         sum_sq += val * val
@@ -212,6 +244,26 @@ fn add_rmsnorm_sm75_gpu[
     var inv_rms = smem[0]
 
     var k = tid
+    while k + 768 < D:
+        var v0 = Float32(x_row[k])
+        var v1 = Float32(x_row[k + 256])
+        var v2 = Float32(x_row[k + 512])
+        var v3 = Float32(x_row[k + 768])
+        var g0: Float32 = 1.0
+        var g1: Float32 = 1.0
+        var g2: Float32 = 1.0
+        var g3: Float32 = 1.0
+        @parameter
+        if HAS_WEIGHT:
+            g0 = weight_ptr[k]
+            g1 = weight_ptr[k + 256]
+            g2 = weight_ptr[k + 512]
+            g3 = weight_ptr[k + 768]
+        o_row[k] = Scalar[T](v0 * inv_rms * g0)
+        o_row[k + 256] = Scalar[T](v1 * inv_rms * g1)
+        o_row[k + 512] = Scalar[T](v2 * inv_rms * g2)
+        o_row[k + 768] = Scalar[T](v3 * inv_rms * g3)
+        k += 1024
     while k < D:
         var val = Float32(x_row[k])
         var gamma: Float32 = 1.0
@@ -439,21 +491,47 @@ fn gdn_recurrence_sm75_gpu[
     var row_offset = hv * (D_v * D_k) + dv * D_k
     var row_ptr = state_s + row_offset
 
-    # 1. kv_mem = sum(state_s * k) dengan decay — state S disimpan FP32 di
+    # 1. kv_mem = sum(state_s * decay * k) — state S disimpan FP32 di
     #    VRAM (WAJIB: rounding per-langkah terakumulasi karena decay ~ 1.0;
     #    lihat config `mamba_ssm_dtype: float32` & llama.cpp GGML_TYPE_F32).
     #    Akses float4, baris 16B-aligned.
+    #
+    #    PENTING (diukur, bukan dugaan): fase ini DULU menulis S*decay kembali
+    #    ke VRAM lalu fase 3 membacanya lagi dan menimpanya. Tulisan itu
+    #    dibuang di sini — fase 3 menghitung S*decay sendiri dari S asli, dan
+    #    karena `S*decay` dibulatkan ke FP32 dengan cara yang sama persis,
+    #    nilainya BIT-EXACT identik. Trafik turun 12 MB -> 9 MB per layer
+    #    (baca 3, baca 3, tulis 3) tanpa mengubah satu bit pun hasil akhir.
     var kv_mem: Float32 = 0.0
     var dk4 = 0
+    # Loop dibuka 4x (16 float per iterasi) supaya 4 pemuatan float4 MELAYANG
+    # bersamaan. Alasannya diukur, bukan dugaan: kernel ini diluncurkan
+    # grid=(48,1,1) block=(128,1,1) = cuma 6144 thread untuk GPU 40 SM, dan
+    # dengan satu pemuatan melayang per thread ia hanya mencapai 50,9 GB/s
+    # (12 MB x 48 layer / 11,32 ms) dari puncak mesin 264 GB/s yang diukur
+    # sendiri. URUTAN operasi sengaja TIDAK diubah (akumulasi tetap 0..3,
+    # 4..7, 8..11, 12..15) supaya hasilnya tetap bit-exact.
+    while dk4 + 15 < D_k:
+        var s0 = row_ptr.load[width=4](dk4)
+        var s1 = row_ptr.load[width=4](dk4 + 4)
+        var s2 = row_ptr.load[width=4](dk4 + 8)
+        var s3 = row_ptr.load[width=4](dk4 + 12)
+        var d0 = s0 * g_decay
+        var d1 = s1 * g_decay
+        var d2 = s2 * g_decay
+        var d3 = s3 * g_decay
+        kv_mem += d0[0] * smem_k[dk4] + d0[1] * smem_k[dk4 + 1] + d0[2] * smem_k[dk4 + 2] + d0[3] * smem_k[dk4 + 3]
+        kv_mem += d1[0] * smem_k[dk4 + 4] + d1[1] * smem_k[dk4 + 5] + d1[2] * smem_k[dk4 + 6] + d1[3] * smem_k[dk4 + 7]
+        kv_mem += d2[0] * smem_k[dk4 + 8] + d2[1] * smem_k[dk4 + 9] + d2[2] * smem_k[dk4 + 10] + d2[3] * smem_k[dk4 + 11]
+        kv_mem += d3[0] * smem_k[dk4 + 12] + d3[1] * smem_k[dk4 + 13] + d3[2] * smem_k[dk4 + 14] + d3[3] * smem_k[dk4 + 15]
+        dk4 += 16
     while dk4 + 3 < D_k:
         var s4 = row_ptr.load[width=4](dk4)
         var sd = s4 * g_decay
-        row_ptr.store[width=4](dk4, sd)
         kv_mem += sd[0] * smem_k[dk4] + sd[1] * smem_k[dk4 + 1] + sd[2] * smem_k[dk4 + 2] + sd[3] * smem_k[dk4 + 3]
         dk4 += 4
     while dk4 < D_k:
         var s_decayed = state_s[row_offset + dk4] * g_decay
-        state_s[row_offset + dk4] = s_decayed
         kv_mem += s_decayed * smem_k[dk4]
         dk4 += 1
 
@@ -461,22 +539,209 @@ fn gdn_recurrence_sm75_gpu[
     var v_val = Float32(v_ptr[hv * D_v + dv])
     var delta = (v_val - kv_mem) * beta
 
-    # 3. Update state S = S + k * delta dan hitung output S * q
+    # 3. Tulis state S = S * decay + k * delta dan hitung output S * q.
+    #    Karena fase 1 tidak lagi menyimpan S*decay, decay DIULANG di sini
+    #    dari S asli. `S * g_decay` dibulatkan ke FP32 persis seperti yang
+    #    dulu dilakukan fase 1, jadi nilai yang ditulis BIT-EXACT sama dengan
+    #    jalur lama; hanya tulisan perantara di VRAM yang hilang.
     var read_out: Float32 = 0.0
     dk4 = 0
+    # Sama seperti fase 1: 4 pemuatan float4 melayang bersamaan, urutan
+    # operasi tidak diubah (bit-exact).
+    while dk4 + 15 < D_k:
+        var s0 = row_ptr.load[width=4](dk4)
+        var s1 = row_ptr.load[width=4](dk4 + 4)
+        var s2 = row_ptr.load[width=4](dk4 + 8)
+        var s3 = row_ptr.load[width=4](dk4 + 12)
+        var n0 = s0 * g_decay + SIMD[DType.float32, 4](smem_k[dk4], smem_k[dk4 + 1], smem_k[dk4 + 2], smem_k[dk4 + 3]) * delta
+        var n1 = s1 * g_decay + SIMD[DType.float32, 4](smem_k[dk4 + 4], smem_k[dk4 + 5], smem_k[dk4 + 6], smem_k[dk4 + 7]) * delta
+        var n2 = s2 * g_decay + SIMD[DType.float32, 4](smem_k[dk4 + 8], smem_k[dk4 + 9], smem_k[dk4 + 10], smem_k[dk4 + 11]) * delta
+        var n3 = s3 * g_decay + SIMD[DType.float32, 4](smem_k[dk4 + 12], smem_k[dk4 + 13], smem_k[dk4 + 14], smem_k[dk4 + 15]) * delta
+        row_ptr.store[width=4](dk4, n0)
+        row_ptr.store[width=4](dk4 + 4, n1)
+        row_ptr.store[width=4](dk4 + 8, n2)
+        row_ptr.store[width=4](dk4 + 12, n3)
+        read_out += n0[0] * smem_q[dk4] + n0[1] * smem_q[dk4 + 1] + n0[2] * smem_q[dk4 + 2] + n0[3] * smem_q[dk4 + 3]
+        read_out += n1[0] * smem_q[dk4 + 4] + n1[1] * smem_q[dk4 + 5] + n1[2] * smem_q[dk4 + 6] + n1[3] * smem_q[dk4 + 7]
+        read_out += n2[0] * smem_q[dk4 + 8] + n2[1] * smem_q[dk4 + 9] + n2[2] * smem_q[dk4 + 10] + n2[3] * smem_q[dk4 + 11]
+        read_out += n3[0] * smem_q[dk4 + 12] + n3[1] * smem_q[dk4 + 13] + n3[2] * smem_q[dk4 + 14] + n3[3] * smem_q[dk4 + 15]
+        dk4 += 16
     while dk4 + 3 < D_k:
         var s4 = row_ptr.load[width=4](dk4)
-        var n4 = s4 + SIMD[DType.float32, 4](smem_k[dk4], smem_k[dk4 + 1], smem_k[dk4 + 2], smem_k[dk4 + 3]) * delta
+        var n4 = s4 * g_decay + SIMD[DType.float32, 4](smem_k[dk4], smem_k[dk4 + 1], smem_k[dk4 + 2], smem_k[dk4 + 3]) * delta
         row_ptr.store[width=4](dk4, n4)
         read_out += n4[0] * smem_q[dk4] + n4[1] * smem_q[dk4 + 1] + n4[2] * smem_q[dk4 + 2] + n4[3] * smem_q[dk4 + 3]
         dk4 += 4
     while dk4 < D_k:
-        var s_new = state_s[row_offset + dk4] + smem_k[dk4] * delta
+        var s_new = state_s[row_offset + dk4] * g_decay + smem_k[dk4] * delta
         state_s[row_offset + dk4] = s_new
         read_out += s_new * smem_q[dk4]
         dk4 += 1
 
     out_ptr[hv * D_v + dv] = Scalar[T](read_out)
+
+
+# ----------------------------------------------------------------------------
+# 6b. Rekurensi GDN VARIAN LEBAR: 8 thread per baris, 32 baris per blok.
+#     Desain ini DIPILIH LEWAT PENGUKURAN (probe CUDA mandiri, bagian 10
+#     harness uji) — BUKAN dugaan. Pada rejim nyata (48 peluncuran berurutan,
+#     satu layer tiap peluncuran, persis seperti model):
+#        pola lama        48 blok x 128 thread   4,037 ms/token  (1,00x)
+#        32 float/thread 192 blok x 128 thread   3,115 ms/token  (1,30x)
+#        16 float/thread 192 blok x 256 thread   2,671 ms/token  (1,51x) <- ini
+#     Varian "1 thread = 1 baris + S di SMEM" (yang memangkas trafik jadi
+#     6 MB tapi menurunkan okupansi jadi 4 blok/SM) cuma 1,04x — nyaris nol.
+#     Jadi yang menang adalah MEMPERBANYAK THREAD, bukan sekadar memangkas
+#     trafik. Kernel ini mendapat keduanya: thread 8x lipat DAN trafik 6 MB.
+#
+#     Memakai identitas aljabar (terverifikasi di probe, selisih 4,47e-08 thd
+#     |out| ~1e-1, sementara gap TOP-2 = 16,25):
+#        out = decay * B + delta * kq,   B = sum(S*q),  kq = sum(k*q)
+#     sehingga S cukup DIBACA SEKALI dan DITULIS SEKALI.
+#     TIDAK bit-exact (urutan penjumlahan berubah); diaktifkan terpisah lewat
+#     BONSAI_GDN_WIDE=1, default 0 = jalur lama yang sudah terbukti.
+#
+#     *** HASIL UJI DI DALAM MODEL (run v36, jangan diterka dari probe!) ***
+#     lama = 50,026 ms/token | lebar = 50,993 ms/token -> 0,981x, alias TIDAK
+#     lebih cepat (24 token tetap identik, jadi aljabarnya benar). Jadi probe
+#     yang mengukur 1,51x TIDAK mewakili keadaan nyata: di dalam model,
+#     peluncuran rekurensi diselingi GEMV dan keadaannya berbeda. Kesimpulan:
+#     jangan lagi menyetel kernel ini berdasar probe terisolasi.
+# ----------------------------------------------------------------------------
+fn gdn_recurrence_sm75_gpu_wide[
+    T: DType,
+    HAS_PARAMS: Bool = True
+](
+    state_s: UnsafePointer[Float32, MutAnyOrigin],
+    q_normed: UnsafePointer[Scalar[T], MutAnyOrigin],
+    k_normed: UnsafePointer[Scalar[T], MutAnyOrigin],
+    v_ptr: UnsafePointer[Scalar[T], MutAnyOrigin],
+    a_ptr: UnsafePointer[Scalar[T], MutAnyOrigin],
+    b_ptr: UnsafePointer[Scalar[T], MutAnyOrigin],
+    a_log: UnsafePointer[Float32, MutAnyOrigin],
+    dt_bias: UnsafePointer[Float32, MutAnyOrigin],
+    out_ptr: UnsafePointer[Scalar[T], MutAnyOrigin],
+    repeat_factor: Int,
+    D_v: Int,
+    D_k: Int
+):
+    """grid = (H_v, D_v/32, 1), block = (256, 1, 1).
+    32 baris per blok, 8 thread per baris, 16 float per thread."""
+    var hv = block_idx.x
+    var rg = block_idx.y
+    var t = thread_idx.x
+    var hk = hv // repeat_factor
+
+    var smem_k = stack_allocation[
+        256, Float32, alignment = 16, address_space = AddressSpace.SHARED
+    ]()
+    var smem_q = stack_allocation[
+        256, Float32, alignment = 16, address_space = AddressSpace.SHARED
+    ]()
+    # 32 baris x 128 float = 4096 float = 16 KiB
+    var smem_S = stack_allocation[
+        4096, Float32, alignment = 16, address_space = AddressSpace.SHARED
+    ]()
+    var redA = stack_allocation[
+        256, Float32, alignment = 16, address_space = AddressSpace.SHARED
+    ]()
+    var redB = stack_allocation[
+        256, Float32, alignment = 16, address_space = AddressSpace.SHARED
+    ]()
+
+    var i0 = t
+    while i0 < D_k:
+        smem_k[i0] = Float32(k_normed[hk * D_k + i0])
+        smem_q[i0] = Float32(q_normed[hk * D_k + i0])
+        i0 += 256
+
+    var a_val = Float32(a_ptr[hv])
+    var b_val = Float32(b_ptr[hv])
+
+    var g_decay: Float32
+    @parameter
+    if HAS_PARAMS:
+        var sp_in = a_val + dt_bias[hv]
+        var sp = sp_in if sp_in > 20.0 else log(1.0 + exp(sp_in))
+        g_decay = exp(Float32(-1.0) * exp(a_log[hv]) * sp)
+    else:
+        var sp_in = a_val + 1.0
+        var sp = sp_in if sp_in > 20.0 else log(1.0 + exp(sp_in))
+        g_decay = exp(Float32(-0.5) * sp)
+
+    var beta = 1.0 / (1.0 + exp(-b_val))
+
+    # Tahap S ke SMEM: 1024 float4 per blok; tiap 32 thread menutup satu baris
+    # penuh secara berkoalesensi (itulah sebabnya pengindeksannya "transpos").
+    var Sbase = state_s + (hv * D_v + rg * 32) * D_k
+    var c = t
+    while c < 1024:
+        var r0 = (4 * c) // D_k
+        var off = (4 * c) % D_k
+        var sv = Sbase.load[width=4](r0 * D_k + off)
+        smem_S[r0 * D_k + off] = sv[0]
+        smem_S[r0 * D_k + off + 1] = sv[1]
+        smem_S[r0 * D_k + off + 2] = sv[2]
+        smem_S[r0 * D_k + off + 3] = sv[3]
+        c += 256
+
+    barrier()
+
+    var r = t >> 3
+    var p = t & 7
+    var base = r * D_k + p * 16
+
+    # accA = sum(S*k) dan accB = sum(S*q), keduanya dari SMEM (cepat)
+    var accA: Float32 = 0.0
+    var accB: Float32 = 0.0
+    var j = 0
+    while j < 16:
+        var s0 = smem_S[base + j]
+        var s1 = smem_S[base + j + 1]
+        var s2 = smem_S[base + j + 2]
+        var s3 = smem_S[base + j + 3]
+        accA += s0 * smem_k[p * 16 + j] + s1 * smem_k[p * 16 + j + 1] + s2 * smem_k[p * 16 + j + 2] + s3 * smem_k[p * 16 + j + 3]
+        accB += s0 * smem_q[p * 16 + j] + s1 * smem_q[p * 16 + j + 1] + s2 * smem_q[p * 16 + j + 2] + s3 * smem_q[p * 16 + j + 3]
+        j += 4
+
+    redA[t] = accA
+    redB[t] = accB
+    barrier()
+
+    # Reduksi 8 parsial per baris (urutan 0..7, deterministik)
+    var Atot: Float32 = 0.0
+    var Btot: Float32 = 0.0
+    var q2 = 0
+    while q2 < 8:
+        Atot += redA[r * 8 + q2]
+        Btot += redB[r * 8 + q2]
+        q2 += 1
+
+    var dv = rg * 32 + r
+    var delta = (Float32(v_ptr[hv * D_v + dv]) - g_decay * Atot) * beta
+
+    var kq: Float32 = 0.0
+    var m = 0
+    while m < D_k:
+        kq += smem_k[m] * smem_q[m]
+        m += 1
+
+    if p == 0:
+        out_ptr[hv * D_v + dv] = Scalar[T](g_decay * Btot + delta * kq)
+
+    # Tulis balik S yang baru: baca dari SMEM, tulis ke VRAM (float4)
+    var wr = r * D_k + p * 16
+    var j2 = 0
+    while j2 < 16:
+        var sv = SIMD[DType.float32, 4](
+            smem_S[base + j2], smem_S[base + j2 + 1],
+            smem_S[base + j2 + 2], smem_S[base + j2 + 3])
+        var kv = SIMD[DType.float32, 4](
+            smem_k[p * 16 + j2], smem_k[p * 16 + j2 + 1],
+            smem_k[p * 16 + j2 + 2], smem_k[p * 16 + j2 + 3])
+        var nv = sv * g_decay + kv * delta
+        Sbase.store[width=4](wr + j2, nv)
+        j2 += 4
 
 
 # ----------------------------------------------------------------------------
@@ -527,9 +792,13 @@ fn gdn_norm_gate_sm75_gpu[
     var wid = dv >> 5
     var idx = hv * D_v + dv
 
-    # Alokasi 32 float SMEM aman untuk seluruh 32 lane pada reduksi inter-warp
+    # SMEM reduksi. 128 float (bukan 32): JALUR UMUM di bawah menulis
+    # smem[dv] untuk tiap thread dv, dan D_v bisa sebesar 128 (config.mojo
+    # gdn_head_v_dim). Jalur cepat (D_v == 128) hanya menyentuh smem[0..3],
+    # jadi pembesaran ini tidak mengubah hasilnya satu bit. Peluncur di
+    # ops.mojo menolak D_v > 128 -> tidak ada luapan.
     var smem = stack_allocation[
-        32, Float32, alignment = 16, address_space = AddressSpace.SHARED
+        128, Float32, alignment = 16, address_space = AddressSpace.SHARED
     ]()
 
     var x_val = Float32(gdn_out[block_idx.y * out_row_stride + idx])
@@ -542,25 +811,63 @@ fn gdn_norm_gate_sm75_gpu[
 
     # Hitung mean kuadrat atas norm_in
     var sq = norm_in * norm_in
-    sq += shuffle_down(sq, 16)
-    sq += shuffle_down(sq, 8)
-    sq += shuffle_down(sq, 4)
-    sq += shuffle_down(sq, 2)
-    sq += shuffle_down(sq, 1)
 
-    if lane == 0:
-        smem[wid] = sq
+    # Reduksi sum-of-squares atas D_v thread blok. Cabang seragam (D_v bernilai
+    # sama untuk seluruh thread di blok -> tidak ada barrier menyimpang).
+    #
+    #   * D_v == 128 (satu-satunya geometri PRODUKSI, config.mojo
+    #     gdn_head_v_dim=128): ladder shuffle full-warp + reduksi antar-warp di
+    #     shared memory. KODE LAMA, tidak diubah -> hasil byte-identik dengan
+    #     sebelum perbaikan ini. Syaratnya bukan sekadar ">= 32": ladder shuffle
+    #     hanya absah bila SETIAP warp penuh (D_v kelipatan 32), DAN tahap
+    #     antar-warp menjumlahkan tepat 4 slot (smem[lane] jika lane < 4), jadi
+    #     hanya D_v == 128 yang memenuhi keduanya sekaligus.
+    #   * D_v lain (1..127; bentuk uji non-produksi): kedua asumsi itu jebak.
+    #       - D_v < 32: blok = satu warp parsial. shuffle_down(delta >= 16)
+    #         membaca lane yang tak pernah dieksekusi (sampah).
+    #       - D_v = 32/64/96: warp-warp penuh, tapi jumlah warp < 4, sehingga
+    #         smem[1..3] (atau smem[2..3]) dibaca namun tak pernah ditulis.
+    #       - D_v bukan kelipatan 32 (mis. 48): warp terakhir parsial, sehingga
+    #         ladder shuffle-nya sendiri sudah membaca lane mati.
+    #     Semua itu menghasilkan RMS yang salah besar (rel ~0,6 vs referensi
+    #     FP64) tanpa crash. Sebagai gantinya seluruh reduksi dikerjakan di
+    #     shared memory: tiap thread menulis kuadratnya, satu thread
+    #     menjumlahkan semuanya. Tidak ada asumsi geometri sama sekali.
+    if D_v == 128:
+        sq += shuffle_down(sq, 16)
+        sq += shuffle_down(sq, 8)
+        sq += shuffle_down(sq, 4)
+        sq += shuffle_down(sq, 2)
+        sq += shuffle_down(sq, 1)
 
-    barrier()
-
-    if wid == 0:
-        var wsq: Float32 = smem[lane] if lane < 4 else 0.0
-        wsq += shuffle_down(wsq, 2)
-        wsq += shuffle_down(wsq, 1)
         if lane == 0:
-            smem[0] = 1.0 / sqrt(wsq / Float32(D_v) + eps)
+            smem[wid] = sq
 
-    barrier()
+        barrier()
+
+        if wid == 0:
+            var wsq: Float32 = smem[lane] if lane < 4 else 0.0
+            wsq += shuffle_down(wsq, 2)
+            wsq += shuffle_down(wsq, 1)
+            if lane == 0:
+                smem[0] = 1.0 / sqrt(wsq / Float32(D_v) + eps)
+
+        barrier()
+    else:
+        # D_v <= 127 -> smem[0..D_v-1] muat di 128 slot. Tanpa shuffledown:
+        # shuffle pada warp parsial tidak terdefinisi. Akumulasi berurutan oleh
+        # thread 0 saja; cukup untuk bentuk uji (produksi selalu lewat cabang
+        # D_v == 128 di atas).
+        smem[dv] = sq
+        barrier()
+        if dv == 0:
+            var wsq: Float32 = 0.0
+            var j = 0
+            while j < D_v:
+                wsq += smem[j]
+                j += 1
+            smem[0] = 1.0 / sqrt(wsq / Float32(D_v) + eps)
+        barrier()
 
     var inv_rms = smem[0]
     var gamma: Float32 = 1.0

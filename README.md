@@ -1,265 +1,272 @@
-# Bonsai-27B 1-Bit Inference + KHQ KV-Cache Compression untuk NVIDIA T4
+# Bonsai-27B 1-Bit Inference + KHQ KV-Cache Compression for NVIDIA T4
 
-Inferensi **Bonsai-27B** (kuantisasi 1-bit biner, W1A16, `group_size 128`, Affine Bonsai) di GPU **NVIDIA T4** (Turing, `sm_75`), ditulis dalam **Mojo** dengan kernel CUDA `sm_75` lewat FFI.
+Inference for **Bonsai-27B** (binary 1-bit quantization, W1A16, `group_size 128`, Affine Bonsai) on an **NVIDIA T4** GPU (Turing, `sm_75`), written in **Mojo** with `sm_75` CUDA kernels via FFI.
 
-Repositori ini berisi dua bagian:
+This repository contains two parts:
 
-1. **Kernel matmul & decode 1-bit** — GEMV decode (`M ≤ 8`), prefill WMMA (`M > 8`), plus rangkaian kernel elementwise/GDN untuk arsitektur hybrid Bonsai-27B.
-2. **KHQ — kompresi KV-cache** — kalibrasi penuh di GPU dan runtime kompresi KV untuk layer attention, menggantikan KV cache fp16 dengan representasi terkompresi. Seluruh komputasi kalibrasi berjalan di CUDA; Mojo hanya menangani IO/FFI (baca dump, marshal buffer, tulis file). **Tidak ada fallback CPU.**
+1. **1-bit matmul & decode kernels** — GEMV decode (`M ≤ 8`), WMMA prefill (`M > 8`), plus the elementwise/GDN kernel set for the hybrid Bonsai-27B architecture.
+2. **KHQ — KV-cache compression** — full GPU-side calibration and a KV compression runtime for the attention layers, replacing the fp16 KV cache with a compressed representation. All calibration compute runs in CUDA; Mojo only handles IO/FFI (read dumps, marshal buffers, write files). **There is no CPU fallback.**
 
 ---
 
-## Hasil Terukur (Kaggle, Tesla T4)
+## Measured Results (Kaggle, Tesla T4)
 
-**Korektnes runtime KHQ** — dibandingkan dengan baseline KV cache fp16 pada prompt & bobot yang sama:
+**Throughput** (Bonsai-27B 1-bit, greedy, from a T4 inference log):
 
-| Metrik | Hasil |
+| Phase | Speed |
 |---|---|
-| Token greedy identik | **512 / 512** (prefix identik 512) |
-| Selisih logit top-1 di batas prefill | **0.000000** |
-| Layer attention terkalibrasi | **16** (id 3, 7, 11, …, 63) |
-| Event kompresi | **3 per layer** (token 256, 384, 512) |
+| Prefill (81 tokens) | **120.4 tokens/s** (8.30 ms/token) |
+| Decode (511 tokens) | **18.2 tokens/s** (54.95 ms/token) |
 
-**Cadence kompresi** (terukur via `BONSAI_KHQ_DEBUG=1`):
+**KHQ runtime correctness** — compared against the fp16 KV-cache baseline with the same prompt and weights:
+
+| Metric | Result |
+|---|---|
+| Identical greedy tokens | **512 / 512** (identical 512-token prefix) |
+| Top-1 logit gap at the prefill boundary | **0.000000** |
+| Calibrated attention layers | **16** (ids 3, 7, 11, …, 63) |
+| Compression events | **3 per layer** (tokens 256, 384, 512) |
+
+**Compression cadence** (measured via `BONSAI_KHQ_DEBUG=1`):
 
 ```
-token 256 -> kompres 128 tertua -> boundary 128, jendela raw 128
-token 384 -> kompres 128 tertua -> boundary 256, jendela raw 128
-token 512 -> kompres 128 tertua -> boundary 384, jendela raw 128
+token 256 -> compress 128 oldest -> boundary 128, raw window 128
+token 384 -> compress 128 oldest -> boundary 256, raw window 128
+token 512 -> compress 128 oldest -> boundary 384, raw window 128
 ```
 
-Setelah event pertama, kompresi terjadi **tiap 128 token**; jendela raw berayun 128 ↔ 256 dan region terkompresi tumbuh monoton.
+After the first event, compression happens **every 128 tokens**; the raw window swings 128 ↔ 256 and the compressed region grows monotonically.
 
-**Performa** — angka di bawah dari **satu run T4 terkontrol**: prompt 56 token, decode 512 token, binary & kondisi identik, hanya `BONSAI_KHQ_SPLITS` yang berbeda (dari A/B di `deploy_on_kaggle.sh`):
+**Performance** — the numbers below come from **one controlled T4 run**: 56-token prompt, 512-token decode, identical binary and conditions, only `BONSAI_KHQ_SPLITS` changed (A/B from `deploy_on_kaggle.sh`):
 
-| Konfigurasi | ms/token | Beban vs baseline |
+| Configuration | ms/token | Overhead vs baseline |
 |---|---|---|
-| Baseline KV fp16 | 57,17 | — |
-| KHQ `splits=1` (jalur lama) | 66,67 | +9,50 (+16,6%) |
-| KHQ `splits=4` | 62,01 | +4,84 (+8,5%) |
-| KHQ `splits=8` | 59,98 | +2,81 (+4,9%) |
+| Baseline KV fp16 | 57.17 | — |
+| KHQ `splits=1` (legacy path) | 66.67 | +9.50 (+16.6%) |
+| KHQ `splits=4` | 62.01 | +4.84 (+8.5%) |
+| KHQ `splits=8` | 59.98 | +2.81 (+4.9%) |
 
-Split-K memotong **beban** KHQ dari 9,50 → 2,81 ms/token (−70%), yang berarti penghematan **6,69 ms/token (−10,0%)** pada laju decode. Semua nilai splits tetap menghasilkan stream token 512/512 identik dan `|delta| logit top-1 = 0.000000`.
+Split-K cuts the **KHQ overhead** from 9.50 → 2.81 ms/token (−70%), which means a **6.69 ms/token (−10.0%)** gain in decode speed. Every splits value still produced an identical 512/512 token stream with top-1 logit `|delta| = 0.000000`.
 
-Catatan: angka "53,2 → 75,0 ms/token (+22 ms)" yang sempat dilaporkan **tidak tereproduksi** di pengukuran terkontrol ini; beban KHQ yang terukur adalah +9,50 ms, bukan +22 ms. Tabel di atas menggantikannya.
+Note: the previously reported "53.2 → 75.0 ms/token (+22 ms)" was **not reproduced** in this controlled measurement; the measured KHQ overhead is +9.50 ms, not +22 ms. The table above supersedes it.
 
-Ukuran KV terkompresi turun dari **1024 B → 220 B** per (token, head) — sekitar **4,7×** lebih kecil. Karena biaya attention tumbuh linear terhadap panjang sekuens, keuntungan memori ini baru terasa pada konteks panjang.
+Compressed KV size drops from **1024 B → 220 B** per (token, head) — roughly **4.7×** smaller. Because attention cost grows linearly with sequence length, this memory win only pays off at long context.
 
-**Catatan soal profil per-subsistem.** Baris `[PROF/SPLIT]` **tidak** memecah waktu GPU per subsistem pada konfigurasi default. Di `main.mojo`, `acc_gdn +=` dan `acc_attn +=` berada **di luar** `if prof:` — hanya `synchronize()`-nya yang di dalam `if prof:`. Karena `BONSAI_PROFILE` dimatikan di `deploy_on_kaggle.sh` (sengaja: sync 65×/token mematikan pipeline async), `prof` bernilai false, sehingga `acc_gdn`/`acc_attn` hanyalah waktu *submit CPU* dan `acc_lm` adalah waktu GPU **seluruh token** yang terkuras pada sync terakhir.
+**A note on the per-subsystem profile.** The `[PROF/SPLIT]` line does **not** break GPU time down per subsystem under the default configuration. In `main.mojo`, `acc_gdn +=` and `acc_attn +=` sit **outside** `if prof:` — only their `synchronize()` is inside. Since `BONSAI_PROFILE` is off in `deploy_on_kaggle.sh` (deliberately: syncing 65×/token kills the async pipeline), `prof` is false, so `acc_gdn`/`acc_attn` are only *CPU submit* times, and `acc_lm` is the GPU time of **all tokens** drained at the last sync.
 
-Konsekuensinya, angka `LM_HEAD+argmax` pada baris itu (~47 ms) **bukan** biaya LM head — itu waktu forward satu token penuh. Kalau angka itu benar-benar LM head, 64 layer harus membaca 4,9 GB dataset bobot dalam ~3 ms = ~1.500 GB/s, jauh di atas puncak bandwidth T4 (320 GB/s).
+As a consequence, the `LM_HEAD+argmax` figure on that line (~47 ms) is **not** the LM-head cost — it is the full forward time of one token. If it really were the LM head, 64 layers would have to read the 4.9 GB weight set in ~3 ms ≈ 1500 GB/s, far above the T4 peak bandwidth (320 GB/s).
 
-Yang bisa disimpulkan: decode benar-benar bandwidth-bound, membaca ~4,9 GB bobot per token dalam ~47 ms ≈ **104 GB/s** (≈33% puncak T4). Pemecahan per-subsistem yang sah hanya didapat dengan `BONSAI_PROFILE=1` di sesi profiling terpisah.
-
----
-
-## Arsitektur Bonsai-27B (Qwen 3.5 / 3.8 Hybrid)
-
-- **64 layer**: 48 *Gated DeltaNet* (linear, stateless, **tanpa** KV cache) + 16 *full attention*.
-- Layer attention adalah `li ≡ 3 (mod 4)` → **3, 7, 11, …, 63**. Layer non-attention tidak menyimpan KV.
-- Konfigurasi: `hidden 5120`, `vocab 248320`, `H_q 24`, `H_kv 4` (GQA), `head_dim 256`, `rotary_dim 64`, `rope_theta 1e7`.
+What can be concluded: decode is genuinely bandwidth-bound, reading ~4.9 GB of weights per token in ~47 ms ≈ **104 GB/s** (~33% of the T4 peak). A real per-subsystem breakdown is only available with `BONSAI_PROFILE=1`.
 
 ---
 
-## KHQ: Kompresi KV-Cache
+## Bonsai-27B Architecture (Qwen 3.5 Hybrid)
 
-### Cara kerja
+- **64 layers**: 48 *Gated DeltaNet* (linear, stateless, **no** KV cache) + 16 *full attention*.
+- Attention layers are `li ≡ 3 (mod 4)` → **3, 7, 11, …, 63**. Non-attention layers keep no KV.
+- Configuration: `hidden 5120`, `vocab 248320`, `H_q 24`, `H_kv 4` (GQA), `head_dim 256`, `rotary_dim 64`, `rope_theta 1e7`.
 
-- **Ring buffer** 256 slot menyimpan K/V mentah (fp16). `watermark = 256`, `chunk = 128`.
-- Saat jendela raw mencapai 256, **128 token tertua** dikompres; `boundary` maju 128 sehingga jendela kembali 128. Kompresi berikutnya terjadi tiap 128 token.
-- Setiap langkah attention menghitung **dua region** lalu menggabungkannya dengan *log-sum-exp*:
-  1. region terkompresi (dekompresi payload K/V),
-  2. jendela raw di ring (K sudah di-RoPE pada posisi absolutnya).
-- Terakhir, sigmoid gate diterapkan setelah merge.
-- **Split-K** pada region terkompresi: rentang token dipecah `BONSAI_KHQ_SPLITS` bagian, tiap bagian jadi satu block tersendiri, lalu partial (acc, `max_s`, `sum_exp`) digabung kernel reduce via logsumexp. Ini menaikkan paralelisme dari `H_q × 1 warp` (24 warp) menjadi `H_q × splits`. Dengan `splits = 1` kernel memakai jalur lama persis, jadi kontrak bit-exact tetap utuh.
+---
 
-### Skema kompresi per (token, head)
+## KHQ: KV-Cache Compression
 
-| Komponen | K | V |
+### How it works
+
+- A **ring buffer** of 256 slots holds raw K/V (fp16). `watermark = 256`, `chunk = 128`.
+- When the raw window reaches 256, the **128 oldest tokens** are compressed; `boundary` advances by 128 so the window returns to 128. The next compression happens 128 tokens later.
+- Each attention step computes **two regions** and merges them with a *log-sum-exp*:
+  1. the compressed region (decompressed K/V payloads),
+  2. the raw window in the ring (K already RoPE'd at its absolute positions).
+- A sigmoid gate is applied after the merge.
+- **Split-K** on the compressed region: the token range is split into `BONSAI_KHQ_SPLITS` parts, each part becomes its own block, and the partials (acc, `max_s`, `sum_exp`) are merged by a reduce kernel via logsumexp. This raises parallelism from `H_q × 1 warp` (24 warps) to `H_q × splits`. With `splits = 1` the kernel takes the exact legacy path, so the bit-exact contract stays intact.
+
+### Compression scheme per (token, head)
+
+| Component | K | V |
 |---|---|---|
-| Mask 2-bit (16 × u32) | 64 B | — |
-| Payload | 40 B (outlier 4-bit + tanda) | 104 B (VQ 7-bit + dim3 4-bit) |
-| Norma / residual | 2 B + 2 B | 2 B + 2 B |
-| Shared meta | 4 B | (pakai bersama) |
+| 2-bit mask (16 × u32) | 64 B | — |
+| Payload | 40 B (4-bit outliers + sign) | 104 B (VQ 7-bit + dim3 4-bit) |
+| Norm / residual | 2 B + 2 B | 2 B + 2 B |
+| Shared meta | 4 B | (shared) |
 
-K: normalisasi → FWHT → rotor 4D → kuantisasi mask 2-bit dengan maksimum 50 outlier. V: normalisasi → FWHT → rotor → VQ (codebook 256 × 3 per patch) + komponen dimensi ke-3.
+K: normalize → FWHT → 4D rotor → 2-bit mask quantization with at most 50 outliers. V: normalize → FWHT → rotor → VQ (codebook 256 × 3 per patch) + a third-dimension component.
 
-### Kalibrasi
+### Calibration
 
-Driver `src/khq/calib.mojo` menerima `kv_dump.bin` (hasil forward pass model asli) dan menghasilkan `khq_calib.bin`. Semua operasi berat di GPU via `launch_cal_op` (10 op) dan `launch_cal_svq_train`:
+The driver `src/khq/calib.mojo` takes `kv_dump.bin` (from a forward pass of the original model) and produces `khq_calib.bin`. All heavy operations run on the GPU via `launch_cal_op` (10 ops) and `launch_cal_svq_train`:
 
-FWHT base → K-static → rotate → PCA → kmeans 4/dim → kmeans VQ → Procrustes → SmartK → SmartV → head-major, ditambah turnamen **SmartVQ** (seeds 42/137/271, 2 ronde 30+70 iterasi, Adam, temperature `1.5·(0.1/1.5)^(i/max)`, seleksi winner dari bobot *best*).
+FWHT base → K-static → rotate → PCA → kmeans 4/dim → kmeans VQ → Procrustes → SmartK → SmartV → head-major, plus the **SmartVQ** tournament (seeds 42/137/271, 2 rounds of 30+70 iterations, Adam, temperature `1.5·(0.1/1.5)^(i/max)`, winner selection from the *best* weights).
 
 ---
 
-## Pemakaian
+## Usage
 
-### Prasyarat
+### Prerequisites
 
-Kompilasi kernel CUDA (butuh `nvcc`) menjadi `libbonsai_qmv_sm75.so`:
+Compile the CUDA kernels (requires `nvcc`) into `libbonsai_qmv_sm75.so`:
 
 ```bash
 bash scripts/build_cuda_ffi.sh
 export BONSAI_CUDA_LIB=$PWD/build/libbonsai_qmv_sm75.so
 ```
 
-### Menjalankan inferensi
+### Running inference
 
 ```bash
 pixi run mojo build -I . main.mojo -o bonsai_infer
-BONSAI_USE_GPU=1 ./bonsai_infer --model-dir <dir_model> \
+BONSAI_USE_GPU=1 ./bonsai_infer --model-dir <model_dir> \
     --prompt-tokens 248045,846,198 --max-tokens 24 --gpu
 ```
 
-Opsi: `--model-dir`, `--prompt-tokens` (id dipisah koma), `--max-tokens`, `--gpu`.
+Options: `--model-dir`, `--prompt-tokens` (comma-separated ids), `--max-tokens`, `--gpu`.
 
-### Menghasilkan dump K/V untuk kalibrasi
+### Generating the K/V dump for calibration
 
 ```bash
-BONSAI_DUMP_KV_DIR=/tmp/khq ./bonsai_infer --model-dir <dir_model> \
+BONSAI_DUMP_KV_DIR=/tmp/khq ./bonsai_infer --model-dir <model_dir> \
     --prompt-tokens <ids> --max-tokens 512 --gpu
 # -> /tmp/khq/kv_dump.bin + attn_<layer>.bin
 ```
 
-K/V diambil **dari forward pass model asli** (K post-norm pre-RoPE + V + skor softmax kausal). File `attn_<layer>.bin` wajib ada dan jumlah tokennya harus sama dengan dump, kalau tidak kalibrasi menolak berjalan (bukan diam-diam turun ke mode parseval).
+K/V is captured **from a forward pass of the original model** (post-norm pre-RoPE K + V + causal softmax scores). The `attn_<layer>.bin` files are mandatory and their token count must match the dump, otherwise calibration refuses to run (it never silently falls back to Parseval mode).
 
-### Menjalankan kalibrasi
+### Running calibration
 
 ```bash
 pixi run mojo run -I . src/khq/calib.mojo /tmp/khq /tmp/khq/khq_calib.bin
 ```
 
-### Mengaktifkan jalur kompresi
+### Enabling the compression path
 
 ```bash
-BONSAI_KHQ_PATH=/tmp/khq/khq_calib.bin ./bonsai_infer --model-dir <dir_model> \
+BONSAI_KHQ_PATH=/tmp/khq/khq_calib.bin ./bonsai_infer --model-dir <model_dir> \
     --prompt-tokens <ids> --max-tokens 512 --gpu
 ```
 
-### Variabel lingkungan
+### Environment variables
 
-| Variabel | Fungsi |
+| Variable | Purpose |
 |---|---|
-| `BONSAI_CUDA_LIB` | Path `libbonsai_qmv_sm75.so` |
-| `BONSAI_USE_GPU` | Wajib; tanpa ini program berhenti (tanpa fallback CPU) |
-| `BONSAI_KHQ_PATH` | Aktifkan KV terkompresi (file centroid) |
-| `BONSAI_DUMP_KV_DIR` | Dump K/V model asli untuk kalibrasi |
-| `BONSAI_KHQ_DEBUG` | Cetak event kompresi + norma payload tiap event |
-| `BONSAI_KHQ_SPLITS` | Jumlah split-K attention terkompresi (default 8, maks 16) |
-| `BONSAI_KHQ_PROF` | Profil per-fase jalur KHQ (sync tiap fase, total jadi lebih lambat) |
-| `BONSAI_DUMP_TOP2` | Cetak logit top-2 (pembanding numerik) |
-| `BONSAI_PROFILE` | Sync per tahap (profil akurat, ~6% lebih lambat) |
-| `BONSAI_NO_FUSE` | Matikan fusi (pembanding A/B) |
-| `BONSAI_PREFILL_PER_TOKEN` | Paksa prefill per-token (pembanding) |
-| `BONSAI_DISABLE_CUDA_FFI` | Matikan jalur CUDA FFI |
+| `BONSAI_CUDA_LIB` | Path to `libbonsai_qmv_sm75.so` |
+| `BONSAI_USE_GPU` | Required; without it the program stops (no CPU fallback) |
+| `BONSAI_KHQ_PATH` | Enable compressed KV (centroid file) |
+| `BONSAI_DUMP_KV_DIR` | Dump the original model's K/V for calibration |
+| `BONSAI_KHQ_DEBUG` | Print compression events + payload norms per event |
+| `BONSAI_KHQ_SPLITS` | Number of split-K parts for compressed attention (default 8, max 16) |
+| `BONSAI_KHQ_PROF` | Profile the KHQ path per phase (syncs each phase, slower overall) |
+| `BONSAI_DUMP_TOP2` | Print top-2 logits (numeric comparison) |
+| `BONSAI_PROFILE` | Sync per stage (accurate profile, ~6% slower) |
+| `BONSAI_NO_FUSE` | Disable fusion (A/B comparison) |
+| `BONSAI_PREFILL_PER_TOKEN` | Force per-token prefill (comparison) |
+| `BONSAI_DISABLE_CUDA_FFI` | Disable the CUDA FFI path |
 
-### Deploy & uji otomatis di Kaggle
+### Automated deploy & test on Kaggle
 
 ```bash
 bash push_to_kaggle.sh
 ```
 
-`deploy_on_kaggle.sh` secara berurutan: kompilasi CUDA → smoke test FFI → uji kernel → build `main.mojo` → buat wheel → jalankan inferensi di T4 → **dump K/V asli → kalibrasi → uji runtime KHQ**, dengan gate otomatis (verifikasi dump, TOP2, cadence, dan isi payload), lalu **A/B split-K** (splits 1/4/8/16 + baseline fp16) dan **profil per-fase**.
+In order, `deploy_on_kaggle.sh`: compiles CUDA → FFI smoke test → kernel tests → builds `main.mojo` → builds the wheel → runs inference on the T4 → **original K/V dump → calibration → KHQ runtime test**, with automatic gates (dump verification, TOP2, cadence, payload content), then the **split-K A/B** (splits 1/4/8/16 + fp16 baseline) and the **per-phase profile**.
 
 ---
 
-## Kernel Matmul 1-Bit
+## 1-Bit Matmul Kernels
 
-### Jalur decode (`M = 1` dan batch kecil `M ≤ 8`)
+### Decode path (`M = 1` and small batches `M ≤ 8`)
 
-- **Vectorized memory coalescing** — pemuatan bobot 32-bit hingga 128-bit (`uint4` = 1 grup penuh `g128` per lane).
-- **Eliminasi LDS bank conflict** — padding `128 → 132` float (`132 % 32 == 4`), 8 kolom grup mengakses 8 bank berbeda.
-- **Akumulator register-M** — bobot dibaca **1 kali** dari DRAM per token.
-- **Reduksi warp deterministik** — tanpa `atomicAdd`, determinisme bitwise 100%.
+- **Vectorized memory coalescing** — 32-bit weight loads up to 128-bit (`uint4` = one full `g128` group per lane).
+- **LDS bank-conflict elimination** — padding `128 → 132` floats (`132 % 32 == 4`), so the 8 group columns hit 8 different banks.
+- **Register-tiled accumulators** — weights are read **once** from DRAM per token.
+- **Deterministic warp reduction** — no `atomicAdd`, 100% bitwise determinism.
 
-### Jalur prefill (`M > 8`)
+### Prefill path (`M > 8`)
 
-- **Dua varian tiling** — `prefill_sm75` (`BM=64, BN=32, BK=64`) dan `prefill_wmma` (`BM=64, BN=64, BK=64`, WMMA).
-- **Eliminasi bank conflict** — `PAD = 8` pada matriks shared memory.
-- **Dekuantisasi branchless** — `w_eff = s · (2·bit − 1)` dan trik tanda IEEE FP16 (`0xBC00 ^ (bit << 15)`), tanpa percabangan per-bit.
-- **Uniform barrier** — seluruh thread CTA memanggil barrier bersama walau sel di luar batas matriks, mencegah deadlock warp pada batas ragged.
+- **Two tiling variants** — `prefill_sm75` (`BM=64, BN=32, BK=64`) and `prefill_wmma` (`BM=64, BN=64, BK=64`, WMMA).
+- **Bank-conflict elimination** — `PAD = 8` on the shared-memory matrices.
+- **Branchless dequantization** — `w_eff = s · (2·bit − 1)` and the IEEE FP16 sign trick (`0xBC00 ^ (bit << 15)`), no per-bit branches.
+- **Uniform barrier** — all CTA threads call the barrier together even for out-of-bounds matrix cells, preventing warp deadlock on ragged boundaries.
 
 ---
 
-## Kontrak Matematika Kuantisasi
+## Quantization Math Contract
 
-- **Bobot** `uint8`, shape `[N, K/8]`, 8 bobot per byte urutan **LSB-first**:
+- **Weights** `uint8`, shape `[N, K/8]`, 8 weights per byte, **LSB-first** order:
   `bit_i = (byte >> (k mod 8)) & 1`
-- **Skala** `Float16`/`Float32`, shape `[N, (K + 127) / 128]`, `group_size = 128`.
-- **Kontrak Affine Bonsai** (`b = −s`):
-  `w_eff = (2·bit − 1) · s` → `+s` bila bit `1`, `−s` bila bit `0`.
-  Bias `−s` terserap ke perkalian, tanpa alokasi bias terpisah maupun FMA tambahan.
+- **Scales** `Float16`/`Float32`, shape `[N, (K + 127) / 128]`, `group_size = 128`.
+- **Affine Bonsai contract** (`b = −s`):
+  `w_eff = (2·bit − 1) · s` → `+s` when the bit is `1`, `−s` when the bit is `0`.
+  The `−s` bias is absorbed into the multiply — no separate bias allocation, no extra FMA.
 
 ---
 
-## Struktur Repositori
+## Repository Structure
 
 ```text
 bonsai-1bit-t4-mojo/
-├── main.mojo                     # CLI inferensi native
-├── deploy_on_kaggle.sh           # Build + uji + kalibrasi + runtime KHQ di Kaggle
-├── push_to_kaggle.sh             # Push dataset & kernel, lalu unduh artefak
+├── main.mojo                     # Native inference CLI
+├── deploy_on_kaggle.sh           # Build + test + calibration + KHQ runtime on Kaggle
+├── push_to_kaggle.sh             # Push dataset & kernel, then download artifacts
 ├── src/
-│   ├── common.mojo               # Konstanta arsitektur, geometri tile, stride
-│   ├── dequant.mojo              # Ekstraksi bit LSB-first & branchless sign-flip
-│   ├── ops.mojo                  # Dispatcher host + FFI CUDA (termasuk cal_op)
-│   ├── csrc/qmv_sm75_kernel.cu   # Kernel CUDA sm_75 (matmul, elementwise, KHQ, calib)
+│   ├── common.mojo               # Architecture constants, tile geometry, strides
+│   ├── dequant.mojo              # LSB-first bit extraction & branchless sign-flip
+│   ├── ops.mojo                  # Host dispatcher + CUDA FFI (including cal_op)
+│   ├── csrc/qmv_sm75_kernel.cu   # sm_75 CUDA kernels (matmul, elementwise, KHQ, calib)
 │   ├── khq/
-│   │   ├── calib.mojo            # Driver kalibrasi (dump -> khq_calib.bin)
-│   │   └── runtime.mojo          # Runtime kompresi KV (ring, kompresi, attention)
-│   ├── kernels/                  # Kernel Mojo: decode, prefill, elementwise, direct_smallm
+│   │   ├── calib.mojo            # Calibration driver (dump -> khq_calib.bin)
+│   │   └── runtime.mojo          # KV compression runtime (ring, compress, attention)
+│   ├── kernels/                  # Mojo kernels: decode, prefill, elementwise, direct_smallm
 │   ├── models/qwen3_5/           # Layer, attention, GDN, MLP, RoPE, norm, khq_dump
-│   └── safetensors.mojo          # Loader safetensors + jsonlite
-├── tests/                        # Selftest kernel, FFI, rope, argmax, arsitektur
-├── benchmarks/                   # Micro-benchmark T4 + profil layer
-└── scripts/build_cuda_ffi.sh     # Kompilasi kernel CUDA -> .so
+│   └── safetensors.mojo          # Safetensors loader + jsonlite
+├── tests/                        # Kernel selftests, FFI, rope, argmax, architecture
+├── benchmarks/                   # T4 micro-benchmarks + layer profiles
+└── scripts/build_cuda_ffi.sh     # Compile CUDA kernels -> .so
 ```
 
 ---
 
-## Menjalankan Uji
+## Running the Tests
 
 ```bash
-# Selftest kernel W1A16: kasus ekstrem (K mini, ragged N/M, broadcast, pola bit)
+# W1A16 kernel selftest: edge cases (tiny K, ragged N/M, broadcast, bit patterns)
 pixi run mojo run tests/selftest_sm75.mojo
 
-# Validasi dimensi layer Bonsai-27B
+# Validate Bonsai-27B layer dimensions
 pixi run mojo run tests/test_bonsai_shapes.mojo
 
-# Smoke test FFI & primary context
+# FFI & primary context smoke test
 pixi run mojo run tests/test_cuda_ffi_smoketest.mojo
 
-# Verifikasi silang vs referensi FP64 (Python + NumPy)
+# Cross-check against an FP64 reference (Python + NumPy)
 python3 tests/verify_differential.py
 
-# Benchmark throughput & bandwidth
+# Throughput & bandwidth benchmark
 pixi run mojo run benchmarks/bench_t4.mojo
 ```
 
 ---
 
-## Keterbatasan yang Diketahui
+## Known Limitations
 
-Bagian ini jujur soal apa yang **belum** setara dengan implementasi referensi (Python/MLX):
+This section is honest about what is **not yet** on par with the reference implementation (Python/MLX):
 
-**Kalibrasi**
-- Jumlah token kalibrasi di pipeline deploy 567 token, sedangkan referensi memakai 32.768 (`SEQ_LEN=1024 × 32 batch`). Keterwakilan distribusi lebih rendah.
-- Vektor `d` memakai seed turunan `layer_id` dengan xorshift, referensi memakai `layer_id // 4` via `np.random.RandomState`. Konsisten internal (kalibrasi ↔ runtime), tapi tidak bit-parity dengan referensi.
-- RNG inisialisasi/noise SmartVQ memakai xorshift per-thread, referensi memakai MLX. Algoritma & distribusi sama, lintasan acak berbeda.
-- Skor attention disimpan fp16; referensi bf16.
+**Calibration**
+- The deploy pipeline calibrates on 567 tokens, while the reference uses 32,768 (`SEQ_LEN=1024 × 32 batch`). Distribution coverage is lower.
+- The `d` vectors use a `layer_id`-derived seed via xorshift; the reference uses `layer_id // 4` via `np.random.RandomState`. Internally consistent (calibration ↔ runtime), but not bit-parity with the reference.
+- The SmartVQ init/noise RNG uses per-thread xorshift; the reference uses MLX. Same algorithm and distribution, different random trajectory.
+- Attention scores are stored fp16; the reference uses bf16.
 
 **Runtime**
-- `win_len` belum dijaga terhadap `KHQ_RING` (256). Pada `max_seq = 4096` aman karena kompresi selalu mengejar, tetapi bila `max_seq` dinaikkan melewati ~4200 jendela raw dapat melebihi ring dan kernel membaca slot melingkar tanpa peringatan.
-- Belum ada API reset state antar-sekuens; `khq_init_layer` idempoten.
-- State per-layer saat ini tidak dipersistensikan antar-proses.
+- `win_len` is not yet guarded against `KHQ_RING` (256). At `max_seq = 4096` this is safe because compression always catches up, but if `max_seq` is raised past ~4200 the raw window can exceed the ring and the kernel reads ring slots without warning.
+- No state-reset API between sequences yet; `khq_init_layer` is idempotent.
+- Per-layer state is currently not persisted across processes.
 
-**Performa**
-- `khq_attn_kernel` semula di-launch `<<<H_q = 24, 32>>>` — hanya 24 block × 32 thread (≈1,9% okupansi T4) dengan loop token serial di dalam block. Split-K (`BONSAI_KHQ_SPLITS`, default 8) sudah diimplementasikan untuk mengatasi ini; **angka perbaikannya belum terukur** di T4 — pengukuran ada di bagian A/B pada `deploy_on_kaggle.sh`. Karena kernel ini latency-bound (bukan throughput-bound), device dengan komputasi lebih tinggi tidak otomatis menolong.
-- Split-K mengubah urutan akumulasi floating-point. Secara matematis identik (merge logsumexp), tetapi hasil akhir bisa berbeda di level pembulatan. Karena itu run verifikasi di deploy dikunci `BONSAI_KHQ_SPLITS=1` supaya kontrak bit-exact dan gate isi payload tetap berlaku; stream token tiap nilai splits dibandingkan terpisah di A/B.
-- `BONSAI_PROFILE=1` (per-tahap GDN/ATTN) dimatikan secara bawaan karena sync 65×/token mematikan pipeline async. Untuk jalur KHQ ada `BONSAI_KHQ_PROF=1` yang mengukur 7 fase internal KHQ (ring-write, compress-K/V, gather-q, attn-kompresi, attn-jendela, merge+gate).
+**Performance**
+- `khq_attn_kernel` originally launched as `<<<H_q = 24, 32>>>` — only 24 blocks × 32 threads (≈1.9% T4 occupancy) with a serial token loop inside the block. Split-K (`BONSAI_KHQ_SPLITS`, default 8) is implemented to address this; **its improvement is not yet measured** on the T4 — measurement lives in the A/B section of `deploy_on_kaggle.sh`. Since this kernel is latency-bound (not throughput-bound), a device with more compute does not automatically help.
+- Split-K changes the floating-point accumulation order. It is mathematically identical (logsumexp merge), but the final result can differ at rounding level. The verification runs in deploy are therefore pinned to `BONSAI_KHQ_SPLITS=1` so the bit-exact contract and payload-content gates hold; the token stream for each splits value is compared separately in the A/B.
+- `BONSAI_PROFILE=1` (per-stage GDN/ATTN) is off by default because syncing 65×/token kills the async pipeline. For the KHQ path, `BONSAI_KHQ_PROF=1` measures the 7 internal KHQ phases (ring-write, compress-K/V, gather-q, compressed attention, raw-window attention, merge+gate).
 
 ---
 
-## Lisensi
+## License
 
-Apache-2.0 License.
+Apache-2.0

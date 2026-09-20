@@ -1,7 +1,7 @@
 {
-  "id": "okiabrian/bonsai-mojo-t4-build",
-  "title": "bonsai-mojo-t4-build",
-  "code_file": "run_deploy.py",
+  "id": "okiabrian/bonsai-banding-llamacpp",
+  "title": "bonsai-banding-llamacpp",
+  "code_file": "run_banding.py",
   "language": "python",
   "kernel_type": "script",
   "is_private": true,
@@ -10,13 +10,9 @@
   "enable_tpu": false,
   "enable_internet": true,
   "dataset_sources": [
-    "okiabrian/bonsai-mojo-source",
     "okiabrian/bonsai-27b-mlx-1bit"
   ],
   "competition_sources": [],
-  "kernel_sources": [
-    "okiabrian/bonsai-build-cpu",
-    "okiabrian/bonsai-mojo-t4-build"
-  ],
+  "kernel_sources": [],
   "model_sources": []
 }

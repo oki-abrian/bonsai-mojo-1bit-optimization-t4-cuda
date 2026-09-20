@@ -159,6 +159,14 @@ struct SafeTensorsIndex:
         var bytes = s.as_bytes()
         for i in range(n):
             fresh[self.n_shard_bytes + i] = bytes[i]
+        # Penutup NUL WAJIB DITULIS, bukan cuma dialokasikan: `alloc` tidak
+        # menjamin memori nol, dan read_raw() membangun path lewat
+        # String(unsafe_from_utf8_ptr=...) yang berhenti di byte nol. Tanpa
+        # baris ini path shard terbaca melewati batas dan menyambung isi memori
+        # tetangga — pernah muncul sebagai ".../model.safetensorsjson" ketika
+        # path model lebih panjang (mount dataset) dibanding path pendek
+        # (/kaggle/working/bonsai2) yang kebetulan berujung byte nol.
+        fresh[self.n_shard_bytes + n] = UInt8(0)
         if self.n_shard_bytes > 0:
             self.shard_paths.free()
         self.shard_paths = fresh
@@ -453,10 +461,20 @@ struct LoadedQLinear(Copyable, Movable, ImplicitlyCopyable):
     var nbytes: Int
     var ok: Bool
 
-fn load_qlinear(st: SafeTensorsIndex, w_name: String, s_name: String, b_name: String) raises -> LoadedQLinear:
-    """Muat (weight packed, scales, biases) -> FP32. scales DIBAGI 2 di sini
+fn load_qlinear(
+    st: SafeTensorsIndex, w_name: String, s_name: String, b_name: String,
+    bits: Int = 1
+) raises -> LoadedQLinear:
+    """Muat (weight packed, scales, biases) -> FP32.
+
+    bits=1 (default, Bonsai-27B lama): scales DIBAGI 2 di sini
     (s_eff = s_ckpt/2 untuk kernel (2q-1)*s); biases mentah untuk koreksi
-    affine eksak di QwenLinear1Bit.forward (paritas mx.quantized_matmul)."""
+    affine eksak di QwenLinear1Bit.forward (paritas mx.quantized_matmul).
+
+    bits=2 (Bonsai-2 / Ternary-Bonsai-2-27B): kontrak berbeda —
+    biases == -scales penuh, sehingga w = (q-1)*s dan scales dipakai MENTAH
+    (TIDAK dibagi 2). Lihat CATATAN_IMPLEMENTASI_BONSAI2.md.
+    """
     var r = LoadedQLinear(
         w=UnsafePointer[UInt8, MutAnyOrigin](), scales=UnsafePointer[Float32, MutAnyOrigin](),
         biases=UnsafePointer[Float32, MutAnyOrigin](),
@@ -479,16 +497,37 @@ fn load_qlinear(st: SafeTensorsIndex, w_name: String, s_name: String, b_name: St
         wb.free()
         return r
     var nn = st.dim0(ew)
-    var kk = nb * 8 // nn
+    # bits-per-weight menentukan lebar K: 1-bit = 8 bobot/byte, 2-bit = 4.
+    var kk = nb * 8 // bits // nn
     var snum = nn * (kk // 128)
     var sb = alloc[Float32](snum if snum > 0 else 1)
     if not st.read_f32(es, sb, snum):
         wb.free()
         sb.free()
         return r
-    for i in range(snum):
-        sb[i] *= Float32(0.5)
+    # HANYA 1-bit yang membutuhkan s_eff = s_ckpt/2 (b = -s_ckpt/2).
+    # 2-bit ternary: b = -s penuh -> w = (q-1)*s, skala mentah.
+    if bits == 1:
+        for i in range(snum):
+            sb[i] *= Float32(0.5)
     var bb = alloc[Float32](snum if snum > 0 else 1)
     if eb != -1:
         var _ = st.read_f32(eb, bb, snum)
     return LoadedQLinear(w=wb, scales=sb, biases=bb, n_rows=nn, k_dim=kk, nbytes=nb, ok=True)
+
+fn load_signs(st: SafeTensorsIndex, name: String, k_dim: Int) raises -> UnsafePointer[Float32, MutAnyOrigin]:
+    """Muat vektor tanda Hadamard ±1 (tensor `.signs` F32 [K]) untuk modul
+    terfold Bonsai-2. Mengembalikan pointer nol bila tensor tidak ada (berarti
+    modul ini tidak ter-transform — mis. vision tower atau modul tak terfold)."""
+    var es = st.find(name)
+    if es == -1:
+        es = st.find("language_model." + name)
+    if es == -1:
+        return UnsafePointer[Float32, MutAnyOrigin]()
+    if st.dim0(es) != k_dim:
+        return UnsafePointer[Float32, MutAnyOrigin]()
+    var out = alloc[Float32](k_dim if k_dim > 0 else 1)
+    if not st.read_f32(es, out, k_dim):
+        out.free()
+        return UnsafePointer[Float32, MutAnyOrigin]()
+    return out
