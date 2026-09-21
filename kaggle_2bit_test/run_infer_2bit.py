@@ -911,6 +911,136 @@ ok = ok and ok_int8 and ok_h2 and ok_wide
 log("   VERDIK TOTAL:", "LULUS" if ok else "TIDAK LULUS")
 
 # --------------------------------------------------------------------------
+# 6k. UJI KUALITAS 2-BIT PADA SOAL PENALARAN — GENERASI PANJANG (~2000 token).
+#     Semua run 6a-6j di atas memakai prompt pengisi "capital of France" yang
+#     diulang 8x dan hanya 24 token keluaran. Itu menguji STRUKTUR: bobot
+#     termuat, jalur h2 menghasilkan token yang sama. Ia TIDAK menjawab
+#     pertanyaan pokoknya — apakah bobot 2-bit hasil kuantisasi masih sanggup
+#     MENALAR? Sampai sekarang jalur 2-bit belum pernah diuji akurasinya;
+#     seluruh run yang ada adalah smoke test.
+#     Soal: pipa A mengisi kolam 6 jam, pipa B 4 jam; keduanya dibuka 2 jam
+#     bersama-sama lalu B ditutup. Jawaban benar = 3 jam. Patokannya sudah
+#     ada: jalur 1-bit menjawab benar memakai 1739 token pada 60,66 ms/token
+#     (HASIL_INFER_SUSAH_2026-09-14.md).
+#     Sampling dipakai SAMA PERSIS dengan infer_susah/infer_config.json
+#     (temp 0,70 · top_k 20 · top_p 0,95 · seed 1234) supaya kualitasnya
+#     sebanding dengan patokan 1-bit itu. rep_penalty & rep_window sudah
+#     menjadi default di main.mojo:1561-1562, jadi tidak disetel di sini.
+#     DUA run: skalar proven (tanpa BONSAI_DECODE_H2) dan h2. Kesetaraan h2
+#     selama ini hanya terbukti pada 24 token; kalau h2 menyimpang setelah
+#     ratusan token, jawaban yang kacau tidak lagi bisa disalahkan ke
+#     kuantisasi — harus jelas dulu mana sumbernya.
+#     Bagian ini TIDAK menyentuh `ok`, jadi VERDIK TOTAL & exit code di atas
+#     tetap milik 9 run struktur.
+# --------------------------------------------------------------------------
+log("6k. UJI KUALITAS 2-BIT PADA SOAL PENALARAN (generasi panjang)")
+
+PROMPT_SUSAH = os.environ.get(
+    "BONSAI_PROMPT_SUSAH",
+    "Sebuah kolam dapat diisi penuh oleh pipa A dalam 6 jam dan oleh pipa B "
+    "dalam 4 jam. Mula-mula kedua pipa dibuka bersamaan selama 2 jam, lalu "
+    "pipa B ditutup dan hanya pipa A yang terus mengalir sampai kolam penuh. "
+    "Berapa jam total waktu yang dibutuhkan untuk mengisi kolam sampai penuh? "
+    "Tunjukkan langkah perhitungannya.",
+)
+LONG_TOKENS = os.environ.get("BONSAI_LONG_TOKENS", "2048")
+SAMP_TEMP = os.environ.get("BONSAI_LONG_TEMP_X100", "70")
+SAMP_TOPK = os.environ.get("BONSAI_LONG_TOP_K", "20")
+SAMP_TOPP = os.environ.get("BONSAI_LONG_TOP_P_X1000", "950")
+SAMP_SEED = os.environ.get("BONSAI_LONG_SEED", "1234")
+
+# Tokenisasi MANDIRI. Jangan sentuh `ids` / `prompt_tokens` milik bagian 5:
+# sembilan run A/B di atas masih bergantung padanya.
+try:
+    text_susah = ("<|im_start|>user\n" + PROMPT_SUSAH
+                  + "<|im_end|>\n<|im_start|>assistant\n")
+    ids_susah = tok.encode(text_susah, add_special_tokens=False)
+except Exception as e_s:
+    log("   [WARN] tokenisasi prompt susah gagal (" + str(e_s)[:80]
+        + ") — pakai ids bagian 5 (prompt pengisi)")
+    ids_susah = ids
+log(f"   panjang prompt: {len(ids_susah)} token | max-tokens: {LONG_TOKENS}")
+log("   sampling: temperature=" + str(float(SAMP_TEMP) / 100.0)
+    + " top_k=" + SAMP_TOPK
+    + " top_p=" + str(float(SAMP_TOPP) / 1000.0)
+    + " seed=" + SAMP_SEED)
+
+# max_seq = 4096 (main.mojo:1080). main.mojo:1518 memang sudah menolak yang
+# lebih panjang, tapi dicek di sini supaya gagalnya tercatat jelas di log,
+# bukan berhenti sebagai "EXIT 1" tanpa sebab.
+if len(ids_susah) + int(LONG_TOKENS) > 4096:
+    log("   [DILEWATI] prompt + max-tokens melebihi max_seq 4096")
+    gens_scalar, gens_h2 = None, None
+else:
+    pt_susah = ",".join(str(i) for i in ids_susah)
+    env_long = dict(env)
+    env_long.update({
+        "BONSAI_TEMP_X100": SAMP_TEMP,
+        "BONSAI_TOP_K": SAMP_TOPK,
+        "BONSAI_TOP_P_X1000": SAMP_TOPP,
+        "BONSAI_MIN_P_X1000": "0",
+        "BONSAI_SEED": SAMP_SEED,
+    })
+
+    def run_long(label, extra):
+        """Satu kali bonsai_infer pada soal susah. Pulangkan (token, raw)."""
+        e = dict(env_long)
+        e.update(extra)
+        cmd = [infer, "--model-dir", model_dir,
+               "--prompt-tokens", pt_susah,
+               "--max-tokens", LONG_TOKENS, "--gpu"]
+        log(f"   --- RUN PANJANG [{label}] ---")
+        t0 = __import__("time").time()
+        pl = subprocess.run(cmd, env=e, capture_output=True, text=True)
+        log(f"   exit={pl.returncode} "
+            f"({__import__('time').time() - t0:.1f} s)")
+        raw = pl.stdout or ""
+        if pl.returncode != 0:
+            for line in raw.strip().splitlines()[-25:]:
+                print("   stdout:", line, flush=True)
+            for line in (pl.stderr or "").strip().splitlines()[-15:]:
+                print("   stderr:", line, flush=True)
+            return None, None
+        g = parse_gens(raw)
+        pf, dc = parse_perf(raw)
+        log(f"   token tergenerasi: {len(g)}")
+        log("   [PERF] prefill:", pf)
+        log("   [PERF] decode :", dc)
+        return g, raw
+
+    gens_scalar, _ = run_long("skalar proven", {})
+    gens_h2, _ = run_long("cepat h2 (BONSAI_DECODE_H2=1)",
+                          {"BONSAI_DECODE_H2": "1"})
+
+    # A/B kedua jalur. Sampling menyala, jadi ini lebih ketat daripada
+    # greedy: drift logit sekecil apa pun bisa membalik token terambil.
+    if gens_scalar is not None and gens_h2 is not None:
+        n = min(len(gens_scalar), len(gens_h2))
+        beda = [i for i in range(n) if gens_scalar[i] != gens_h2[i]]
+        log("   A/B jalur: " + str(len(gens_scalar)) + " vs "
+            + str(len(gens_h2)) + " token | beda: " + str(len(beda))
+            + " | indeks pertama beda: "
+            + (str(beda[0]) if beda else "(tidak ada)"))
+        if not beda and len(gens_scalar) == len(gens_h2):
+            log("   [OK] seluruh IDENTIK — h2 setara pada generasi panjang")
+
+    # Kualitas yang sebenarnya ada di teks yang didekode, bukan di daftar id.
+    for nama, g in (("SKALAR", gens_scalar), ("H2", gens_h2)):
+        if not g:
+            continue
+        try:
+            teks = tok.decode(g, skip_special_tokens=True)
+        except Exception:
+            try:
+                teks = tok.decode(g)
+            except Exception as e_d:
+                teks = "(decode gagal: " + str(e_d)[:60] + ")"
+        log(f"   ===== TEKS KELUARAN 2-BIT [{nama}] =====")
+        for baris in teks.splitlines() or ["(kosong)"]:
+            print("   |", baris, flush=True)
+        log(f"   ===== akhir teks [{nama}] =====")
+
+# --------------------------------------------------------------------------
 # 7. PROFIL PER-KERNEL (nvprof / nsys).
 #    [PROF-LAYER] menggabungkan semua kernel jadi 5 fase dan TIAP fase
 #    diakhiri ctx.synchronize() (~31-80 us), jadi tidak bisa memisahkan
