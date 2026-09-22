@@ -2,6 +2,8 @@
 
 ## Aturan kerja proyek
 
+- Repositori: `https://github.com/oki-abrian/bonsai-mojo-1bit-optimization-t4-cuda.git`,
+  cabang `main`. Catatan harian ikut ter-commit (berkas memory sudah tracked).
 - Meniru llama.cpp (`references/llama.cpp-prism/`, baca-saja). Metodologi:
   `LAPORAN_AUDIT_PARITAS_LLAMACPP_PRISM.md`.
 - **Mesin lokal BUKAN mesin build.** Build di Kaggle/T4 (sm_75). Verifikasi:
@@ -98,6 +100,36 @@
   **58,48 ms steady-state (766 token)** = +23%; skalar 72,7 → 75,25 = +3,5%.
   1-bit: 58,53 (13 token) → 60,66 (1739 token).
 
+## Gerbang koherensi BUKAN uji kebenaran jawaban
+
+- deploy_on_kaggle.sh:961-1276. Yang diperiksa HANYA degenerasi: siklus
+  periodik (`loop@`), keragaman 50 token ekor (ambang `<12` unik = gagal),
+  rasio id unik per jendela. **LULUS ≠ jawaban benar.** Bukti nyata: run
+  v133 penalaran.think0 LULUS tapi terpotong di 512 token tepat sebelum
+  angka akhir.
+- Anggaran token `BONSAI_COH_TOKENS` (bawaan **512**, :961). Mode thinking
+  `BONSAI_COH_THINK` (0/1/both, :966). Decoding GREEDY (`BONSAI_TEMP_X100=0`,
+  :1100). Semua berprefiks BONSAI_ ⇒ ikut ke container otomatis.
+- **PLAFON KERAS 4096: `BONSAI_COH_TOKENS` TIDAK boleh 4096 atau lebih.**
+  `main.mojo:1080` `var max_seq = 4096` (konstanta, tanpa env override) dan
+  penjaga :1518 `if prompt_len + max_tokens > max_seq: raise Error(FATAL)`.
+  Prompt diukur: cerita 27 token, penalaran 71 token (+template ≈ 86) ⇒
+  aman maks ≈ 4010. Dipakai **3900** dan lolos.
+- **JEBLAKAN: pesan FATAL biner tak pernah muncul di log.** Pipeline COH
+  (:1101-1103) `2>&1 | tee $COH_DIR/$tag.log | grep -E "\[GEN\] token id|\[PERF\]
+  rata-rata"` — grep membuang semua baris lain, jadi kegagalan tampil hanya
+  sbg "token tidak terekam di log" + gerbang GAGAL, tanpa sebab. Gejala
+  khas: run selesai cepat (26 s bukannya 200 s). Kalau gerbang gagal dgn
+  pesan itu, curigai penjaga panjang konteks, BUKAN modelnya.
+- Dua prompt tetap (:1065-1068): `cerita` (nelayan + peta) dan `penalaran`
+  (soal pipa A 6 jam / B 4 jam, jawaban benar = **3 jam**).
+- Uji kebenaran pada soal kompleks butuh: anggaran ≥2048 token agar jawaban
+  tuntas + teks didecode lokal (produksi hanya mencetak id token) + dibanding
+  dgn jawaban yg diketahui. Tidak ada penilai otomatis.
+- Kernel khusus utk itu: `infer_susah/` → `okiabrian/bonsai-2bit-infer`
+  (max_tokens 2048, T=0,70 = resep resmi Bonsai). Di situ v44 menjawab 3 jam
+  dgn lengkap (LaTeX + tabel verifikasi), 781/766 token, nol CJK.
+
 ## Status 2-bit (diuji 2026-09-21/22)
 
 - **Uji akurasi pertama**, kernel `okiabrian/bonsai-2bit-infer` v44, soal pipa
@@ -143,6 +175,33 @@
   runtime kompresi KV, kalibrasi) dilewati; dicetak `>> [KHQ] 5b DILEWATI`.
   Karena `push_to_kaggle.sh` hanya meneruskan `BONSAI_*`, nama HARUS pakai
   prefiks itu (sebelumnya `KHQ_DUMP_FORCE` TIDAK ikut ke container).
+- **[SUDAH DIPERBAIKI 2026-09-23] CACHE KHQ tidak lengkap**: cache hanya
+  menyimpan `kv_dump.bin` + `khq_dump.log`, padahal 5b.2 mewajibkan juga
+  `attn_<lid>.bin` (16 layer x 7,3 MB). Maka tiap run yg memakai ulang cache
+  gagal verifikasi dgn `[KHQ-FAIL] attn_3.bin tidak ada` → `kalibrasi
+  dibatalkan`, tetapi pipeline TETAP exit 0 & gerbang tetap LULUS — tampak
+  hijau padahal KHQ tidak bekerja. Terbukti v136 (2-bit, 15 mnt): dump
+  valid (magic 0x4451484b, 16 layer, dim 1024, 609 token/layer) tp batal.
+  Perbaikan (deploy_on_kaggle.sh:1313,1351-1358,1376-1380):
+  `ATTN_CACHE_DIR=$CACHE_DIR/attn_b${BONSAI_BITS}`; syarat pakai-ulang kini
+  mensyaratkan attn ada, kalau tidak → dump segar (bukan batal diam-diam).
+  Catatan mekanisme: yang lestari antar run HANYA `.cache_t4_build`
+  (diarsip ke mojo_build_cache.tar.gz, deploy_on_kaggle.sh:79) — KHQ_DIR
+  ($WORKING/khq_real) tidak pernah lestari, jadi attn HARUS masuk CACHE_DIR.
+- `KHQ_DUMP_FORCE=1` TIDAK bisa dikirim dari lokal (hanya `BONSAI_*` yg
+  diteruskan). Memaksa dump segar butuh knob berprefiks BONSAI_ atau
+  menghapus berkas cache-nya.
+- **TERBUKTI v138 (41 mnt, exit 0): rantai KHQ utuh** — dump segar 13,8 mnt,
+  5b.2 `[KHQ-OK] dump ASLI dari model valid`, kalibrasi 4,8 mnt →
+  `centroid: ver=2 layers=16 dim=256 bytes=3440976`, 5b.4 `jalur KV
+  terkompresi AKTIF (watermark 256/128)`, event `[KHQ-COMPRESS]` di 16 layer,
+  `[KHQ-OK] jalur window setara secara numerik`. KHQ splits=16 = 51,50
+  ms/token; beban konteks pendek +0,1%; regime 512 token splits=1 = 1,209x
+  baseline fp16, splits=16 = 58,14 ms.
+- **TRAP `set -e` pada penugasan**: `VAR="$(perintah)"` mewarisi status keluar
+  perintah; `find` ke direktori tak ada → status 1 → SELURUH run mati
+  (v137 exit 1 tepat setelah gerbang koherensi). `2>/dev/null` tidak menolong.
+  SELALU akhiri dgn `|| true` bila kegagalan wajar.
   Bukti run 2-bit KHQ=0: 16 menit (vs 39 menit KHQ aktif), exit 0, semua
   gerbang lulus.
 - **Sidik jari build-cache** (§4a): butuh sha256 `main.mojo` + `src/**/*.mojo`

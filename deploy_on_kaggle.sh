@@ -1303,6 +1303,14 @@ PYEOF
     KV_CACHE_LOG="$CACHE_DIR/khq_dump_b${BONSAI_BITS}.log"
     KV_OUT_BIN="kv_dump_b${BONSAI_BITS}.bin"
     KV_OUT_LOG="khq_dump_b${BONSAI_BITS}.log"
+    # attn_<lid>.bin (16 layer x 7,3 MB) WAJIB ikut tercache: 5b.2 menolak
+    # dump bila berkas ini tidak ada, sehingga kalibrasi dibatalkan. Dulu
+    # hanya kv_dump.bin + log yang disimpan, maka TIAP run yang memakai ulang
+    # cache gagal verifikasi dan KHQ diam-diam tidak mengerjakan apa pun
+    # (pipeline tetap exit 0). Cache disimpan di bawah CACHE_DIR karena hanya
+    # .cache_t4_build yang ikut terarsip ke mojo_build_cache.tar.gz —
+    # KHQ_DIR tidak pernah lestari antar run.
+    ATTN_CACHE_DIR="$CACHE_DIR/attn_b${BONSAI_BITS}"
     # ---------------------------------------------------------------
     # CACHE kv_dump.bin + khq_dump.log — run dump ini adalah biaya TERBESAR
     # dalam satu run GPU (terukur, bukan dugaan):
@@ -1336,12 +1344,22 @@ PYEOF
            "$KV_CACHE_LOG" || true
         echo ">> [KHQ-CACHE] $KV_OUT_LOG diimpor dari output GPU run sebelumnya."
     fi
-    if [ -f "$KV_CACHE_BIN" ] && [ -f "$KV_CACHE_LOG" ] \
+    # Cache dianggap layak pakai HANYA kalau lengkap: kv_dump.bin + log +
+    # attn_*.bin. Kalau attn_*.bin belum ada (mis. cache dibuat sebelum
+    # perbaikan ini), jangan dipakai — lebih baik bayar dump 14 menit
+    # daripada verifikasi 5b.2 gagal dan kalibrasi batal tanpa kelihatan.
+    # `|| true` WAJIB: skrip memakai `set -e`, dan find mengembalikan status 1
+    # bila direktori belum ada — tanpa itu status penugasan ini menjadi 1 dan
+    # seluruh run mati di sini (terjadi di kernel v137, exit 1 tepat setelah
+    # gerbang koherensi).
+    ATTN_CACHED="$(find "$ATTN_CACHE_DIR" -maxdepth 1 -name 'attn_*.bin' -print -quit 2>/dev/null || true)"
+    if [ -f "$KV_CACHE_BIN" ] && [ -f "$KV_CACHE_LOG" ] && [ -n "$ATTN_CACHED" ] \
        && [ "${KHQ_DUMP_FORCE:-0}" != "1" ]; then
         # Nama kerja di dalam KHQ_DIR / DIST_DIR TETAP kv_dump.bin &
         # khq_dump.log, supaya pembaca di 5b.2 & 5b.9 tidak tersentuh.
         cp "$KV_CACHE_BIN" "$KHQ_DIR/kv_dump.bin" || true
         cp "$KV_CACHE_LOG" "$DIST_DIR/khq_dump.log" || true
+        cp "$ATTN_CACHE_DIR"/attn_*.bin "$KHQ_DIR/" 2>/dev/null || true
         echo ">> [KHQ-CACHE] dump dipakai ulang dari cache (BONSAI_BITS=$BONSAI_BITS)."
         echo ">> [KHQ-CACHE] run dump $KHQ_TOKENS token DILEWATI (hemat ~13 menit kuota GPU)."
     else
@@ -1359,6 +1377,11 @@ PYEOF
             # tanpa salinan ini run berikutnya tidak bisa mengimpornya.
             cp "$KHQ_DIR/kv_dump.bin" "$KHQ_DIR/$KV_OUT_BIN" || true
             cp "$DIST_DIR/khq_dump.log" "$DIST_DIR/$KV_OUT_LOG" || true
+            # attn_*.bin ikut disimpan ke CACHE_DIR, supaya run berikutnya
+            # yang memakai ulang cache bisa lolos verifikasi 5b.2 dan
+            # kalibrasinya benar-benar jalan.
+            mkdir -p "$ATTN_CACHE_DIR"
+            cp "$KHQ_DIR"/attn_*.bin "$ATTN_CACHE_DIR/" 2>/dev/null || true
             echo ">> [KHQ-CACHE] dump disimpan ke cache utk run berikutnya (BONSAI_BITS=$BONSAI_BITS)."
         fi
     fi
