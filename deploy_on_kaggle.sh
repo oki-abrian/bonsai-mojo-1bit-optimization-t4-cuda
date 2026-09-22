@@ -721,20 +721,33 @@ if command -v nvidia-smi >/dev/null 2>&1 && [ -f "$WORKING/bonsai_infer" ]; then
     echo "========================================================="
     echo " 5. UJI INFERENSI DI GPU KAGGLE ($(nvidia-smi --query-gpu=name --format=csv,noheader | head -1))"
     echo "========================================================="
-    # Bobot diasumsikan terpasang dari Kaggle Dataset (okiabrian/bonsai-27b-mlx-1bit)
-    # di /kaggle/input — TANPA mengunduh ulang 4.9GB setiap run.
+    # Bobot diasumsikan terpasang dari Kaggle Dataset di /kaggle/input —
+    # TANPA mengunduh ulang setiap run.
+    # Model dipilih lewat BONSAI_BITS. BAWAAN 1, jadi perilaku lama tidak
+    # berubah sedikit pun. main.mojo:293 membaca env ini (env_int default 1).
+    #   1 -> okiabrian/bonsai-27b-mlx-1bit : Bonsai-27B, model_type qwen3_5
+    #   2 -> okiabrian/bonsai-2bit-weights : Bonsai-2, prism_hadamard_qwen35.
+    #        Ini MODEL BERBEDA, bukan Bonsai-27B dalam lebar bit lain —
+    #        memakai kuantisasi rotasi Hadamard, karena itu butuh hadamard.json.
+    BONSAI_BITS="${BONSAI_BITS:-1}"
+    export BONSAI_BITS
+    if [ "$BONSAI_BITS" = "2" ]; then
+        MODEL_CANDS="/kaggle/input/*/bonsai-2bit-weights /kaggle/input/bonsai-2bit-weights /kaggle/input/datasets/okiabrian/bonsai-2bit-weights"
+    else
+        MODEL_CANDS="/kaggle/input/*/bonsai-27b-mlx-1bit /kaggle/input/bonsai-27b-mlx-1bit /kaggle/input/datasets/okiabrian/bonsai-27b-mlx-1bit"
+    fi
     KMODEL=""
-    for cand in /kaggle/input/*/bonsai-27b-mlx-1bit /kaggle/input/bonsai-27b-mlx-1bit /kaggle/input/datasets/okiabrian/bonsai-27b-mlx-1bit; do
+    for cand in $MODEL_CANDS; do
         if [ -f "$cand/model.safetensors.index.json" ] || [ -f "$cand/model.safetensors" ]; then
             KMODEL="$cand"; break
         fi
     done
     if [ -z "$KMODEL" ]; then
         echo ">> [WARN] Dataset bobot tidak ditemukan di /kaggle/input — uji inferensi dilewati."
-        echo ">> [INFO] Daftarkan 'okiabrian/bonsai-27b-mlx-1bit' di dataset_sources kernel-metadata.json."
+        echo ">> [INFO] Daftarkan dataset bobot utk BONSAI_BITS=$BONSAI_BITS di dataset_sources kernel-metadata.json."
         KMODEL="/tmp/bonsai_model"
     else
-        echo ">> [T4] Bobot ditemukan (tanpa unduh): $KMODEL"
+        echo ">> [T4] Bobot ditemukan (tanpa unduh): $KMODEL (BONSAI_BITS=$BONSAI_BITS)"
     fi
 
     # 5.0 TES TOKENIZER — verifikasi ID khusus thd checkpoint ITU SENDIRI.
@@ -764,7 +777,20 @@ print("   kelas: eos=%s im_start=%s im_end=%s" % (t.eos_token_id, t.im_start_tok
 # 1. ID kelas harus mengikuti checkpoint, dan bukan rentang generasi lama.
 if t.eos_token_id != eos:
     fail.append("eos_token_id kelas=%s != checkpoint=%s" % (t.eos_token_id, eos))
-if t.im_end_token_id != eos:
+# <|im_end|> TIDAK selalu sama dgn eos_token_id config. Bonsai-2 (2-bit)
+# menulis eos_token_id=248044 = <|endoftext|>, padahal <|im_end|> bernomor
+# 248046 dan model itu mengakhiri giliran dgn 248046. Bandingkan im_end thd
+# vocab tokenizer; hanya kalau tokennya tak ada di vocab, jatuh ke eos config.
+_im_end_vocab = None
+if hasattr(tok, "convert_tokens_to_ids"):
+    _im_end_vocab = tok.convert_tokens_to_ids("<|im_end|>")
+elif hasattr(tok, "token_to_id"):
+    _im_end_vocab = tok.token_to_id("<|im_end|>")
+if isinstance(_im_end_vocab, int) and _im_end_vocab >= 0:
+    if t.im_end_token_id != _im_end_vocab:
+        fail.append("im_end_token_id kelas=%s != <|im_end|> vocab=%s"
+                    % (t.im_end_token_id, _im_end_vocab))
+elif t.im_end_token_id != eos:
     fail.append("im_end_token_id kelas=%s != eos checkpoint=%s" % (t.im_end_token_id, eos))
 if (t.eos_token_id, t.im_start_token_id, t.im_end_token_id) == (151643, 151644, 151645):
     fail.append("ID masih rentang Qwen2.5/Qwen3.0 (151xxx)")
@@ -818,6 +844,11 @@ PYEOF
     export BONSAI_CUDA_LIB="$WORKING/libbonsai_qmv_sm75.so"
     export LD_LIBRARY_PATH="$WORKING:$REPO_DIR:$REPO_DIR/build:$WORKING/build:$DIST_DIR:$REPO_DIR/.pixi/envs/default/lib:${LD_LIBRARY_PATH:-}"
     export BONSAI_USE_GPU=1
+    # Jalur decode cepat half2. AMAN diekspor global untuk kedua model:
+    # linear.mojo:409 mensyaratkan self.bits == 2, jadi pada 1-bit env ini
+    # diabaikan (nol efek). Tanpa ini, jalur 2-bit diam-diam memakai kernel
+    # skalar — 75,25 vs 58,48 ms/token (1,286x lebih lambat) tanpa pesan error.
+    export BONSAI_DECODE_H2=1
     # BONSAI_PROFILE=1 DI-MATIKAN: sync 65x/token di main loop mematikan
     # pipeline async (bukti: regresi 8.00 -> 7.54 tok/s saat profil aktif).
     # Aktifkan hanya untuk sesi profiling terpisah.
@@ -1251,9 +1282,27 @@ PYEOF
     #     skor softmax dari khq_dump_attn — persis yang dikumpulkan
     #     precompute_centroids.py (k_unroped + v + scores).
     # ---------------------------------------------------------------
+    KHQ_ENABLE="${BONSAI_KHQ_ENABLE:-1}"
+    if [ "$KHQ_ENABLE" = "0" ]; then
+        echo ">> [KHQ] 5b DILEWATI (BONSAI_KHQ_ENABLE=0) — dump, kalibrasi, dan"
+        echo ">> [KHQ] uji runtime kompresi KV semuanya tidak dijalankan."
+        echo ">> [KHQ] Inferensi murni saja; cache KHQ tidak disentuh."
+    else
     KHQ_DIR="$WORKING/khq_real"
     KHQ_TOKENS="${KHQ_DUMP_TOKENS:-512}"
     rm -rf "$KHQ_DIR"; mkdir -p "$KHQ_DIR"
+    # ---------------------------------------------------------------
+    # Cache KHQ DIKUNCI PER MODEL. Dump K/V bergantung pada BOBOT (baris
+    # 1299 memakai --model-dir "$KMODEL"), jadi dump hasil 1-bit TIDAK
+    # boleh dipakai ulang untuk run 2-bit dan sebaliknya — kalau nama
+    # berkasnya tetap seperti dulu, run yang bergantian akan saling
+    # memakai dump yang salah tanpa satu pesan pun. Nama berkas kini
+    # memuat lebar bit sbg kuncinya.
+    # ---------------------------------------------------------------
+    KV_CACHE_BIN="$CACHE_DIR/kv_dump_b${BONSAI_BITS}.bin"
+    KV_CACHE_LOG="$CACHE_DIR/khq_dump_b${BONSAI_BITS}.log"
+    KV_OUT_BIN="kv_dump_b${BONSAI_BITS}.bin"
+    KV_OUT_LOG="khq_dump_b${BONSAI_BITS}.log"
     # ---------------------------------------------------------------
     # CACHE kv_dump.bin + khq_dump.log — run dump ini adalah biaya TERBESAR
     # dalam satu run GPU (terukur, bukan dugaan):
@@ -1275,23 +1324,25 @@ PYEOF
     # kernel_sources (lihat kernel-metadata.json), sehingga output run
     # sebelumnya termount di /kaggle/input/bonsai-mojo-t4-build dan bisa
     # diimpor. Bila mount itu tidak ada, impor dilewati tanpa error.
-    if [ ! -f "$CACHE_DIR/kv_dump.bin" ] \
-       && [ -f "/kaggle/input/bonsai-mojo-t4-build/khq_real/kv_dump.bin" ]; then
-        cp "/kaggle/input/bonsai-mojo-t4-build/khq_real/kv_dump.bin" \
-           "$CACHE_DIR/kv_dump.bin" || true
-        echo ">> [KHQ-CACHE] kv_dump.bin diimpor dari output GPU run sebelumnya."
+    if [ ! -f "$KV_CACHE_BIN" ] \
+       && [ -f "/kaggle/input/bonsai-mojo-t4-build/khq_real/$KV_OUT_BIN" ]; then
+        cp "/kaggle/input/bonsai-mojo-t4-build/khq_real/$KV_OUT_BIN" \
+           "$KV_CACHE_BIN" || true
+        echo ">> [KHQ-CACHE] $KV_OUT_BIN diimpor dari output GPU run sebelumnya."
     fi
-    if [ ! -f "$CACHE_DIR/khq_dump.log" ] \
-       && [ -f "/kaggle/input/bonsai-mojo-t4-build/dist/khq_dump.log" ]; then
-        cp "/kaggle/input/bonsai-mojo-t4-build/dist/khq_dump.log" \
-           "$CACHE_DIR/khq_dump.log" || true
-        echo ">> [KHQ-CACHE] khq_dump.log diimpor dari output GPU run sebelumnya."
+    if [ ! -f "$KV_CACHE_LOG" ] \
+       && [ -f "/kaggle/input/bonsai-mojo-t4-build/dist/$KV_OUT_LOG" ]; then
+        cp "/kaggle/input/bonsai-mojo-t4-build/dist/$KV_OUT_LOG" \
+           "$KV_CACHE_LOG" || true
+        echo ">> [KHQ-CACHE] $KV_OUT_LOG diimpor dari output GPU run sebelumnya."
     fi
-    if [ -f "$CACHE_DIR/kv_dump.bin" ] && [ -f "$CACHE_DIR/khq_dump.log" ] \
+    if [ -f "$KV_CACHE_BIN" ] && [ -f "$KV_CACHE_LOG" ] \
        && [ "${KHQ_DUMP_FORCE:-0}" != "1" ]; then
-        cp "$CACHE_DIR/kv_dump.bin" "$KHQ_DIR/kv_dump.bin" || true
-        cp "$CACHE_DIR/khq_dump.log" "$DIST_DIR/khq_dump.log" || true
-        echo ">> [KHQ-CACHE] kv_dump.bin + khq_dump.log dipakai ulang dari cache."
+        # Nama kerja di dalam KHQ_DIR / DIST_DIR TETAP kv_dump.bin &
+        # khq_dump.log, supaya pembaca di 5b.2 & 5b.9 tidak tersentuh.
+        cp "$KV_CACHE_BIN" "$KHQ_DIR/kv_dump.bin" || true
+        cp "$KV_CACHE_LOG" "$DIST_DIR/khq_dump.log" || true
+        echo ">> [KHQ-CACHE] dump dipakai ulang dari cache (BONSAI_BITS=$BONSAI_BITS)."
         echo ">> [KHQ-CACHE] run dump $KHQ_TOKENS token DILEWATI (hemat ~13 menit kuota GPU)."
     else
         echo ""
@@ -1301,9 +1352,14 @@ PYEOF
             2>&1 | tee "$DIST_DIR/khq_dump.log" \
             || echo ">> [KHQ-FAIL] run dump gagal — periksa $DIST_DIR/khq_dump.log"
         if [ -f "$KHQ_DIR/kv_dump.bin" ] && [ -s "$DIST_DIR/khq_dump.log" ]; then
-            cp "$KHQ_DIR/kv_dump.bin" "$CACHE_DIR/kv_dump.bin" || true
-            cp "$DIST_DIR/khq_dump.log" "$CACHE_DIR/khq_dump.log" || true
-            echo ">> [KHQ-CACHE] kv_dump.bin + khq_dump.log disimpan ke cache utk run berikutnya."
+            cp "$KHQ_DIR/kv_dump.bin" "$KV_CACHE_BIN" || true
+            cp "$DIST_DIR/khq_dump.log" "$KV_CACHE_LOG" || true
+            # Salinan bernama per-model juga ditulis ke KHQ_DIR & DIST_DIR,
+            # karena yang terbit sbg output kernel adalah dua direktori itu —
+            # tanpa salinan ini run berikutnya tidak bisa mengimpornya.
+            cp "$KHQ_DIR/kv_dump.bin" "$KHQ_DIR/$KV_OUT_BIN" || true
+            cp "$DIST_DIR/khq_dump.log" "$DIST_DIR/$KV_OUT_LOG" || true
+            echo ">> [KHQ-CACHE] dump disimpan ke cache utk run berikutnya (BONSAI_BITS=$BONSAI_BITS)."
         fi
     fi
 
@@ -1847,6 +1903,7 @@ PYEOF
         fi
     else
         echo ">> [KHQ-FAIL] dump asli tidak valid — kalibrasi dibatalkan"
+    fi
     fi
 
     kill $CLOCK_PID 2>/dev/null || true

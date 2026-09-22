@@ -11,7 +11,8 @@
   "enable_internet": true,
   "dataset_sources": [
     "okiabrian/bonsai-mojo-source",
-    "okiabrian/bonsai-27b-mlx-1bit"
+    "okiabrian/bonsai-27b-mlx-1bit",
+    "okiabrian/bonsai-2bit-weights"
   ],
   "competition_sources": [],
   "kernel_sources": [

@@ -30,6 +30,7 @@ class QwenTokenizer:
         self.im_end_token_id = self.IM_END_TOKEN_ID
         self._load_special_ids()
         self._load_tokenizer()
+        self._resolve_special_ids_from_vocab()
 
     def _load_special_ids(self):
         """config.json checkpoint = otoritatif untuk eos id (bukan ingatan)."""
@@ -75,6 +76,28 @@ class QwenTokenizer:
             "menghasilkan prompt yang salah secara senyap pada vocab 248320. "
             "Pasang `transformers` atau `tokenizers`, atau pakai model_dir yang benar."
         )
+
+    def _resolve_special_ids_from_vocab(self):
+        """Ambil nomor <|im_start|>/<|im_end|> dari vocab tokenizer sendiri.
+
+        Alasan: config.json Bonsai-2 (paket 2-bit) menulis eos_token_id=248044
+        yaitu <|endoftext|>, padahal <|im_end|> bernomor 248046 dan model itu
+        benar-benar mengakhiri giliran dgn 248046. Karena itu im_end TIDAK
+        boleh dipaksa sama dgn eos config. Pada Bonsai-27B (1-bit) keduanya
+        sama-sama 248046, jadi hasilnya identik dgn perilaku lama.
+        """
+        if self.hf_tokenizer is None:
+            return
+        tok = self.hf_tokenizer
+        for attr, text in (("im_start_token_id", "<|im_start|>"),
+                           ("im_end_token_id", "<|im_end|>")):
+            tid = None
+            if hasattr(tok, "convert_tokens_to_ids"):
+                tid = tok.convert_tokens_to_ids(text)
+            elif hasattr(tok, "token_to_id"):
+                tid = tok.token_to_id(text)
+            if isinstance(tid, int) and tid >= 0:
+                setattr(self, attr, tid)
 
     def encode(self, text: str) -> List[int]:
         """Mengubah string teks menjadi array token ID."""
