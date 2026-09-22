@@ -1303,14 +1303,24 @@ PYEOF
     KV_CACHE_LOG="$CACHE_DIR/khq_dump_b${BONSAI_BITS}.log"
     KV_OUT_BIN="kv_dump_b${BONSAI_BITS}.bin"
     KV_OUT_LOG="khq_dump_b${BONSAI_BITS}.log"
-    # attn_<lid>.bin (16 layer x 7,3 MB) WAJIB ikut tercache: 5b.2 menolak
-    # dump bila berkas ini tidak ada, sehingga kalibrasi dibatalkan. Dulu
-    # hanya kv_dump.bin + log yang disimpan, maka TIAP run yang memakai ulang
-    # cache gagal verifikasi dan KHQ diam-diam tidak mengerjakan apa pun
-    # (pipeline tetap exit 0). Cache disimpan di bawah CACHE_DIR karena hanya
-    # .cache_t4_build yang ikut terarsip ke mojo_build_cache.tar.gz —
-    # KHQ_DIR tidak pernah lestari antar run.
-    ATTN_CACHE_DIR="$CACHE_DIR/attn_b${BONSAI_BITS}"
+    # attn_<lid>.bin (16 layer x 7,3 MB) WAJIB ikut: 5b.2 menolak dump bila
+    # berkas ini tidak ada, sehingga kalibrasi dibatalkan. Dulu hanya
+    # kv_dump.bin + log yang disimpan, maka TIAP run yang memakai ulang cache
+    # gagal verifikasi dan KHQ diam-diam tidak mengerjakan apa pun (pipeline
+    # tetap exit 0).
+    # Jalur lestari (terukur, log v139): arsip cache DIRESTORASI dari
+    # /kaggle/input/bonsai-build-cpu/mojo_build_cache.tar.gz — BUKAN dari
+    # output run GPU — sehingga apa pun yang ditulis ke CACHE_DIR selama run
+    # ini tidak pernah kembali, dan ikut menggemukkan arsip di trap EXIT.
+    # Satu-satunya jalur yang terbukti lestari adalah mount output run GPU
+    # sebelumnya (/kaggle/input/bonsai-mojo-t4-build/), persis yang dipakai
+    # kv_dump_b2.bin. Maka attn_*.bin diterbitkan ke khq_real/attn_b<BITS>/
+    # dan diimpor balik dari sana.
+    # Nama direktori memuat lebar bit SEBAGAI KUNCI: kedua model
+    # searusitektur, jadi header berkas (D & H_kv) tidak bisa membedakan
+    # attn 1-bit dari 2-bit — tanpa kunci ini run 1-bit bisa mewarisi attn
+    # hasil run 2-bit dan 5b.2 tetap meluluskannya (hijau palsu lagi).
+    ATTN_MOUNT="/kaggle/input/bonsai-mojo-t4-build/khq_real/attn_b${BONSAI_BITS}"
     # ---------------------------------------------------------------
     # CACHE kv_dump.bin + khq_dump.log — run dump ini adalah biaya TERBESAR
     # dalam satu run GPU (terukur, bukan dugaan):
@@ -1344,6 +1354,12 @@ PYEOF
            "$KV_CACHE_LOG" || true
         echo ">> [KHQ-CACHE] $KV_OUT_LOG diimpor dari output GPU run sebelumnya."
     fi
+    # attn_<lid>.bin diimpor LANGSUNG ke KHQ_DIR (sudah dikosongkan di atas),
+    # bukan lewat CACHE_DIR — lihat catatan jalur lestari di atas.
+    if [ -d "$ATTN_MOUNT" ]; then
+        cp "$ATTN_MOUNT"/attn_*.bin "$KHQ_DIR/" 2>/dev/null || true
+        echo ">> [KHQ-CACHE] attn_*.bin diimpor dari output GPU run sebelumnya."
+    fi
     # Cache dianggap layak pakai HANYA kalau lengkap: kv_dump.bin + log +
     # attn_*.bin. Kalau attn_*.bin belum ada (mis. cache dibuat sebelum
     # perbaikan ini), jangan dipakai — lebih baik bayar dump 14 menit
@@ -1352,14 +1368,13 @@ PYEOF
     # bila direktori belum ada — tanpa itu status penugasan ini menjadi 1 dan
     # seluruh run mati di sini (terjadi di kernel v137, exit 1 tepat setelah
     # gerbang koherensi).
-    ATTN_CACHED="$(find "$ATTN_CACHE_DIR" -maxdepth 1 -name 'attn_*.bin' -print -quit 2>/dev/null || true)"
+    ATTN_CACHED="$(find "$KHQ_DIR" -maxdepth 1 -name 'attn_*.bin' -print -quit 2>/dev/null || true)"
     if [ -f "$KV_CACHE_BIN" ] && [ -f "$KV_CACHE_LOG" ] && [ -n "$ATTN_CACHED" ] \
        && [ "${KHQ_DUMP_FORCE:-0}" != "1" ]; then
         # Nama kerja di dalam KHQ_DIR / DIST_DIR TETAP kv_dump.bin &
         # khq_dump.log, supaya pembaca di 5b.2 & 5b.9 tidak tersentuh.
         cp "$KV_CACHE_BIN" "$KHQ_DIR/kv_dump.bin" || true
         cp "$KV_CACHE_LOG" "$DIST_DIR/khq_dump.log" || true
-        cp "$ATTN_CACHE_DIR"/attn_*.bin "$KHQ_DIR/" 2>/dev/null || true
         echo ">> [KHQ-CACHE] dump dipakai ulang dari cache (BONSAI_BITS=$BONSAI_BITS)."
         echo ">> [KHQ-CACHE] run dump $KHQ_TOKENS token DILEWATI (hemat ~13 menit kuota GPU)."
     else
@@ -1377,13 +1392,17 @@ PYEOF
             # tanpa salinan ini run berikutnya tidak bisa mengimpornya.
             cp "$KHQ_DIR/kv_dump.bin" "$KHQ_DIR/$KV_OUT_BIN" || true
             cp "$DIST_DIR/khq_dump.log" "$DIST_DIR/$KV_OUT_LOG" || true
-            # attn_*.bin ikut disimpan ke CACHE_DIR, supaya run berikutnya
-            # yang memakai ulang cache bisa lolos verifikasi 5b.2 dan
-            # kalibrasinya benar-benar jalan.
-            mkdir -p "$ATTN_CACHE_DIR"
-            cp "$KHQ_DIR"/attn_*.bin "$ATTN_CACHE_DIR/" 2>/dev/null || true
             echo ">> [KHQ-CACHE] dump disimpan ke cache utk run berikutnya (BONSAI_BITS=$BONSAI_BITS)."
         fi
+    fi
+    # Terbitkan attn_*.bin ke subdir bernama lebar bit. KHQ_DIR dihapus di
+    # awal blok, jadi tanpa salinan ini output run ini tidak berisi
+    # attn_b<BITS>/ dan run berikutnya jatuh ke dump segar lagi (penghematan
+    # ~14 menit hilang). Satu tempat untuk KEDUA cabang (pakai-ulang & dump
+    # segar) supaya tidak bisa terlewat di salah satunya.
+    if [ -n "$(find "$KHQ_DIR" -maxdepth 1 -name 'attn_*.bin' -print -quit 2>/dev/null || true)" ]; then
+        mkdir -p "$KHQ_DIR/attn_b${BONSAI_BITS}"
+        cp "$KHQ_DIR"/attn_*.bin "$KHQ_DIR/attn_b${BONSAI_BITS}/" 2>/dev/null || true
     fi
 
     echo ">> [KHQ] 5b.2 verifikasi dump (harus dari bobot asli, bukan placeholder)"
