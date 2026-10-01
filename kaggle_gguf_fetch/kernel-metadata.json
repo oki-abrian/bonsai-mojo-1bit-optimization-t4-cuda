@@ -1,7 +1,7 @@
 {
-  "id": "okiabrian/bonsai-build-cpu",
-  "title": "bonsai-build-cpu",
-  "code_file": "run_deploy.py",
+  "id": "okiabrian/gguf-fetch-qwen38-iq3s",
+  "title": "gguf-fetch-qwen38-iq3s",
+  "code_file": "fetch_gguf.py",
   "language": "python",
   "kernel_type": "script",
   "is_private": true,
@@ -10,8 +10,6 @@
   "enable_internet": true,
   "dataset_sources": [],
   "competition_sources": [],
-  "kernel_sources": [
-    "okiabrian/a-src-carrier"
-  ],
+  "kernel_sources": [],
   "model_sources": []
 }

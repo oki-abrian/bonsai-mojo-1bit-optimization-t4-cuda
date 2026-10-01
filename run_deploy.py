@@ -59,6 +59,21 @@ def main():
 
     # Cache build dari output run sebelumnya (jangan dari mount dataset).
     copied = False
+
+    # PRIORITAS: cache dari kernel BUILD CPU — itulah jalur "build di CPU,
+    # inferensi di GPU": sidik jari arsip itu mengikuti sumber terakhir yang
+    # dikompilasi. Tanpa prioritas ini, output self-reference kernel INI (cache
+    # BASI setelah sumber berubah) bisa menutupinya hanya karena urutan
+    # os.walk — kejadian v141: cache v140 dipulihkan padahal cache CPU v33
+    # sudah valid, sehingga gerbang sidik jari FATAL sebelum inferensi jalan.
+    CPU_CACHE = "/kaggle/input/bonsai-build-cpu/mojo_build_cache.tar.gz"
+    if os.path.exists(CPU_CACHE) and not os.path.exists(
+            "/kaggle/working/mojo_build_cache.tar.gz"):
+        print(f">> [RUNNER] Cache build (prioritas CPU): {CPU_CACHE} "
+              f"-> /kaggle/working/mojo_build_cache.tar.gz", flush=True)
+        shutil.copyfile(CPU_CACHE, "/kaggle/working/mojo_build_cache.tar.gz")
+        copied = True
+
     for root, dirs, files in os.walk("/kaggle/input"):
         if copied:
             break

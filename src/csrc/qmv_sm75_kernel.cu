@@ -3959,11 +3959,15 @@ __global__ void qmv_dense_kernel(
 // ============================================================================
 extern "C" {
 
-// slot statik utk state modul Mojo (runtime=0, dump=1) — Mojo 25.x tanpa
-// global var; pointer struct Mojo diparkir di memori statik lib ini.
-static void* g_khq_slots[2] = {nullptr, nullptr};
+// slot statik utk state modul Mojo (runtime=0, dump=1, act-dump=2) — Mojo 25.x
+// tanpa global var; pointer struct Mojo diparkir di memori statik lib ini.
+// PENTING: bila `which` di luar jangkauan, nilai lama dijepit ke 0 — itu
+// membuat dua modul berbagi SATU sel dan saling merusak state (pernah terjadi:
+// act-dump memakai slot 2 yg belum ada -> menimpa KhqGlobals -> KHQ terbaca
+// aktif). Karena itu ukuran array WAJIB mengikuti slot tertinggi yang dipakai.
+static void* g_khq_slots[3] = {nullptr, nullptr, nullptr};
 void* khq_state_slot(int which) {
-    if (which < 0 || which > 1) which = 0;
+    if (which < 0 || which > 2) which = 0;
     return (void*)&g_khq_slots[which];
 }
 

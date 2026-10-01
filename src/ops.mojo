@@ -9,7 +9,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from os import getenv
-from sys.ffi import OwnedDLHandle
+from sys.ffi import OwnedDLHandle, RTLD
 from memory import UnsafePointer, alloc
 from .common import (
     cdiv, PREFILL_BM, PREFILL_BN, PREFILL_BK, PREFILL_THREADS, PREFILL_PAD,
@@ -583,23 +583,32 @@ fn dummy_cuda_qmv_dense_fp16(
 
 
 fn try_open_cuda_lib() raises -> OwnedDLHandle:
-    """Mencari dan membuka libbonsai_qmv_sm75.so dari kandidat lokasi."""
+    """Mencari dan membuka libbonsai_qmv_sm75.so dari kandidat lokasi.
+
+    WAJIB memakai RTLD.NODELETE (dibuktikan v5 act-dump, 2026-09-30): build
+    CPU menaruh dlclose SEBELUM pemanggilan simbol di khq_state_slot_cell
+    (dan tak bisa diandalkan urutan kodegen mana pun), sehingga satu-satunya
+    pagar deterministik adalah membuat dlclose tak mungkin melepas pemetaan
+    .so — RTLD_NODELETE menurunkan refcount tapi TIDAK PERNAH unmap.
+    Biaya: .so (2,4 MB) menetap terpetakan seumur proses; tidak berdampak.
+    """
+    alias _RTLD_FLAGS = RTLD.NOW | RTLD.GLOBAL | RTLD.NODELETE
     var env_path = getenv("BONSAI_CUDA_LIB")
     if env_path:
-        return OwnedDLHandle(env_path)
+        return OwnedDLHandle(env_path, _RTLD_FLAGS)
     try:
-        return OwnedDLHandle("libbonsai_qmv_sm75.so")
+        return OwnedDLHandle("libbonsai_qmv_sm75.so", _RTLD_FLAGS)
     except:
         pass
     try:
-        return OwnedDLHandle("/kaggle/working/libbonsai_qmv_sm75.so")
+        return OwnedDLHandle("/kaggle/working/libbonsai_qmv_sm75.so", _RTLD_FLAGS)
     except:
         pass
     try:
-        return OwnedDLHandle("build/libbonsai_qmv_sm75.so")
+        return OwnedDLHandle("build/libbonsai_qmv_sm75.so", _RTLD_FLAGS)
     except:
         pass
-    return OwnedDLHandle("/kaggle/working/build/libbonsai_qmv_sm75.so")
+    return OwnedDLHandle("/kaggle/working/build/libbonsai_qmv_sm75.so", _RTLD_FLAGS)
 
 
 fn try_cuda_ffi_decode_fp16(
@@ -1019,18 +1028,34 @@ alias CudaKhqSlotFn = fn(Int32) -> UnsafePointer[
 
 
 fn khq_state_slot_cell(
-    which: Int
-) -> UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin]:
-    """Alamat sel statik (void*) di lib CUDA utk memarkir pointer state Mojo."""
+    dst: UnsafePointer[
+        UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+        MutAnyOrigin,
+    ],
+    which: Int,
+):
+    """Tulis alamat sel statik (void*) di lib CUDA ke `dst`.
+
+    SEJARAH (penting, jangan diulang): bentuk `return f(...)` dikompilasi
+    menjadi tail call dengan dlclose DI DEPAN pemanggilan (v35 crash);
+    bentuk parameter keluaran `dst[] = f(...)` pun MASIH ditaruh dlclose
+    sebelum call oleh kompilator build CPU (v38) dan TETAP SIGSEGV tanpa
+    LD_PRELOAD (terbukti empiris act-dump v5, 2026-09-30: diag B/D/E/F
+    rc=-11, 0/20 task). Mengandalkan urutan kodegen terbukti tak bisa
+    diandalkan. Pagar deterministiknya ada di try_open_cuda_lib():
+    dlopen dengan RTLD.NODELETE — dlclose tak mungkin melepas pemetaan,
+    sehingga urutan dlclose-vs-call tak lagi relevan.
+    """
     var disable = getenv("BONSAI_DISABLE_CUDA_FFI")
     if disable and (disable == "1" or disable == "true"):
-        return UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin]()
+        dst[] = UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin]()
+        return
     try:
         var h = try_open_cuda_lib()
         var f = h.get_function[CudaKhqSlotFn]("khq_state_slot")
-        return f(Int32(which))
+        dst[] = f(Int32(which))
     except:
-        return UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin]()
+        dst[] = UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin]()
 
 alias CudaKhqCompressFn = fn(
     UnsafePointer[Scalar[DType.float16], MutAnyOrigin],  # x

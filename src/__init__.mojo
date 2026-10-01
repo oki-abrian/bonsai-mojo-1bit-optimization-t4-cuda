@@ -25,7 +25,8 @@ from .models import (
     GatedDeltaNetState, AttentionKVCache, QwenLinear1Bit, qwen3_5_gdn_step,
     qwen3_5_gated_attention_step, qwen3_5_swiglu_mlp_step, QwenDecoderLayer,
     embed_tokens_step, qwen3_5_model_forward, lm_head_argmax_step,
-    khq_dump_configure, khq_dump_flush, khq_dump_active
+    khq_dump_configure, khq_dump_flush, khq_dump_active,
+    act_dump_configure, act_dump_flush, act_dump_site
 )
 from .khq import khq_active, khq_activate, khq_prof_report
 

@@ -1,0 +1,20 @@
+{
+  "id": "okiabrian/bonsai-act-dump",
+  "title": "bonsai-act-dump",
+  "code_file": "run_act_dump.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "okiabrian/bonsai-2bit-weights"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [
+    "okiabrian/bonsai-build-cpu"
+  ],
+  "model_sources": []
+}

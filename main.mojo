@@ -18,6 +18,7 @@ from src import (
     QwenConfig, QwenDecoderLayer, QwenLinear1Bit, GatedDeltaNetState,
     AttentionKVCache, qwen3_5_model_forward,
     khq_dump_configure, khq_dump_flush,
+    act_dump_configure, act_dump_flush,
     khq_active, khq_activate, khq_prof_report
 )
 from time import monotonic
@@ -1067,6 +1068,15 @@ fn main() raises:
         )
         print(">> [KHQ-DUMP] aktif ->", khq_dir)
 
+    # Dump aktivasi kalibrasi GSQ/EoRA (env BONSAI_DUMP_ACT_DIR) — decode
+    # saja, tiga lokasi per layer (input MLP / input attention / input
+    # out_proj GDN). Format berkas & pemetaan hook: act_dump.mojo.
+    var act_dir = getenv("BONSAI_DUMP_ACT_DIR")
+    if act_dir:
+        var act_cap = env_int("BONSAI_DUMP_ACT_TOKENS", 512)
+        act_dump_configure(act_dir, act_cap)
+        print(">> [ACT-DUMP] aktif ->", act_dir, "| cap", act_cap, "token decode")
+
     # KHQ: aktivasi dipindah ke setelah DeviceContext terpasang (lihat bawah).
 
     var layers = alloc[QwenDecoderLayer](n_layers)
@@ -1995,6 +2005,8 @@ fn main() raises:
             print(">> Selesai:", n_generated, "token di-generate (greedy).")
         if khq_dir:
             khq_dump_flush()
+        if act_dir:
+            act_dump_flush()
     else:
         # FALLBACK DIHAPUS: jalur host-sim CPU tidak lagi dipakai produksi.
         # GPU wajib — tanpa BONSAI_USE_GPU program error, bukan diam-diam CPU.

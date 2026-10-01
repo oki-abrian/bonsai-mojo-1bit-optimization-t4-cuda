@@ -89,7 +89,7 @@ else
     echo "========================================================="
     TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
 
-    PKG_DIR="/tmp/mojo_kaggle_pkg"
+    PKG_DIR="${BONSAI_PKG_DIR:-/tmp/mojo_kaggle_pkg}"
     rm -rf "$PKG_DIR"
     mkdir -p "$PKG_DIR"
 

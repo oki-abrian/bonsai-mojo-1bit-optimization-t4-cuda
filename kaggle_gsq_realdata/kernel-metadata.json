@@ -1,0 +1,18 @@
+{
+  "id": "okiabrian/gsq-realdata-e2e",
+  "title": "gsq-realdata-e2e",
+  "code_file": "run_realdata.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "okiabrian/qwen38-27b-gsq-rco-iq3s",
+    "okiabrian/bonsai-2bit-weights"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

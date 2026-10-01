@@ -1,0 +1,16 @@
+[07:07:32] status: RUNNING
+[07:08:32] status: RUNNING
+[07:09:33] status: RUNNING
+[07:10:34] status: RUNNING
+[07:11:35] status: RUNNING
+[07:12:36] status: RUNNING
+[07:13:37] status: RUNNING
+[07:14:38] status: RUNNING
+[07:15:38] status: RUNNING
+[07:16:39] status: RUNNING
+[07:17:40] status: RUNNING
+[07:18:42] status: RUNNING
+[07:19:43] status: RUNNING
+[07:20:43] status: ERROR
+[07:20:43] KERNEL GAGAL: ERROR | failureMessage: 
+[07:20:44] log kernel diunduh ke /Users/macmini/.mounty/SSD_External/fix/bonsai-1bit-t4-mojo/kaggle_gguf_fetch: (['/Users/macmini/.mounty/SSD_External/fix/bonsai-1bit-t4-mojo/kaggle_gguf_fetch/gguf-fetch-qwen38-iq3s.log'], '')

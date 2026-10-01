@@ -13,4 +13,5 @@ from .attention import AttentionKVCache, qwen3_5_gated_attention_step, qwen3_5_g
 from .mlp import qwen3_5_swiglu_mlp_step, qwen3_5_swiglu_mlp_step_gpu
 from .layer import QwenDecoderLayer
 from .khq_dump import khq_dump_configure, khq_dump_flush, khq_dump_active
+from .act_dump import act_dump_configure, act_dump_flush, act_dump_site
 from .model import embed_tokens_step, qwen3_5_model_forward, lm_head_argmax_step

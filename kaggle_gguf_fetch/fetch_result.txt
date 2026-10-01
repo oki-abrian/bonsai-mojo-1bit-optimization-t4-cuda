@@ -1,0 +1,20 @@
+kernel: okiabrian/gguf-fetch-qwen38-iq3s (v2)
+dataset: okiabrian/qwen38-27b-gsq-rco-iq3s
+status: ready
+
+files:
+Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf  11771546784  2026-09-26 00:23:36 UTC
+
+VERDICT: OK
+
+Catatan:
+- Kernel v2 ditandai ERROR oleh Kaggle, tetapi itu hanya langkah polling
+  status pamungkas (endpoint GetDatasetStatus membalas 403 selama ~2 menit
+  pertama setelah create; skrip lama salah mengartikannya fatal). Unduhan HF
+  (11.771.546.784 byte, 1,6 menit) dan unggah dataset (10,7 menit) keduanya
+  sukses — terverifikasi via dataset_status=ready + daftar berkas ukuran
+  persis sama.
+- Skrip fetch_gguf.py sudah diperbaiki (403 = tunggu, bukan fatal) untuk
+  pemakaian berikutnya; TIDAK di-push ulang agar 11,8 GB tidak terunggah
+  dua kali.
+- URL dataset: https://www.kaggle.com/datasets/okiabrian/qwen38-27b-gsq-rco-iq3s

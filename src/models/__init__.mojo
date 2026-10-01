@@ -6,6 +6,7 @@
 from .qwen3_5 import (
     QwenConfig,
     khq_dump_configure, khq_dump_flush, khq_dump_active,
+    act_dump_configure, act_dump_flush, act_dump_site,
     silu,
     sigmoid,
     softplus,

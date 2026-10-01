@@ -14,6 +14,7 @@ from .linear import QwenLinear1Bit, DeviceContextGPU
 from .gated_delta import GatedDeltaNetState, qwen3_5_gdn_step, qwen3_5_gdn_step_gpu, qwen3_5_gdn_step_gpu_from_proj
 from .attention import AttentionKVCache, qwen3_5_gated_attention_step, qwen3_5_gated_attention_step_gpu, qwen3_5_gated_attention_step_gpu_from_proj
 from .mlp import qwen3_5_swiglu_mlp_step, qwen3_5_swiglu_mlp_step_gpu
+from .act_dump import act_dump_site
 from src.ops import (
     rmsnorm_sm75_launch_on, vec_add_sm75_launch_on, add_rmsnorm_sm75_launch_on, swiglu_sm75_launch_on,
     gdn_seq_sm75_try_launch, gdn_recurrence_sm75_launch_on,
@@ -316,6 +317,11 @@ struct QwenDecoderLayer:
         prof = prof and pv and pv[0] == "1"
         var no_fuse = getenv("BONSAI_NO_FUSE")
         var fuse = not (no_fuse and no_fuse == "1")
+        # Dump aktivasi kalibrasi (opt-in). Gate-nya sengaja env-read biasa
+        # (preseden: BONSAI_PROFILE / BONSAI_NO_FUSE di atas) — BUKAN lewat
+        # slot state lib CUDA yang membuka .so tiap panggilan, agar jalur
+        # produksi (env tak diset) tidak berubah biaya sama sekali.
+        var dump_act = getenv("BONSAI_DUMP_ACT_DIR")
 
         # 1. Pre-Layer RMSNorm di GPU (menggunakan pointer bobot VRAM)
         # dilewati HANYA bila `prenorm_done` DAN fusi aktif. `prenorm_done`
@@ -363,6 +369,19 @@ struct QwenDecoderLayer:
                 self.attn_q_norm_w_dev, self.attn_k_norm_w_dev, self.attn_has_norms,
                 kv_cache, pos, self.config, self.layer_idx
             )
+
+        # Dump aktivasi kalibrasi (site 1 & 2) — SETELAH tahap 2 dan SEBELUM
+        # fusi residual-1+post-norm menimpa x_norm_dev:
+        #   layer linear    -> site 2: input out_proj GDN (gdn_out, H_v*D_v);
+        #   layer attention -> site 1: input cabang attention (x_norm pre-attn).
+        if dump_act:
+            if self.is_linear:
+                act_dump_site(
+                    ctx, self.layer_idx, 2, gdn_out_dev,
+                    self.config.gdn_num_v_heads * self.config.gdn_head_v_dim
+                )
+            else:
+                act_dump_site(ctx, self.layer_idx, 1, x_norm_dev, D)
         var t_step = 0.0
         if prof:
             ctx.synchronize()
@@ -387,6 +406,12 @@ struct QwenDecoderLayer:
         if prof:
             ctx.synchronize()
             t_post = Float64(monotonic() - t2) / 1e3
+
+        # Dump aktivasi kalibrasi (site 0): input MLP — x_norm_dev masih
+        # berisi hasil post-attention norm pada titik ini, SEBELUM step MLP
+        # dan sebelum fusi residual-2+pre-norm layer berikutnya menimpanya.
+        if dump_act:
+            act_dump_site(ctx, self.layer_idx, 0, x_norm_dev, D)
 
         # 5. SwiGLU MLP di GPU
         var t4 = monotonic()

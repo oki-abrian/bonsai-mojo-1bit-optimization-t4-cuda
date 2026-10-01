@@ -178,8 +178,16 @@ struct KhqDumpGlobals:
 
 
 fn _dg() -> UnsafePointer[KhqDumpGlobals, MutAnyOrigin]:
-    """State modul via slot statik lib CUDA (slot 1)."""
-    var cell = khq_state_slot_cell(1).bitcast[UnsafePointer[KhqDumpGlobals, MutAnyOrigin]]()
+    """State modul via slot statik lib CUDA (slot 1).
+
+    Hasil FFI ditampung lewat alamat variabel lokal — UnsafePointer(to=...),
+    pengganti resmi address_of yang dihapus sejak Mojo 25.5 — lihat komentar
+    khq_state_slot_cell di src/ops.mojo (jebakan tail call + dlclose,
+    build CPU)."""
+    var tmp = UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin]()
+    var sel = UnsafePointer[UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin], MutAnyOrigin](to=tmp)
+    khq_state_slot_cell(sel, 1)
+    var cell = tmp.bitcast[UnsafePointer[KhqDumpGlobals, MutAnyOrigin]]()
     var p = cell[]
     if p == UnsafePointer[KhqDumpGlobals, MutAnyOrigin]():
         p = alloc[KhqDumpGlobals](1)
